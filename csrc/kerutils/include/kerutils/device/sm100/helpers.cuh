@@ -42,6 +42,46 @@ void utcmma_ss(
     }
 }
 
+template<
+    typename TiledMMA,
+    typename TensorA,
+    typename TensorB,
+    typename TensorSFA,
+    typename TensorSFB,
+    typename TensorFragC
+>
+CUTE_DEVICE
+void utcmma_blockscaled_ss(
+    TiledMMA &tiled_mma,
+    TensorA sA,
+    TensorB sB,
+    TensorSFA tSFA_frag,
+    TensorSFB tSFB_frag,
+    TensorFragC tC_frag,
+    bool clear_accum
+) {
+    using namespace cute;
+    tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+    ThrMMA thr_mma = tiled_mma.get_slice(_0{}); // Since A/B/C are already CTA-local tiles, this number does not matter
+    auto sA_frag = thr_mma.partition_fragment_A(sA);
+    auto sB_frag = thr_mma.partition_fragment_B(sB);
+    static_assert(size<2>(sA_frag) == size<2>(sB_frag));
+    static_assert(size<1>(sA_frag) == size<1>(tC_frag));
+    static_assert(size<1>(sB_frag) == size<2>(tC_frag));
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(sA_frag); ++k) {
+        cute::gemm(
+            tiled_mma,
+            tSFA_frag(_, _, k),
+            tSFB_frag(_, _, k),
+            sA_frag(_, _, k),
+            sB_frag(_, _, k),
+            tC_frag
+        );
+        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+    }
+}
+
 // Perform TS UTCMMA
 // sB should be shared memory tensors (i.e. make_tensor(make_shared_ptr(XXX), XXX)) while tA_frag and tC_frag should be tmem fragment
 template<
@@ -67,6 +107,43 @@ void utcmma_ts(
     for (int k = 0; k < size<2>(tA_frag); ++k) {
         cute::gemm(
             tiled_mma,
+            tA_frag(_, _, k),
+            sB_frag(_, _, k),
+            tC_frag
+        );
+        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+    }
+}
+
+template<
+    typename TiledMMA,
+    typename TensorA,
+    typename TensorB,
+    typename TensorSFA,
+    typename TensorSFB,
+    typename TensorFragC
+>
+CUTE_DEVICE
+void utcmma_blockscaled_ts(
+    TiledMMA &tiled_mma,
+    TensorA tA_frag,
+    TensorB sB,
+    TensorSFA tSFA_frag,
+    TensorSFB tSFB_frag,
+    TensorFragC tC_frag,
+    bool clear_accum
+) {
+    using namespace cute;
+    tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+    ThrMMA thr_mma = tiled_mma.get_slice(_0{}); // Since A/B/C are already CTA-local tiles, this number does not matter
+    auto sB_frag = thr_mma.partition_fragment_B(sB);
+    static_assert(size<2>(tA_frag) == size<2>(sB_frag));
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tA_frag); ++k) {
+        cute::gemm(
+            tiled_mma,
+            tSFA_frag(_, _, k),
+            tSFB_frag(_, _, k),
             tA_frag(_, _, k),
             sB_frag(_, _, k),
             tC_frag

@@ -167,6 +167,46 @@ struct SparseAttnFwdParams {
     cudaStream_t stream;
 };
 
+struct SparseAttnBwdParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    float sm_scale, sm_scale_div_log2;
+
+    // Forward/backward input tensors
+    cutlass::bfloat16_t* __restrict__ q;    // [s_q, h_q, d_qk]
+    cutlass::bfloat16_t* __restrict__ kv;   // [s_kv, h_kv, d_qk]
+    cutlass::bfloat16_t* __restrict__ out;  // [s_q, h_q, d_v]
+    cutlass::bfloat16_t* __restrict__ d_out; // [s_q, h_q, d_v]
+    float* __restrict__ lse;                // [s_q, h_q]
+    int* __restrict__ indices;              // [s_q, h_kv, topk]
+    float* __restrict__ attn_sink;          // [h_q]
+    int* __restrict__ topk_length;          // [s_q], may be nullptr
+
+    // Strides
+    int stride_q_s_q; int stride_q_h_q;
+    int stride_kv_s_kv; int stride_kv_h_kv;
+    int stride_out_s_q; int stride_out_h_q;
+    int stride_d_out_s_q; int stride_d_out_h_q;
+    int stride_lse_s_q;
+    int stride_indices_s_q; int stride_indices_h_kv;
+
+    // Output tensors/workspaces
+    cutlass::bfloat16_t* __restrict__ dq;   // [s_q, h_q, d_qk]
+    cutlass::bfloat16_t* __restrict__ dk;   // [s_kv, h_kv, d_qk]
+    cutlass::bfloat16_t* __restrict__ dv;   // [s_kv, h_kv, d_v]
+    float* __restrict__ d_k_acc;            // [s_kv, h_kv, d_qk]
+    float* __restrict__ d_v_acc;            // [s_kv, h_kv, d_v]
+    float* __restrict__ d_attn_sink;        // [h_q]
+
+    int stride_d_q_s_q; int stride_d_q_h_q;
+    int stride_d_k_s_kv; int stride_d_k_h_kv;
+    int stride_d_v_s_kv; int stride_d_v_h_kv;
+    int stride_d_k_acc_s_kv; int stride_d_k_acc_h_kv;
+    int stride_d_v_acc_s_kv; int stride_d_v_acc_h_kv;
+
+    int num_sm;
+    cudaStream_t stream;
+};
+
 struct MxFp8SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;

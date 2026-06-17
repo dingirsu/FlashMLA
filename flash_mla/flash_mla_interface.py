@@ -211,6 +211,43 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_bwd(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    attn_sink: torch.Tensor,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention prefill backward API for the SM100 head-small path.
+
+    Args:
+        do: [s_q, h_q, d_v], bfloat16.
+        q: [s_q, h_q, d_qk], bfloat16.
+        kv: [s_kv, h_kv, d_qk], bfloat16.
+        out: [s_q, h_q, d_v], bfloat16, forward output.
+        lse: [s_q, h_q], float32, forward log-sum-exp.
+        indices: [s_q, h_kv, topk], int32.
+        sm_scale: float.
+        attn_sink: [h_q], float32.
+        topk_length: optional, [s_q], int32.
+
+    Returns:
+        (dq, dk, dv, d_attn_sink)
+        dq: [s_q, h_q, d_qk], bfloat16.
+        dk: [s_kv, h_kv, d_qk], bfloat16.
+        dv: [s_kv, h_kv, d_v], bfloat16.
+        d_attn_sink: [h_q], float32.
+    """
+    return flash_mla_cuda.sparse_prefill_bwd(
+        do, q, kv, out, lse, indices, sm_scale, attn_sink, topk_length
+    )
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

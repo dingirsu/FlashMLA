@@ -104,13 +104,31 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
     if (warp_idx == 0) {
         if (elect_one_sync()) {
+            // Prefetch TMA descriptors for Q
+            cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
+            if constexpr (HAVE_ROPE) {
+                cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
+            }
+
+            // Initialize barriers
             plan.bar_prologue_q_nope.init(1);
             plan.bar_prologue_q_rope.init(1);
             fence_barrier_init();
 
+            // Launch TMA copies for Q
+            Tensor gQ_nope = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx);
+            Tensor sQ_nope = make_tensor(make_smem_ptr(plan.u.q_full.q_nope.data()), typename Kernel::SmemLayoutQNoPE{});
+            ku::launch_tma_copy(tma_params.tma_Q_nope, gQ_nope, sQ_nope, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
+
+            if constexpr (HAVE_ROPE) {
+                Tensor gQ_rope = tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx);
+                Tensor sQ_rope = make_tensor(make_smem_ptr(plan.q_rope.data()), typename Kernel::SmemLayoutQRoPE{});
+                ku::launch_tma_copy(tma_params.tma_Q_rope, gQ_rope, sQ_rope, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
+            }
+
             cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
             cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv_nope));
-            
+
             // Initialize other barriers
             plan.bar_prologue_utccp_rope.init(1);
             plan.bar_prologue_utccp_nope.init(1);
@@ -137,20 +155,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
     __syncthreads();
 
-    {
-        Tensor sQ_nope = make_tensor(make_smem_ptr(plan.u.q_full.q_nope.data()), typename Kernel::SmemLayoutQNoPE{});
-        for (int i = threadIdx.x; i < Kernel::B_H*Kernel::D_V; i += Kernel::NUM_THREADS) {
-            int h = i / Kernel::D_V;
-            int d = i % Kernel::D_V;
-            sQ_nope(h, d) = params.q[(int64_t)s_q_idx*params.stride_q_s_q + h*params.stride_q_h_q + d];
-        }
+    // Wait for TMA loads to complete
+    if (warp_idx == 0 && elect_one_sync()) {
+        plan.bar_prologue_q_nope.arrive_and_expect_tx(Kernel::B_H*Kernel::D_V*sizeof(bf16));
+        plan.bar_prologue_q_nope.wait(0);
         if constexpr (HAVE_ROPE) {
-            Tensor sQ_rope = make_tensor(make_smem_ptr(plan.q_rope.data()), typename Kernel::SmemLayoutQRoPE{});
-            for (int i = threadIdx.x; i < Kernel::B_H*(Kernel::D_Q-Kernel::D_V); i += Kernel::NUM_THREADS) {
-                int h = i / (Kernel::D_Q-Kernel::D_V);
-                int d = i % (Kernel::D_Q-Kernel::D_V);
-                sQ_rope(h, d) = params.q[(int64_t)s_q_idx*params.stride_q_s_q + h*params.stride_q_h_q + Kernel::D_V + d];
-            }
+            plan.bar_prologue_q_rope.arrive_and_expect_tx(Kernel::B_H*Kernel::D_ROPE*sizeof(bf16));
+            plan.bar_prologue_q_rope.wait(0);
         }
     }
 
@@ -271,10 +282,29 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             }
         }
         NamedBarrier::arrive_and_wait(128, Kernel::NamedBarriers::wg0_sync);
-        for (int i = idx_in_warpgroup; i < Kernel::B_H*Kernel::D_V; i += 128) {
-            int h = i / Kernel::D_V;
-            int dv = i % Kernel::D_V;
-            params.out[(int64_t)s_q_idx*Kernel::B_H*Kernel::D_V + h*Kernel::D_V + dv] = plan.u.o.data()[h*Kernel::D_V + dv];
+
+        // Store O using TMA
+        constexpr int B_EPI = 64;
+        Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), typename Kernel::SmemLayoutO{});
+        Tensor tma_gO = flat_divide(
+            tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
+            Shape<Int<Kernel::B_H>, Int<B_EPI>>{}
+        )(_, _, _0{}, _);
+        Tensor sO_divided = flat_divide(
+            sO,
+            Shape<Int<Kernel::B_H>, Int<B_EPI>>{}
+        )(_, _, _0{}, _);
+        auto thr_tma = tma_params.tma_O.get_slice(_0{});
+
+        CUTE_UNROLL
+        for (int k = 0; k < Kernel::D_V/B_EPI; ++k) {
+            if (warp_idx == 0 && elect_one_sync()) {
+                cute::copy(
+                    tma_params.tma_O,
+                    thr_tma.partition_S(sO_divided(_, _, k)),
+                    thr_tma.partition_D(tma_gO(_, _, k))
+                );
+            }
         }
 
         if (warp_idx == 0) {
@@ -445,6 +475,35 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.d_qk == D_QK);
     KU_ASSERT(params.d_v == Kernel::D_V);
 
+    // Create TMA descriptor for Q_nope
+    auto shape_Q_nope = make_shape(params.h_q, Kernel::D_V, params.s_q);
+    auto tma_Q_nope = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q),
+            make_layout(
+                shape_Q_nope,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        typename Kernel::SmemLayoutQNoPE{}
+    );
+
+    // Create TMA descriptor for Q_rope
+    auto shape_Q_rope = make_shape(params.h_q, Kernel::D_ROPE, params.s_q);
+    auto tma_Q_rope = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q + Kernel::D_V),
+            make_layout(
+                shape_Q_rope,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        typename Kernel::SmemLayoutQRoPE{}
+    );
+
+    // Create TMA descriptor for O
     auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
     auto tma_O = cute::make_tma_copy(
         SM90_TMA_STORE{},
@@ -483,8 +542,12 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     }
 
     TmaParams<
+        decltype(shape_Q_nope), decltype(tma_Q_nope),
+        decltype(shape_Q_rope), decltype(tma_Q_rope),
         decltype(shape_O), decltype(tma_O)
     > tma_params = {
+        shape_Q_nope, tma_Q_nope,
+        shape_Q_rope, tma_Q_rope,
         shape_O, tma_O,
         tensor_map_kv_nope
     };

@@ -10,9 +10,13 @@ namespace sm100::fwd::head_small {
 using namespace cute;
 
 template<
+    typename Shape_Q_nope, typename TMA_Q_nope,
+    typename Shape_Q_rope, typename TMA_Q_rope,
     typename Shape_O, typename TMA_O
 >
 struct TmaParams {
+    Shape_Q_nope shape_Q_nope; TMA_Q_nope tma_Q_nope;
+    Shape_Q_rope shape_Q_rope; TMA_Q_rope tma_Q_rope;
     Shape_O shape_O; TMA_O tma_O;
     CUtensorMap tensor_map_kv_nope;
 };
@@ -34,7 +38,7 @@ static constexpr float MAX_INIT_VAL = -1e30;
 
 static constexpr int B_H = H_Q;
 static constexpr int B_H_TMEM = H_Q == 24 ? 32 : H_Q;
-static constexpr int B_TOPK = 64;
+static constexpr int B_TOPK = 128;
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_THREADS = 128 + 128 + 128;
 
@@ -44,8 +48,6 @@ struct tmem_cols {
     // 320 ~ 352: Q RoPE, only for D_QK=192
     // 400 ~ 464: P, transposed as [B_TOPK, B_H]
     static constexpr int O = 0;
-    static constexpr int Q = 256;
-    static constexpr int Q_RoPE = 320;
     static constexpr int P = 400;
 };
 
@@ -100,8 +102,6 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 struct SharedMemoryPlan {
     union {
         struct {
-            array_aligned<bf16, cosize_v<SmemLayoutKRoPE>> _k_rope_pad;
-            array_aligned<bf16, cosize_v<SmemLayoutKNoPE>> _k_pad[2];
             array_aligned<bf16, cosize_v<SmemLayoutQNoPE>> q_nope;
         } q_full;
         struct {
@@ -110,7 +110,6 @@ struct SharedMemoryPlan {
         } k;
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } u;
-    float p_exchange_buf[4][32 * (B_TOPK/2)];
     bf16 s[B_H*B_TOPK];
     array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
     float p_t[B_TOPK*B_H];

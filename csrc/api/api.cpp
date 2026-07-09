@@ -5,8 +5,7 @@
 #include "sparse_decode.h"
 #include "dense_decode.h"
 #include "dense_fwd.h"
-// TODO: Uncomment when MXFP8 kernel is implemented
-// #include "mxfp8_sparse_fwd.h"
+#include "mxfp8_sparse_fwd.h"
 // #include "mxfp8_sparse_decode.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -17,7 +16,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_prefill_bwd", &sparse_attn_prefill_bwd_interface);
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
-    // TODO: Uncomment when MXFP8 kernel is implemented
-    // m.def("mxfp8_sparse_prefill_fwd", &mxfp8_sparse_attn_prefill_interface);
+    m.def("mxfp8_sparse_prefill_fwd", &mxfp8_sparse_attn_prefill_interface);
     // m.def("mxfp8_sparse_decode_fwd", &mxfp8_sparse_attn_decode_interface);
 }

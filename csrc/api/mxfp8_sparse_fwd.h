@@ -4,7 +4,6 @@
 #include "params.h"
 
 #include "sm100/prefill/sparse/mxfp8_fwd/head64/phase1.h"
-#include "sm100/prefill/sparse/mxfp8_fwd/head128/phase1.h"
 
 enum class MxFp8FwdFeatures : int {
     HEAD_64,
@@ -26,7 +25,6 @@ class MxFp8Fwd_Sm100_Head64_Impl : public MxFp8FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         MxFp8FwdFeatures::HEAD_64,
         MxFp8FwdFeatures::HEAD_DIM_512,
-        MxFp8FwdFeatures::HEAD_DIM_576,
         MxFp8FwdFeatures::ATTN_SINK,
         MxFp8FwdFeatures::TOPK_LENGTH
     )
@@ -35,23 +33,6 @@ protected:
     void run_(const MxFp8SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             sm100::mxfp8_fwd::head64::run_mxfp8_fwd_phase1_kernel<HEAD_DIM_QK>(params);
-        });
-    }
-};
-
-class MxFp8Fwd_Sm100_Head128_Impl : public MxFp8FwdImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        MxFp8FwdFeatures::HEAD_128,
-        MxFp8FwdFeatures::HEAD_DIM_512,
-        MxFp8FwdFeatures::HEAD_DIM_576,
-        MxFp8FwdFeatures::ATTN_SINK,
-        MxFp8FwdFeatures::TOPK_LENGTH
-    )
-
-protected:
-    void run_(const MxFp8SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::mxfp8_fwd::head128::run_mxfp8_fwd_phase1_kernel<HEAD_DIM_QK>(params);
         });
     }
 };
@@ -93,15 +74,12 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     int h_kv = kv.size(1);
     int topk = indices.size(2);
 
-    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
-    TORCH_CHECK(d_v == 512, "Invalid d_v: ", d_v);
+    TORCH_CHECK(d_qk == 512, "MXFP8 sparse prefill head64 currently supports only d_qk=512, got ", d_qk);
+    TORCH_CHECK(d_v == 448, "MXFP8 sparse prefill head64 currently supports only d_v=448, got ", d_v);
 
     // Compute expected bytes per token (same as existing FP8 KV cache format)
     int bytes_per_token;
-    if (d_qk == 576 && d_v == 512) {
-        // V3.2 style: 512 bytes NoPE (e4m3) + 16 bytes scales + 128 bytes RoPE (BF16)
-        bytes_per_token = 512 + 16 + 128;
-    } else if (d_qk == 512 && d_v == 512) {
+    if (d_qk == 512 && d_v == 448) {
         // MODEL1 style: 448 bytes NoPE (e4m3) + 8 bytes scales + 128 bytes RoPE (BF16)
         bytes_per_token = 448 + 8 + 128;
     } else {
@@ -168,14 +146,10 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     std::vector<MxFp8FwdFeatures> required_features;
     if (h_q == 64) {
         required_features.push_back(MxFp8FwdFeatures::HEAD_64);
-    } else if (h_q == 128) {
-        required_features.push_back(MxFp8FwdFeatures::HEAD_128);
     } else {
-        TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv448: ", h_q);
     }
-    if (d_qk == 576) {
-        required_features.push_back(MxFp8FwdFeatures::HEAD_DIM_576);
-    } else if (d_qk == 512) {
+    if (d_qk == 512) {
         required_features.push_back(MxFp8FwdFeatures::HEAD_DIM_512);
     } else {
         TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
@@ -190,11 +164,8 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     if (h_q == 64) {
         MxFp8Fwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);
-    } else if (h_q == 128) {
-        MxFp8Fwd_Sm100_Head128_Impl fwd_impl;
-        fwd_impl.run(params, required_features);
     } else {
-        TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv448: ", h_q);
     }
 
     return {out, max_logits, lse};

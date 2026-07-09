@@ -134,6 +134,74 @@ void retrieve_mask_and_reduce_p(
 }
 
 /*
+In transposed KQ^T Gemm, the P in tmem is trival [B_H, B_TOPK]  
+ */
+
+
+template<
+    int NUM_ELEMS_PER_THREAD,
+    int TMEM_COL_START,
+    int BARRIER_WARP02_SYNC_ID,
+    int BARRIER_WARP13_SYNC_ID,
+    bool STORE_BACK_P
+>
+CUTE_DEVICE
+void retrieve_and_mask_transposed_p_128(
+    char* k_validness_base,
+    int local_warp_idx,
+    int lane_idx,
+    auto slot_bar_P_empty_arrival,
+    float p_exchange_buf[4][32*NUM_ELEMS_PER_THREAD],
+    float p[NUM_ELEMS_PER_THREAD]
+) {
+    using namespace cute;
+    using cutlass::arch::NamedBarrier;
+    static_assert(BARRIER_WARP13_SYNC_ID == BARRIER_WARP02_SYNC_ID+1);
+    
+    ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START + local_warp_idx * NUM_ELEMS_PER_THREAD, p);
+    
+    cutlass::arch::fence_view_async_tmem_load();
+    ku::tcgen05_before_thread_sync();
+    slot_bar_P_empty_arrival();
+
+    // Mask invalid tokens
+    // We put masking before reduction, since (-inf) + anything (except nan and +inf) is (-inf), which guarantees correctness, and this can overlap with smem load
+    static_assert(NUM_ELEMS_PER_THREAD == 32);
+    uint32_t is_k_valid = *(uint32_t*)(k_validness_base + (local_warp_idx>=2?NUM_ELEMS_PER_THREAD/8:0));
+    CUTE_UNROLL
+    for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
+        if (!(is_k_valid >> i & 1))
+            p[i] = -CUDART_INF_F;
+    }
+
+    // Reduce P within the cluster
+    {
+        // Store
+        // Warp 0, 1 store their right (col 32 ~ 63) part, while warp 2, 3 store their left (row 0 ~ 31) part
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD/4; ++i) {
+            ku::st_shared(&p_exchange_buf[local_warp_idx^2][i*32*4 + lane_idx*4], *(float4*)(p_peer + i*4));
+        }
+        NamedBarrier::arrive_and_wait(64, BARRIER_WARP02_SYNC_ID + (local_warp_idx&1));
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD/4; ++i) {
+            float2 t[2];
+            *(float4*)t = *(float4*)(&p_exchange_buf[local_warp_idx][i*32*4 + lane_idx*4]);
+            float2* cur_p = (float2*)(p + i*4);
+            cur_p[0] = ku::float2_add(cur_p[0], t[0]);
+            cur_p[1] = ku::float2_add(cur_p[1], t[1]);
+        }
+    }
+
+    if constexpr (STORE_BACK_P) {
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD/4; ++i) {
+            ku::st_shared(&p_exchange_buf[local_warp_idx][i*32*4 + lane_idx*4], *(float4*)(p+i*4));
+        }
+    }
+}
+
+/*
 Rescale O in Tensor Memory.
 
 O should occupy 128 rows x (D_V/2) columns in Tensor Memory.

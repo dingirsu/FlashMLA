@@ -200,13 +200,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             float cur_sum = 0.0f;
             CUTE_UNROLL
             for (int g = 0; g < NUM_QUANT_GROUPS; ++g) {
-                e8m0 scale_g = e8m0(absmax_p[g] / FP8_MAX); // change here to vectorized type conversion
+                e8m0 scale_g = e8m0(absmax_p[g] / FP8_MAX); //TODO: change here to vectorized type conversion
                 s_scale[g] = scale_g;
                 for (int k = 0; k < 32; ++k) {
                     kk = k + g * 32;
-                    float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max); // change here to vectorzied load from shmem
+                    float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max); //TODO: change here to vectorzied load from shmem
                     cur_sum += s_val;
-                    sS_out(h, kk) = e4m3(s_val / float(scale_g)); // change here to vectorized store and type conversion
+                    sS_out(h, kk) = e4m3(s_val / float(scale_g)); //TODO: change here to vectorized store and type conversion
                 }
 
             }
@@ -479,7 +479,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     // O += sS @ sV
                     ku::utcmma_blockscaled_ss(
                         tiled_mma_O, sV, sS, tS_scale, tK_scale, tO, k == 1
-                    );  // We need to produce tS_scale in warpgroup idx 0
+                    );  //TODO: We need to produce tS_scale in tmem in warpgroup idx 0
                     ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
                 }
 

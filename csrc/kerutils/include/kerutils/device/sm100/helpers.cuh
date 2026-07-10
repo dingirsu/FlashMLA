@@ -70,10 +70,13 @@ void utcmma_blockscaled_ss(
     static_assert(size<1>(sB_frag) == size<2>(tC_frag));
     CUTE_UNROLL
     for (int k = 0; k < size<2>(sA_frag); ++k) {
-        cute::gemm(
-            tiled_mma,
+        auto tiled_mma_with_scale = tiled_mma.with(
+            tiled_mma.accumulate_,
             tSFA_frag(_, _, k),
-            tSFB_frag(_, _, k),
+            tSFB_frag(_, _, k)
+        );
+        cute::gemm(
+            tiled_mma_with_scale,
             sA_frag(_, _, k),
             sB_frag(_, _, k),
             tC_frag
@@ -140,10 +143,13 @@ void utcmma_blockscaled_ts(
     static_assert(size<2>(tA_frag) == size<2>(sB_frag));
     CUTE_UNROLL
     for (int k = 0; k < size<2>(tA_frag); ++k) {
-        cute::gemm(
-            tiled_mma,
+        auto tiled_mma_with_scale = tiled_mma.with(
+            tiled_mma.accumulate_,
             tSFA_frag(_, _, k),
-            tSFB_frag(_, _, k),
+            tSFB_frag(_, _, k)
+        );
+        cute::gemm(
+            tiled_mma_with_scale,
             tA_frag(_, _, k),
             sB_frag(_, _, k),
             tC_frag

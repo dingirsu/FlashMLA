@@ -180,7 +180,7 @@ void retrieve_and_mask_transposed_p_128(
         // Warp 0, 1 store their right (col 32 ~ 63) part, while warp 2, 3 store their left (row 0 ~ 31) part
         CUTE_UNROLL
         for (int i = 0; i < NUM_ELEMS_PER_THREAD/4; ++i) {
-            ku::st_shared(&p_exchange_buf[local_warp_idx^2][i*32*4 + lane_idx*4], *(float4*)(p_peer + i*4));
+            ku::st_shared(&p_exchange_buf[local_warp_idx^2][i*32*4 + lane_idx*4], *(float4*)(p + i*4));
         }
         NamedBarrier::arrive_and_wait(64, BARRIER_WARP02_SYNC_ID + (local_warp_idx&1));
         CUTE_UNROLL

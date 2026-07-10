@@ -9,17 +9,36 @@
 
 namespace sm100::mxfp8_fwd::head64 {
 
+using namespace cute;
+
 using e4m3 = cutlass::float_e4m3_t;
 using e8m0 = cutlass::float_ue8m0_t;
+
+template<
+    typename Shape_O, typename TMA_O,
+    typename Shape_Q_Scale, typename TMA_Q_Scale
+>
+struct TmaParams {
+    Shape_O shape_O; TMA_O tma_O;
+    Shape_Q_Scale shape_Q_scale; TMA_Q_Scale tma_Q_scale;
+    CUtensorMap tensor_map_q_nope;
+    CUtensorMap tensor_map_q_rope;
+    CUtensorMap tensor_map_kv_nope;
+    CUtensorMap tensor_map_kv_rope;
+};
 
 constexpr int D_Q = 512;
 constexpr int D_K = 512;
 constexpr int D_V = 448;
 constexpr int D_NOPE = 448;
+constexpr int D_NOPE_PAD = 512;
 constexpr int D_ROPE = 64;
 constexpr int NUM_SCALES_EACH_TOKEN = 8; // 7 valid 64-wide groups + 1 padding group.
 constexpr int SCALE_GROUP_SIZE = 64;
 constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+constexpr int K_QUANT_GROUP_SIZE = SCALE_GROUP_SIZE;
+constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
+constexpr int K_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
 constexpr int Q_ROPE_OFFSET = D_NOPE + NUM_SCALES_EACH_TOKEN;
 constexpr int KV_ROPE_OFFSET = D_NOPE + NUM_SCALES_EACH_TOKEN;
 constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE; 
@@ -27,17 +46,20 @@ constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
 constexpr int BYTES_PER_TOKEN = D_NOPE + NUM_SCALES_EACH_TOKEN + D_ROPE * sizeof(bf16);
 
 constexpr int B_H = 64;
-constexpr int NUM_THREADS = 256;
+constexpr int B_TOPK = 128;
+constexpr int NUM_BUFS = 3;
+constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
+constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
+constexpr float FP8_MAX = 448.0f;
+constexpr int NUM_SCALE_GROUPS_PAD = D_NOPE_PAD / MXFP8_SCALE_VEC_SIZE;
+constexpr int Q_SCALE_SMEM_ELEMS = B_H * NUM_SCALE_GROUPS_PAD;
+constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * NUM_SCALE_GROUPS_PAD;
 
 static_assert(D_Q == D_NOPE + D_ROPE);
 static_assert(D_K == D_NOPE + D_ROPE);
 static_assert(D_V == D_NOPE);
 static_assert(BYTES_PER_TOKEN == 584);
-
-constexpr int B_TOPK = 128;                                                                                         
-constexpr int NUM_BUFS = 3;                                                                                         
-constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 
 // Tensor memory columns
 namespace tmem_cols {
@@ -53,7 +75,7 @@ namespace tmem_cols {
 
 using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e4m3>{},
-    Shape<Int<B_H>, Int<D_V>>{},
+    Shape<Int<B_H>, Int<D_NOPE_PAD>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
@@ -64,11 +86,16 @@ using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
 ), Shape<_1, _1>{})); // NOT Transposed, May also need transpose?
 
 using SmemLayoutQScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFB(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE>>{}
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
 ));
 
+using SmemLayoutQScaleTMA = Layout<
+    Shape<Int<B_H>, Int<Q_SCALE_BYTES>>,
+    Stride<Int<Q_SCALE_BYTES>, _1>
+>;
+
 using SmemLayoutKScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFA(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE>>{}
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
 ));
 
 using SmemLayoutSscale = SmemLayoutQScale;
@@ -80,7 +107,8 @@ using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutO = SmemLayoutOTiles<8>; //TODO: WHY 8? For MODEL1 it might should be 7?
+using SmemLayoutO = SmemLayoutOTiles<7>;
+using SmemLayoutOBuf_TMA = SmemLayoutOTiles<1>;
 
 template<int NUM_TILES>
 using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
@@ -89,12 +117,12 @@ using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutKNoPE = SmemLayoutKTiles<8>; //TODO: WHY 8? For MODEL1 it might should be 7?
+using SmemLayoutKNoPE = SmemLayoutKTiles<8>;
 
 using SmemLayoutV = decltype(coalesce(
     composition(
         SmemLayoutKNoPE{},
-        Layout<Shape<Int<D_V>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
+        Layout<Shape<Int<D_NOPE_PAD>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}
     )
 , Shape<_1, _1>{}));
 
@@ -103,6 +131,9 @@ using SmemLayoutKRoPE = decltype(coalesce(tile_to_shape(
     Shape<Int<B_TOPK>, Int<64>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
+
+using SmemLayoutKNoPE_TiledMMA = SmemLayoutKNoPE;
+using SmemLayoutKRoPE_TiledMMA = SmemLayoutKRoPE;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
   UMMA::Layout_K_INTER_Atom<e4m3>{},
@@ -114,18 +145,19 @@ struct SharedMemoryPlan {
     union {
         struct {
             array_aligned<bf16, B_H*D_ROPE> q_rope;
-            array_aligned<e4m3, B_H*D_NOPE> q_nope;
+            array_aligned<e4m3, B_H*D_NOPE_PAD> q_nope;
         } q;
         struct {
-            array_aligned<e4m3, B_TOPK*D_NOPE> kv_nope[NUM_BUFS]; // NoPE part, dequantized
+            array_aligned<e4m3, B_TOPK*D_NOPE_PAD> kv_nope[NUM_BUFS]; // NoPE part, padded for SW128 MMA layout
             array_aligned<bf16, B_TOPK*D_ROPE> kv_rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
-            array_aligned<e8m0, cosize_v<SmemLayoutKScale>> kv_nope_scale[NUM_BUFS];
+            array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_nope_scale[NUM_BUFS];
         } kv;
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
     union {
-      e4m3 s[B_H*B_TOPK];
-      array_aligned<e8m0, cosize_v<SmemLayoutQScale>> q_scale;
+        e4m3 s[B_H*B_TOPK];
+        array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
+        array_aligned<bf16, cosize_v<SmemLayoutQRoPE>> q_rope;
     } s_q_scale;
     float head_scale[B_H], head_mi[B_H], head_li[B_H], head_real_mi[B_H];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
@@ -151,7 +183,24 @@ using TiledMMA_P_RoPE = decltype(make_tiled_mma(
 ));
 
 using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, D_V, B_H, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_P{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
+));
+using SmemLayoutPScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_P{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
+));
+using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_O{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+));
+using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_O{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
 ));
 
 enum NamedBarriers : int {

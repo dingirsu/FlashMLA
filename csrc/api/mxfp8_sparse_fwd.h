@@ -40,12 +40,11 @@ protected:
 /*
  * mxfp8_sparse_attn_prefill_interface
  *
- * MXFP8 sparse attention prefill with BF16 RoPE. Both Q and KV use the same format
- * as existing FP8 KV cache: NoPE part is e4m3 + block scales, RoPE part is BF16. SM100 only.
+ * MXFP8 sparse attention prefill. Both Q and KV are stored as e4m3 data
+ * followed by e8m0 block scales. SM100 only.
  *
- * Token layout (same as existing FP8 KV cache):
- *   - d_qk=512 (MODEL1): 448 bytes NoPE (e4m3) + 8 bytes scales + 128 bytes RoPE (BF16) = 584 bytes/token
- *   - d_qk=576 (V32): 512 bytes NoPE (e4m3) + 16 bytes scales + 128 bytes RoPE (BF16) = 656 bytes/token
+ * Token layout:
+ *   - d_qk=512: 512 bytes e4m3 + 8 bytes scales = 520 bytes/token
  */
 static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     const at::Tensor &q,        // [s_q, h_q, bytes_per_token_q]
@@ -75,13 +74,12 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     int topk = indices.size(2);
 
     TORCH_CHECK(d_qk == 512, "MXFP8 sparse prefill head64 currently supports only d_qk=512, got ", d_qk);
-    TORCH_CHECK(d_v == 448, "MXFP8 sparse prefill head64 currently supports only d_v=448, got ", d_v);
+    TORCH_CHECK(d_v == 512, "MXFP8 sparse prefill head64 currently supports only d_v=512, got ", d_v);
 
-    // Compute expected bytes per token (same as existing FP8 KV cache format)
+    // Compute expected bytes per token.
     int bytes_per_token;
-    if (d_qk == 512 && d_v == 448) {
-        // MODEL1 style: 448 bytes NoPE (e4m3) + 8 bytes scales + 128 bytes RoPE (BF16)
-        bytes_per_token = 448 + 8 + 128;
+    if (d_qk == 512 && d_v == 512) {
+        bytes_per_token = 512 + 8;
     } else {
         TORCH_CHECK(false, "Unsupported head sizes for MXFP8");
     }
@@ -147,7 +145,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     if (h_q == 64) {
         required_features.push_back(MxFp8FwdFeatures::HEAD_64);
     } else {
-        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv448: ", h_q);
+        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv512: ", h_q);
     }
     if (d_qk == 512) {
         required_features.push_back(MxFp8FwdFeatures::HEAD_DIM_512);
@@ -165,7 +163,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
         MxFp8Fwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else {
-        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv448: ", h_q);
+        TORCH_CHECK(false, "Unsupported h_q for MXFP8 sparse prefill k512/dv512: ", h_q);
     }
 
     return {out, max_logits, lse};

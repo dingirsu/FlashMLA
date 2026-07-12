@@ -24,7 +24,7 @@ CUTE_DEVICE
 void rescale_O_t(float scale[B_H]) {
     float o[B_H_TMEM];
     CUTE_UNROLL
-    for (int tile = 0; tile < D_V/64; ++tile) {
+    for (int tile = 0; tile < D_V/B_TOPK; ++tile) {
         ku::tmem_ld_32dp32bNx<B_H_TMEM>(TMEM_COL_START + tile*B_H_TMEM, o);
         cutlass::arch::fence_view_async_tmem_load();
         CUTE_UNROLL
@@ -38,7 +38,7 @@ void rescale_O_t(float scale[B_H]) {
 
 using FwdMode = SparseAttnFwdMode;
 
-template<bool HAVE_ROPE, typename TmaParams>
+template<typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
@@ -83,12 +83,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
     if (warp_idx == 0) {
         if(elect_one_sync()) {
-            plan.bar_prologue_q_nope.init(1);
-            plan.bar_prologue_q_rope.init(1);
+            plan.bar_prologue_q.init(1);
             plan.bar_prologue_utccp_q_scale.init(1);
             fence_barrier_init();
 
-            // Q is stored as: e4m3 NoPE data, e8m0 block scales, then bf16 RoPE.
+            // Q is stored as e4m3 data followed by e8m0 block scales.
             cute::SM90_TMA_LOAD_3D::copy(
                 &tma_params.tensor_map_q,
                 (uint64_t*)&plan.bar_prologue_q,
@@ -155,6 +154,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             if (idx_in_warpgroup < B_H) {
             int h = idx_in_warpgroup;
             Tensor sS_out = make_tensor(make_smem_ptr(plan.s_q_scale.s), SmemLayoutS{});
+            Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutOScaleBAtom{});
             float cur_pi_max = -CUDART_INF_F;
             constexpr int NUM_QUANT_GROUPS = B_TOPK/MXFP8_SCALE_VEC_SIZE;
             float absmax_p[NUM_QUANT_GROUPS];
@@ -187,7 +187,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             float cur_sum = 0.0f;
             CUTE_UNROLL
             for (int g = 0; g < NUM_QUANT_GROUPS; ++g) {
-                e8m0 scale_g = e8m0(absmax_p[g] / FP8_MAX); //TODO: change here to vectorized type conversion
+                float scale_f = absmax_p[g] > 0.0f ? absmax_p[g] / FP8_MAX : 1.0f;
+                e8m0 scale_g = e8m0(scale_f); //TODO: change here to vectorized type conversion
+                sS_scale(h, g*MXFP8_SCALE_VEC_SIZE, _0{}) = scale_g;
                 for (int i = 0; i < 32; ++i) {
                     int kk = i + g * 32;
                     float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max); //TODO: change here to vectorzied load from shmem
@@ -200,17 +202,19 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             if (k > 0) {
                 plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
             }
+            }
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
             if (k > 0) {
                 ku::tcgen05_after_thread_sync();
                 rescale_O_t<B_H, B_H_TMEM, tmem_cols::O, D_V>(plan.head_scale);
                 ku::tcgen05_before_thread_sync();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             }
 
-            fence_view_async_shared();
-            if (elect_one_sync()) {
+            if (idx_in_warpgroup == 0) {
                 plan.bar_so_ready.arrive();
-            }
             }
         }
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -240,16 +244,18 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         }
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
-        if (warp_idx < 4) {
+        {
             Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.data()), SmemLayoutO{});
             float o_head[B_H_TMEM];
-            int dv = warp_idx*32 + lane_idx;
-            int tile = dv / 64;
-            ku::tmem_ld_32dp32bNx<B_H_TMEM>(tmem_cols::O + tile*B_H_TMEM, o_head);
-            cutlass::arch::fence_view_async_tmem_load();
             CUTE_UNROLL
-            for (int h = 0; h < B_H; ++h) {
-                sO(h, dv) = bf16(o_head[h] * plan.head_scale[h]);
+            for (int tile = 0; tile < D_V/B_TOPK; ++tile) {
+                int dv = tile*B_TOPK + idx_in_warpgroup;
+                ku::tmem_ld_32dp32bNx<B_H_TMEM>(tmem_cols::O + tile*B_H_TMEM, o_head);
+                cutlass::arch::fence_view_async_tmem_load();
+                CUTE_UNROLL
+                for (int h = 0; h < B_H; ++h) {
+                    sO(h, dv) = bf16(o_head[h] * plan.head_scale[h]);
+                }
             }
         }
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -314,7 +320,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         CUTE_UNROLL
                         for (int local_col = 0; local_col < D_K/64; ++local_col) {
                             ku::tma_gather4(
-                                &(tma_params.tensor_map_kv_nope),
+                                &(tma_params.tensor_map_kv),
                                 plan.bar_kv_ready[cur_buf],
                                 sK_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
                                 local_col*64,
@@ -398,7 +404,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
                     plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     Tensor sK_scale = make_tensor(
-                        make_smem_ptr(plan.qkvo.kv.kv_nope_scale[cur_buf].data()),
+                        make_smem_ptr(plan.qkvo.kv.kv_scale[cur_buf].data()),
                         SmemLayoutKScale{}
                     );
                     auto sK_compact = make_tensor(sK_scale.data(), filter_zeros(sK_scale.layout()));
@@ -430,17 +436,28 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     int cur_buf = (k-1)%NUM_BUFS;
 
                     Tensor sS = make_tensor(make_smem_ptr(plan.s_q_scale.s), SmemLayoutS{});
+                    Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutOScaleBAtom{});
                     Tensor sV = make_tensor(make_smem_ptr(plan.qkvo.kv.kv[cur_buf].data()), SmemLayoutV{});
 
                     // Wait for S(i-1) and O to be scaled
                     plan.bar_so_ready.wait((k-1)&1);
                     ku::tcgen05_after_thread_sync();
 
+                    auto sS_compact = make_tensor(sS_scale.data(), filter_zeros(sS_scale.layout()));
+                    auto tS_compact = make_tensor(tS_scale.data(), filter_zeros(tS_scale.layout()));
+                    auto copy_S_scale = make_utccp_copy(SM100_UTCCP_4x32dp128bit_1cta{}, tS_compact);
+                    auto thr_S = copy_S_scale.get_slice(0);
+                    auto src_S = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_1cta>(
+                        thr_S.partition_S(sS_compact) // TODO: change here to tcgen05.ld instead of tcgen05.cp
+                    );
+                    auto dst_S = thr_S.partition_D(tS_compact);
+                    cute::copy(copy_S_scale, src_S, dst_S);
+
                     // O += sS @ sV
                     CUTE_UNROLL
                     for (int dv_block = 0; dv_block < D_V/B_TOPK; ++dv_block) {
                         Tensor tO_block = partition_fragment_C(tiled_mma_O, Shape<Int<B_TOPK>, Int<B_H>>{});
-                        tO_block.data().get() = tmem_cols::O + dv_block*B_TOPK;
+                        tO_block.data().get() = tmem_cols::O + dv_block*B_H_TMEM;
                         ku::utcmma_blockscaled_ss(
                             tiled_mma_O, sV(make_coord(_, dv_block), _), sS,
                             tV_scale, tS_scale, tO_block, k == 1
@@ -519,7 +536,7 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     auto tma_Q_scale = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(
-            make_gmem_ptr((e8m0*)((uint8_t*)params.q + D_NOPE)),
+            make_gmem_ptr((e8m0*)((uint8_t*)params.q + D_Q)),
             make_layout(
                 shape_Q_scale,
                 make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
@@ -548,7 +565,7 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
         tensor_map_kv
     };
 
-    auto kernel = &sparse_attn_fwd_kernel<D_QK == 512, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

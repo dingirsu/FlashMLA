@@ -211,10 +211,9 @@ struct MxFp8SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
 
-    // Input tensors: MXFP8 with BF16 RoPE
-    // Same format as existing FP8 KV cache: NoPE part is e4m3 + block scales, RoPE part is BF16
-    void* __restrict__ q;          // [s_q, h_q, bytes_per_token] (NoPE: e4m3+scales, RoPE: BF16)
-    void* __restrict__ kv;         // [s_kv, h_kv, bytes_per_token] (NoPE: e4m3+scales, RoPE: BF16)
+    // Input tensors: MXFP8 e4m3 data followed by e8m0 block scales.
+    void* __restrict__ q;          // [s_q, h_q, bytes_per_token]
+    void* __restrict__ kv;         // [s_kv, h_kv, bytes_per_token]
     int* __restrict__ indices;     // [s_q, h_kv, topk]
     float* __restrict__ attn_sink; // [h_q], may be nullptr
     int* __restrict__ topk_length; // [s_q], may be nullptr

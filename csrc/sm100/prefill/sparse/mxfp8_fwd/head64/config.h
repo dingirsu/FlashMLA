@@ -117,9 +117,34 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
   Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+using TiledMMA_P = decltype(make_tiled_mma( // make the type name shorter
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>{}
+));
+
+using TiledMMA_O = decltype(make_tiled_mma(
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_P{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D>>{}
+));
+using SmemLayoutPScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_P{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D>>{}
+));
+using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_O{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+));
+using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_O{},
+    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+));
+
 struct SharedMemoryPlan {
     union {
-        array_aligned<bf16, B_H*D_Q> q;
+        array_aligned<e4m3, B_H*D_Q> q;
         struct {
             array_aligned<e4m3, B_TOPK*D_K> kv[NUM_BUFS];
             array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_scale[NUM_BUFS];
@@ -130,6 +155,7 @@ struct SharedMemoryPlan {
         e4m3 s[B_H*B_TOPK];
         array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
     } s_q_scale;
+    array_aligned<e8m0, cosize_v<SmemLayoutOScaleBAtom>> s_scale;
     float head_scale[B_H], head_mi[B_H], head_li[B_H], head_real_mi[B_H];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     float p_t[B_TOPK*B_H];
@@ -144,31 +170,6 @@ struct SharedMemoryPlan {
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
 };
-
-using TiledMMA_P = decltype(make_tiled_mma( // make the type name shorter
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
-));
-
-using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
-    TiledMMA_P{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
-));
-using SmemLayoutPScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
-    TiledMMA_P{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_NOPE_PAD>>{}
-));
-using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
-    TiledMMA_O{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
-));
-using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
-    TiledMMA_O{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
-));
 
 enum NamedBarriers : int {
     wg0_sync = 0,

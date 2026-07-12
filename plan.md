@@ -1,577 +1,865 @@
-# Sparse Head-Small Transposed Backward Plan
+# MXFP8 DSA Prefill Kernel — Bug-Fix Plan (D_QK=512, D_V=448)
 
-This plan targets a first SM100 backward kernel for
-`csrc/sm100/prefill/sparse/fwd/head_small/phase1.cuh` style sparse prefill.
-The forward kernel uses a transposed attention dataflow:
+> Target file: `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/phase1.cuh`
+> Companion file: `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/config.h`
+> API: `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/phase1.h`
+> Instantiation: `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu`
+>
+> Scope of this revision: get `D_QK=512`, `D_V=448` (i.e. the `MX_FP8` variant) to
+> compile, link against `csrc/api/mxfp8_sparse_fwd.h`, and produce numerically
+> correct attention output. Performance is secondary — we only fix correctness,
+> typed-in declarations, and the explicit TODO items that the kernel already
+> flags.
+>
+> Reference (non-mxfp8) for sanity: `csrc/sm100/prefill/sparse/fwd/head64/`.
 
-```text
-P_t = K @ Q^T          [B_TOPK, B_H]
-S_t = softmax(P_t)     logically [B_TOPK, B_H]
-O_t = V^T @ S_t        [D_V, B_H]
-```
+## Background
 
-Backward should keep the same principle: avoid register-fragment transpose and
-cross-warp shuffle paths by using TMEM as the accumulator/exchange layer and
-SMEM as the explicit transpose/staging surface.
-
-KernelWiki references used:
-
-- `sources/prs/cutlass/PR-2466.md` (`pr-cutlass-2466`): Blackwell MLA backward
-  uses transposed `S^T = QK` and `dP^T = dOV`, stores score/probability data in
-  SMEM, and dedicates TMEM regions to `dK`, `dV`, and reused `dQ/dP` workspaces.
-- `wiki/techniques/warp-specialization.md` (`technique-warp-specialization`):
-  on SM100, one warp can issue `tcgen05.mma` while other warps specialize on
-  load/compute/epilogue because accumulators live in TMEM.
-- `wiki/kernels/flash-attention-4.md` (`kernel-flash-attention-4`): overlap
-  softmax/rescale work with MMA work and avoid unnecessary correction work.
-
-## Fixed Decisions
-
-- Inputs/outputs: `dO`, final `dQ`, final `dK`, and final `dV` are BF16.
-- Internal accumulation: FP32 for `dQ` TMEM, `dK/dV` global accumulation buffers,
-  softmax derivative scalars, and `d_attn_sink`.
-- Sparse indices are per query token and shared by all heads:
-  `indices[s_q_idx, kk]`, not per-head indices.
-- Sparse indices have no duplicates inside one query. A CTA therefore does not
-  need local duplicate-row combining for its own topk list.
-- Cross-query accumulation is still required for `dK/dV` because different query
-  CTAs can reference the same KV row.
-- `attn_sink` is `nn.Parameter(torch.empty(n_q_heads, dtype=torch.float32))`.
-  Its gradient is a global FP32 vector `[n_q_heads]` reduced across all query
-  rows.
-- Backward always recomputes `P_t = K @ Q^T`. Forward does not need to save P or
-  probabilities.
-- Backward uses forward `lse` only. `max_logits` is not a backward input.
-- Grid is one CTA per query row: `grid = [s_q, 1, 1]`.
-
-Non-goals for the first kernel:
-
-- No direct BF16 global stores to final `dK/dV` from the main backward kernel.
-- No FP8/MXFP8 path until the BF16 backward is correct and profiled.
-- No 2-SM cooperative mode initially.
-
-## Math
-
-Forward recomputation uses natural-log logits conceptually:
+The kernel implements DSA (DeepSeek Sparse Attention) prefill with:
 
 ```text
-raw[kk,h] = dot(K[kk,:], Q[h,:])
-p[kk,h]   = raw[kk,h] * sm_scale
-prob[kk,h] = exp(p[kk,h] - lse[h])
-sink_prob[h] = exp(attn_sink[h] - lse[h])
-O[h,dv] = sum_kk prob[kk,h] * V[kk,dv] + sink_prob[h] * 0
+Q :  e4m3 NoPE [B_H, D_V=448] + UE8M0 scales [B_H, 14] + bf16 RoPE [B_H, 64]
+K  :  same layout as Q (448 NoPE e4m3, 8 bytes of scales incl. padding, 64 RoPE bf16)
+V  :  reuses K's NoPE bytes (so V = K's NoPE, 448 e4m3 + scales)
+P := QK^T  :  [B_TOPK, B_H]            ; online softmax, FP32 in TMEM
+S := P*sm_scale_div_log2 → exp2 → quantized e4m3 [B_H, B_TOPK]  + UE8M0 scales
+O := S @ V  :  [B_H, D_V]              ; in TMEM, then rescaled per block
 ```
 
-Forward code may compute in base-2 for speed:
+Pipeline depth: `NUM_BUFS=3`, `B_TOPK=128`, `B_H=64`, `NUM_THREADS=384` (3
+warpgroups).
+
+Warpgroups:
 
 ```text
-p_log2 = raw * sm_scale * log2(e)
-prob = exp2(p_log2 - lse * log2(e))
-sink_prob = exp2(attn_sink * log2(e) - lse * log2(e))
+WG0 (warps 0..3)   : scale & exp + epilogue (TMEM rescale, O store via TMA)
+WG1 (warps 4..7)   : KV NoPE producer (TMA gather4 + per-row scale scatter)
+WG2 (warps 8..11)  : MMA issuer (UTCCP Q scales → tcgen05.mma, P / S / O MMAs)
+                     warp 8  : Q UTCCP, P/QK/ROPE, SV
+                     warp 9  : KV valid mask producer
+                     warp 10,11 : K RoPE cp.async loader
 ```
 
-Useful per-head scalar:
+## Catalogue of Bugs
 
-```text
-D[h] = sum_dv dO[h,dv] * O[h,dv]
-```
+The bugs are listed in roughly the order they need to be fixed, P0 first.
 
-For each valid sparse KV row `kk` and head `h`:
+### P0 — `run_fwd_phase1_kernel` does not exist; no kernel is ever launched
 
-```text
-dProb[kk,h] = dot(V[kk,:], dO[h,:])
-dP_scaled[kk,h] = prob[kk,h] * (dProb[kk,h] - D[h])
-dRaw[kk,h] = dP_scaled[kk,h] * sm_scale
+`phase1.h:10` declares `run_mxfp8_fwd_phase1_kernel<D_QK>`, but `phase1.cuh:547`
+defines `run_fwd_phase1_kernel` (different name). The instantiation in
+`instantiations/phase1_k512.cu:6` instantiates `run_mxfp8_fwd_phase1_kernel<512>`.
+Result: linker error.
 
-dV[kk,dv] += prob[kk,h] * dO[h,dv]
-dQ[h,dq]  += dRaw[kk,h] * K[kk,dq]
-dK[kk,dq] += dRaw[kk,h] * Q[h,dq]
-```
+Also, the `run_fwd_phase1_kernel<D_QK>` body in `phase1.cuh:548-622` builds the
+TMA descriptors and then **falls off the end** without ever calling
+`kernel<<<...>>>(params, tma_params)`. So even after the rename, nothing runs.
 
-Sink term:
+**Fix:**
 
-```text
-d_attn_sink[h] += sink_prob[h] * (0 - D[h])
-```
+1. Rename `run_fwd_phase1_kernel` → `run_mxfp8_fwd_phase1_kernel` in
+   `phase1.cuh:547`.
+2. Add the missing `TmaParams` struct to `mxfp8_fwd/head64/config.h`. It must
+   hold the same six things the kernel reads:
+   `shape_O`, `tma_O`, `shape_Q_scale`, `tma_Q_scale`, plus the three
+   `CUtensorMap`s `tensor_map_q_nope`, `tensor_map_q_rope`, `tensor_map_kv_nope`,
+   `tensor_map_kv_rope`. Model after `fwd/head64/config.h:17` and add the
+   `tma_Q_scale` field.
+3. Define `SmemLayoutOBuf_TMA = SmemLayoutOTiles<1>` in `config.h` (the
+   `run_*` body references it at `phase1.cuh:566`).
+4. Add the missing `ku::make_tensor_map_kv_nope` setup with `D_NOPE/8` int64 box
+   (already drafted in `phase1.cuh:612-620` — leave as-is but feed it into
+   `TmaParams`).
+5. Add the missing `ku::make_tensor_map_kv_rope` setup with `D_ROPE` bf16
+   (already drafted in `phase1.cuh:602-610`).
+6. At the end of `run_mxfp8_fwd_phase1_kernel`, after the TMA builders,
+   instantiate `TmaParams`, call
+   `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)`,
+   and launch `kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params)`.
+   The reference body is at `fwd/head64/phase1.cuh:664-670`.
 
-There is no direct sink contribution to `dV`, `dQ`, or `dK`. The sink only
-changes the denominator through `lse`; that effect is already included in
-`prob` and `D` for real KV logits. Do not multiply `d_attn_sink` by `sm_scale`:
-`attn_sink` is already a natural-logit parameter in the forward path.
+### P0 — `SharedMemoryPlan` member names do not match the kernel
 
-## Transposed Backward Dataflow
-
-Use these logical matrices inside the CTA:
-
-```text
-P_t      = K @ Q^T                        [B_TOPK, B_H]
-Prob_t   = softmax(P_t, lse)              [B_TOPK, B_H]
-dP_t     = V @ dO^T                       [B_TOPK, B_H]
-dRaw_t   = Prob_t * (dP_t - D) * sm_scale [B_TOPK, B_H]
-dV       = Prob_t @ dO                    [B_TOPK, D_V]
-dK       = dRaw_t @ Q                     [B_TOPK, D_QK]
-dQ_t     = K^T @ dRaw_t                   [D_QK, B_H]
-```
-
-The accumulator layout for `dV` is `[B_TOPK, D_V]`, matching the sparse KV row
-storage order and making scatter/atomic stores straightforward.
-
-## Tile Sizes and Launch
-
-```text
-B_TOPK      = 64
-B_H         = H_Q                    // 8, 16, 24, or 32
-B_H_TMEM    = H_Q == 24 ? 32 : H_Q
-D_V         = 128                    // two 64-wide tiles
-D_QK        = 128 or 192             // NoPE 128 + optional RoPE 64
-NUM_BUFS    = 2                      // KV, valid, and indices buffers
-NUM_THREADS = 384                    // three 128-thread warpgroups
-```
-
-Launch shape:
+The struct in `config.h:113-143` exposes:
 
 ```cpp
-__launch_bounds__(384, 1, 1)
-kernel<<<params.s_q, 384, smem_size, params.stream>>>(params, tma_params);
+union {
+    struct { bf16 q_rope; e4m3 q_nope; } q;
+    struct { e4m3 kv_nope[NUM_BUFS]; bf16 kv_rope; e8m0 kv_nope_scale[NUM_BUFS]; } kv;
+    bf16 o[cosize_v<SmemLayoutO>];
+} qkvo;
+union { e4m3 s[B_H*B_TOPK]; e8m0 q_scale[cosize_v<SmemLayoutQScale>]; } s_q_scale;
 ```
 
-No cluster is used in v1; this matches the existing head-small forward kernel's
-1-SM CTA model.
+The kernel, however, repeatedly reads these nonexistent members:
 
-## TMEM Allocation
+| Line | Bad expression | Correct expression |
+| --- | --- | --- |
+| `phase1.cuh:97`  | `plan.s_q_rope.q_tail.q_scale.data()` | `plan.s_q_scale.q_scale.data()` |
+| `phase1.cuh:167` | `make_smem_ptr(plan.s)` | `make_smem_ptr(plan.s_q_scale.s.data())` (and use `SmemLayoutS` correctly) |
+| `phase1.cuh:390` | `plan.s_q_rope.q_tail.q_scale.data()` | `plan.s_q_scale.q_scale.data()` |
+| `phase1.cuh:472` | `make_smem_ptr(plan.s_q_rope.s)` | `make_smem_ptr(plan.s_q_scale.s.data())` |
 
-Allocate 512 TMEM columns and use explicit column starts. Column widths are
-based on MMA N-dimension columns, not logical row counts.
+**Fix:** Replace all four sites with the correct member access. (Optionally,
+also add an `s_scale[NUM_QUANT_GROUPS]` element to `s_q_scale` if you want the
+scale/exp logic to write its `e8m0 scale_g` values there; see P0 — tS_scale
+below.)
 
-Worst-case `D_QK=192`, `B_H=32` layout:
+### P0 — `bar_prologue_utccp_rope` / `bar_prologue_utccp_nope` do not exist
 
-| Region | Start | Active width | Reserved end | Contents |
-| --- | ---: | ---: | ---: | --- |
-| `DV` | 0 | 128 | 127 | `dV [B_TOPK, D_V]`, two 64-wide tiles |
-| `DK` | 128 | 128 | 255 | `dK_nope [B_TOPK, 128]`, two 64-wide tiles |
-| `Score` | 256 | `B_H_TMEM` <= 32 | 319 | reused for `P_t` / `dP_t [B_TOPK, B_H]` |
-| `DQ` | 320 | `2 * B_H_TMEM` <= 64 | 383 | `dQ_nope_t [128, B_H]`, two 64-wide tiles |
-| `DK_RoPE` | 384 | 64 | 447 | `dK_rope [B_TOPK, 64]` when `D_QK=192` |
-| `DQ_RoPE` | 448 | `B_H_TMEM` <= 32 | 479 | `dQ_rope_t [64, B_H]` when `D_QK=192` |
-| `Spare` | 480 | 32 | 511 | future score double buffer or scratch |
-
-Recommended constants:
+`phase1.cuh:108-109` initialises two barriers that are not declared in
+`SharedMemoryPlan`:
 
 ```cpp
-struct tmem_cols {
-    static constexpr int DV = 0;
-    static constexpr int DV_WIDTH = 128;
-    static constexpr int DK = 128;
-    static constexpr int DK_WIDTH = 128;
-    static constexpr int SCORE = 256;
-    static constexpr int SCORE_WIDTH = B_H_TMEM;
-    static constexpr int DQ = 320;
-    static constexpr int DQ_WIDTH = 2 * B_H_TMEM;
-    static constexpr int DK_ROPE = 384;
-    static constexpr int DK_ROPE_WIDTH = D_QK == 192 ? 64 : 0;
-    static constexpr int DQ_ROPE = 448;
-    static constexpr int DQ_ROPE_WIDTH = D_QK == 192 ? B_H_TMEM : 0;
-    static constexpr int TOTAL_RESERVED = 480;
-};
-static_assert(tmem_cols::TOTAL_RESERVED <= 512);
+plan.bar_prologue_utccp_rope.init(1);    // line 108
+plan.bar_prologue_utccp_nope.init(1);    // line 109
 ```
 
-The `Score` region reserves columns 256..319 for simple fixed addressing even
-though the active width is only `B_H_TMEM`. This leaves a clean boundary for
-`DQ` at 320.
+`config.h:134` only declares `bar_prologue_utccp_q_scale` and
+`bar_prologue_utccp_k_scale`. The `bar_prologue_utccp_*` field is what the
+UTCCP step later `umma_arrive_noelect`s into. The same comment also applies to
+`phase1.cuh:412` (`umma_arrive_noelect(plan.bar_prologue_q_scale)` — this name
+is also wrong; the field is `bar_prologue_utccp_q_scale`).
 
-## Shared Memory Plan
+Also `phase1.cuh:116` says `bar_k_valid_ready[i].init(B_TOPK/8)` with
+`// TODO: Check the NUmber here`. With `B_TOPK = 128`, that is 16 threads per
+buffer producing validity, but only `lane_idx < B_TOPK/8 = 16` lanes run in
+warp 9 (`phase1.cuh:490`), so `init(16)` is correct. Keep it. (Drop the TODO.)
 
-Use a `SharedMemoryPlan` close to forward, with explicit backward staging. Store
-`dO` in transposed form `[D_V, B_H]` in SMEM so both `dP_t = V @ dO^T` and
-`dV = Prob_t @ dO` can use compatible UMMA views without extra cross-warp
-transpose.
+**Fix:** Replace both init sites and the umma_arrive to use
+`bar_prologue_utccp_q_scale` / `bar_prologue_utccp_k_scale` (matching the
+struct).
 
-Persistent/prologue data:
+### P0 — `B_H_TMEM` is undefined
 
-```text
-q_nope        SmemLayoutQNoPE        [B_H, 128] bf16
-q_rope        SmemLayoutQRoPE        [B_H, 64] bf16, D_QK=192 only
-do_t          SmemLayoutDOTransposed [D_V, B_H] bf16
-o             linear/UMMA layout     [B_H, D_V] bf16, only needed for sum_odo
-lse           float[B_H]
-neg_lse       float[B_H]
-sum_odo       float[B_H]
-attn_sink     float[B_H]
-```
+`phase1.cuh:22` declares a templated function `rescale_O_t<B_H, B_H_TMEM, …>`.
+`phase1.cuh:220` calls it as `rescale_O_t<Kernel>(plan.head_scale)` (no extra
+args). `phase1.cuh:255-258` and the function body itself use
+`Kernel::B_H_TMEM`, but the `Kernel` alias is not declared anywhere in the
+mxfp8 namespace and `B_H_TMEM` is not defined in `config.h`. The `B_H` for
+this kernel is fixed at 64, so `B_H_TMEM = B_H = 64` (one TMEM row per
+`head_real_mi[h]`).
 
-Double-buffered sparse data:
-
-```text
-k_nope[2]     SmemLayoutKNoPE        [B_TOPK, 128] bf16
-v[2]          SmemLayoutV            [B_TOPK, D_V] bf16
-indices[2]    int[B_TOPK]
-valid[2]      char[B_TOPK / 8]
-k_rope        SmemLayoutKRoPE        [B_TOPK, 64] bf16, D_QK=192 only
-```
-
-Score/derivative data:
-
-```text
-p_t           float[B_TOPK * B_H]
-prob_t        bf16[B_TOPK * B_H]
-dp_t          float[B_TOPK * B_H]
-draw_t        bf16[B_TOPK * B_H]      // dRaw_t, MMA operand for dK/dQ
-```
-
-Output staging:
-
-```text
-dq_smem       bf16[B_H, D_QK]         // optional; direct global store is also OK
-dk_vec        float vector scratch    // TMEM -> FP32 atomicAdd to dk_acc
-dv_vec        float vector scratch    // TMEM -> FP32 atomicAdd to dv_acc
-```
-
-Worst-case SMEM byte budget before barrier objects, with aliasing:
-
-| Buffer | Bytes | Notes |
-| --- | ---: | --- |
-| `q_nope [B_H,128]` | 8192 | persistent |
-| `q_rope [B_H,64]` | 4096 | D_QK=192 only |
-| `do_t [128,B_H]` | 8192 | persistent transposed dO |
-| `o [B_H,128]` | 8192 | can alias with later staging after `sum_odo` |
-| `k_nope[2] [64,128]` | 32768 | double-buffered |
-| `v[2] [64,128]` | 32768 | double-buffered unless aliased with K load phases |
-| `k_rope [64,64]` | 8192 | single-buffered v1 |
-| `p_t [64,B_H] float` | 8192 | can alias with `dp_t` after use |
-| `dp_t [64,B_H] float` | 8192 | sequential with `p_t` if copied carefully |
-| `prob_t [64,B_H] bf16` | 4096 | needed for dV MMA |
-| `draw_t [64,B_H] bf16` | 4096 | needed for dK/dQ MMA |
-| `dq_smem [B_H,192] bf16` | 12288 | optional staging; direct store can skip it |
-| `indices[2]` | 512 | double-buffered for epilogue address safety |
-| `valid[2]` | 16 | double-buffered |
-| scalar arrays | <1024 | `lse`, `neg_lse`, `sum_odo`, barriers metadata |
-
-With unions (`o` with `dq_smem`, `p_t` with `dp_t` where legal, and output
-scratch with score buffers), the target is about 110-125 KB, below SM100's
-228 KB SMEM capacity. Add a compile-time `static_assert(sizeof(SharedMemoryPlan)
-<= cutlass::arch::sm100_smem_capacity_bytes)` once layouts are concrete.
-
-## SumOdO Strategy
-
-WG0 computes `sum_odo[h] = dot(O[h,:], dO[h,:])` in the prologue.
-
-Use all 128 threads in WG0:
-
-```text
-head = idx_in_warpgroup % B_H
-part = idx_in_warpgroup / B_H
-parts_per_head = 128 / B_H
-```
-
-Each thread handles a contiguous or strided slice of `D_V / parts_per_head`
-elements:
-
-```text
-B_H=32 -> 4 threads/head, 32 dv values/thread
-B_H=16 -> 8 threads/head, 16 dv values/thread
-B_H=8  -> 16 threads/head, 8 dv values/thread
-```
-
-Write partial sums to `sum_odo_partial[128]`, synchronize WG0, then one thread
-per head reduces `parts_per_head` partials into `sum_odo[h]`. This avoids
-complicated sub-warp masks and gives a clear barrier before softmax derivative
-computation.
-
-## Warpgroup and Warp Assignment
-
-Keep three warpgroups to match the forward kernel:
-
-```text
-WG0: compute/softmax/epilogue, warps 0..3
-WG1: sparse KV + prologue loader, warps 4..7
-WG2: tcgen05 MMA issuer, warps 8..11
-```
-
-WG0:
-
-- Initialize barriers and TMEM from warp 0.
-- Load `lse`, precompute `neg_lse`, load `attn_sink`, and compute `sum_odo`.
-- Copy `P_t` / `dP_t` from TMEM Score into SMEM.
-- Compute `prob_t` and `draw_t = prob_t * (dP_t - sum_odo) * sm_scale`.
-- Compute `d_attn_sink[h] = -sink_prob[h] * sum_odo[h]` and FP32 `atomicAdd`
-  into global `d_attn_sink[h]`.
-- Read TMEM `dQ_t`, `dK`, and `dV` in vectorized chunks.
-- Direct-store BF16 `dQ`; FP32 `atomicAdd` `dK/dV` into `dk_acc/dv_acc`.
-
-WG1:
-
-- Warp 4 loads sparse indices/valid masks and issues TMA gather for K/V NoPE.
-- Warp 5 loads Q, O, and dO; write dO as transposed `do_t [D_V, B_H]`.
-- Warps 6..7 load RoPE K rows with cp.async when `D_QK=192`.
-- Keep `indices[2]` double-buffered because the optimized epilogue may still
-  need indices for block `k-2` while WG1 prepares indices for block `k`.
-
-WG2:
-
-- Warp 8 issues all `tcgen05.mma` instructions using `elect_one_sync()`.
-- Warp 9 can generate valid masks or prepare scatter addresses if WG1 becomes
-  overloaded.
-- Warps 10..11 can be idle in v1 or used for RoPE copy assistance.
-
-Register directives:
+**Fix:** Add to `config.h`:
 
 ```cpp
-// Same starting point as forward.
-warpgroup_reg_alloc<176>();   // WG0 compute/softmax/epilogue
-warpgroup_reg_dealloc<80>();  // WG1 loader
-warpgroup_reg_dealloc<80>();  // WG2 MMA issuer
-```
-
-Verify with `--ptxas-options=-v`. If WG0 spills, split WG0 into warps 0..1 for
-score/softmax derivative and warps 2..3 for TMEM epilogue.
-
-## Barrier Plan
-
-For v1 correctness, keep score/MMAs mostly serial and use single logical
-barriers:
-
-```text
-bar_kv_ready[2]       WG1 -> WG2, K/V NoPE tile ready
-bar_k_rope_ready      WG1 -> WG2, K RoPE tile ready
-bar_valid_ready[2]    WG1 -> WG0, valid mask and indices ready
-bar_score_free        WG0 -> WG2, Score TMEM can be overwritten
-bar_qk_done           WG2 -> WG0, P_t ready in Score TMEM
-bar_dp_done           WG2 -> WG0, dP_t ready in Score TMEM
-bar_ds_ready          WG0 -> WG2, prob_t/draw_t SMEM operands ready
-bar_dv_done           WG2 -> WG0, dV TMEM accumulator ready
-bar_dk_done           WG2 -> WG0, dK TMEM accumulator ready
-bar_dq_done           WG2 -> WG0, dQ TMEM accumulator ready
-bar_store_done[2]     WG0 -> WG1/WG2, indices/output staging reusable
-wg0_sync              intra-WG0 named barrier
-```
-
-Introduce `[2]` variants for `bar_qk_done`, `bar_dp_done`, and score buffers only
-in the optimized double-buffered score pipeline. Always use
-`tcgen05_after_thread_sync()` before reading TMEM and `tcgen05_before_thread_sync()`
-before releasing a TMEM region to the MMA warp.
-
-## Pipeline
-
-### Prologue
-
-1. Initialize barriers and allocate 512 TMEM columns.
-2. Load Q NoPE/RoPE to SMEM.
-3. Load O and dO; store dO as `do_t [D_V, B_H]`.
-4. Load `lse`, compute `neg_lse`, and load `attn_sink`.
-5. WG0 computes `sum_odo[h]` and `d_attn_sink[h]`, then FP32 atomic-adds sink
-   gradients to the global `[n_q_heads]` vector.
-6. WG1 starts loading KV block 0, `indices[0]`, and `valid[0]`.
-
-### V1 Serial Main Loop
-
-For each sparse block `k`:
-
-1. WG2 waits for `bar_kv_ready[cur]`, `bar_valid_ready[cur]`, and
-   `bar_score_free`.
-2. WG2 computes `P_t = K @ Q^T` into `tmem Score`.
-   - If `D_QK=192`, compute RoPE partial first and NoPE partial with accumulate,
-     matching forward's score semantics.
-3. WG0 copies `P_t` TMEM -> `p_t` SMEM.
-4. WG2 computes `dP_t = V @ dO^T` into `tmem Score`.
-5. WG0 copies `dP_t` TMEM -> `dp_t` SMEM.
-6. WG0 computes `prob_t` and `draw_t` for valid rows; invalid rows write zero.
-7. WG2 computes gradient MMAs:
-   - `dV [B_TOPK, D_V] = Prob_t [B_TOPK, B_H] @ dO [B_H, D_V]`.
-   - `dK_nope [B_TOPK,128] = draw_t [B_TOPK,B_H] @ Q_nope [B_H,128]`.
-   - `dK_rope [B_TOPK,64] = draw_t @ Q_rope` when `D_QK=192`.
-   - `dQ_nope_t [128,B_H] += K_nope^T [128,B_TOPK] @ draw_t`.
-   - `dQ_rope_t [64,B_H] += K_rope^T @ draw_t` when `D_QK=192`.
-8. WG0 epilogue for this block:
-   - Read `dV` and `dK` from TMEM and FP32 `atomicAdd` to `dv_acc/dk_acc` using
-     `indices[cur]`.
-   - Skip invalid rows.
-9. Release KV/indices buffer `cur` and Score TMEM.
-
-`dQ_t` accumulates across all sparse blocks in TMEM and is stored only after the
-loop finishes.
-
-### Optimized Steady State
-
-Target overlap:
-
-```text
-WG1: load K/V(k+1), indices(k+1), valid(k+1)
-WG2: compute P_t(k) and gradient MMAs for k
-WG0: softmax/draw for k-1 and dK/dV epilogue for k-2
-```
-
-`NUM_BUFS=2` is sufficient for K/V SMEM because the dK/dV epilogue reads only
-TMEM accumulators plus `indices[cur]`; it does not re-read K/V SMEM. Indices
-must stay double-buffered so epilogue address generation cannot race with WG1's
-next index load.
-
-After v1 correctness:
-
-- Add a second score TMEM region if the 512-column budget allows it cleanly.
-- Double-buffer `bar_qk_done`, `bar_dp_done`, and Score ownership.
-- Move `dV` earlier because it needs only `prob_t` and dO, while `dK/dQ` need
-  `draw_t`.
-- For `D_QK=192`, compute gradients in this order for overlap:
-  1. `dK_nope` two 64-wide tiles.
-  2. `dK_rope` one tile.
-  3. `dQ_nope_t` two tiles.
-  4. `dQ_rope_t` one tile.
-
-## MMA Major Selection
-
-The first implementation should use the following atom orientations. The exact
-CuTe layouts should be written to match this table before coding the kernel.
-
-| MMA | Result shape | A operand | A major | B operand | B major |
-| --- | --- | --- | --- | --- | --- |
-| `P_t = K @ Q^T` | `[B_TOPK, B_H]` | `K [B_TOPK,D]` | `K` | `Q [B_H,D]` | `K` |
-| `dP_t = V @ dO^T` | `[B_TOPK,B_H]` | `V [B_TOPK,D_V]` | `K` | `do_t [D_V,B_H]` | `K` |
-| `dV = Prob_t @ dO` | `[B_TOPK,64]` | `Prob_t [B_TOPK,B_H]` | `K` | `do_t tile [64,B_H]` | `MN` |
-| `dK = draw_t @ Q` | `[B_TOPK,64]` | `draw_t [B_TOPK,B_H]` | `K` | `Q tile [B_H,64]` | `MN` |
-| `dQ_t = K^T @ draw_t` | `[64,B_H]` | `K tile [64,B_TOPK]` | `MN` | `draw_t [B_TOPK,B_H]` | `MN` |
-
-Sketch:
-
-```cpp
-using TiledMMA_QK = SM100_MMA_F16BF16_SS_NOELECT<
-    bf16, bf16, float, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>;
-
-using TiledMMA_DPV = SM100_MMA_F16BF16_SS_NOELECT<
-    bf16, bf16, float, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>;
-
-using TiledMMA_DV = SM100_MMA_F16BF16_SS_NOELECT<
-    bf16, bf16, float, B_TOPK, 64, UMMA::Major::K, UMMA::Major::MN>;
-
-using TiledMMA_DK = SM100_MMA_F16BF16_SS_NOELECT<
-    bf16, bf16, float, B_TOPK, 64, UMMA::Major::K, UMMA::Major::MN>;
-
-using TiledMMA_DQ = SM100_MMA_F16BF16_SS_NOELECT<
-    bf16, bf16, float, 64, B_H, UMMA::Major::MN, UMMA::Major::MN>;
-```
-
-## dQ TMEM-to-Global Transpose
-
-`dQ_t` is accumulated in TMEM as `[D_QK_tile, B_H]`, but global `dQ` is
-`[B_H, D_QK]`. Use the same pattern as forward's O epilogue:
-
-```cpp
-for (int tile = 0; tile < D_QK / 64; ++tile) {
-    int dq_pos = tile * 64 + warp_idx_in_wg0 * 32 + lane_idx;
-    if (dq_pos < D_QK) {
-        float dq_vals[B_H_TMEM];
-        ku::tmem_ld_32dp32bNx<B_H_TMEM>(dq_tmem_col(tile), dq_vals);
-        cutlass::arch::fence_view_async_tmem_load();
-        for (int h = 0; h < B_H; ++h) {
-            params.dq[s_q_idx, h, dq_pos] = bf16(dq_vals[h]);
-        }
-    }
+namespace sm100::mxfp8_fwd::head64 {
+constexpr int B_H_TMEM = B_H;        // 64; P / O tmem columns are 64-wide rows
 }
 ```
 
-For `D_QK=192`, this is three 64-wide passes. Warps 0..3 cover 128 positions per
-pass capacity, so pass 0/1 use all four warps and pass 2 uses the first two
-warps for positions 128..191.
+(or use the same value through `Kernel` if you wrap things in a struct later).
+Verify with the existing `tmem_ld_32dp32bNx<B_H_TMEM>` calls in
+`rescale_O_t` (line 28, 34) and the load at `phase1.cuh:258`.
 
-## Global Accumulation and Convert Kernels
+### P0 — `SmemLayoutO` and `SmemLayoutKNoPE` are sized for `D_V=512`, not `D_V=448`
 
-`dQ`:
-
-- One CTA owns one query row's full topk list, so final BF16 `dQ` is a direct
-  store after all sparse blocks have accumulated into TMEM.
-- If future work splits topk across CTAs, add FP32 `dQ_acc` and a convert kernel.
-
-`dK/dV`:
-
-- Main backward kernel uses FP32 `atomicAdd` into:
-
-```text
-dk_acc[s_kv, D_QK] float
-dv_acc[s_kv, D_V]  float
-```
-
-- Final `dK/dV` outputs are produced by a convert kernel:
+`config.h:83`:
 
 ```cpp
-__global__ void convert_fp32_to_bf16(
-    const float* __restrict__ src,
-    bf16* __restrict__ dst,
-    int total_elements) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        dst[idx] = __float2bfloat16(src[idx]);
-    }
+using SmemLayoutO = SmemLayoutOTiles<8>;        // 8 * 64 = 512
+```
+
+`config.h:92`:
+
+```cpp
+using SmemLayoutKNoPE = SmemLayoutKTiles<8>;    // 8 * 64 = 512
+```
+
+But `D_V = 448`, so `D_V / 64 = 7`. The two `// TODO: WHY 8? For MODEL1 it
+might should be 7?` comments at `config.h:83,92` flag this directly. The
+SM100 `UMMA::Layout_K_SW128_Atom` swizzle and the TMA `tensor_map_kv_nope` box
+of `D_NOPE/8 = 56` int64s (8 bytes per int64 = 448 bytes — already correct at
+`phase1.cuh:613`) both match `D_V=448`. Only the swizzled SMEM layouts are
+wrong.
+
+`SmemLayoutV` is fine because it is built by composing `SmemLayoutKNoPE` with
+`Layout<Shape<Int<D_V>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>{}`, so when
+KNoPE is 7-tile (448 cols), V automatically becomes 7-tile too.
+
+**Fix:** Change both `SmemLayoutO` and `SmemLayoutKNoPE` to `<7>`. The O TMA
+store in `run_*` should also use `SmemLayoutOTiles<1>{}` (64-byte tile = one
+TMA copy per `B_EPI=64` element) for the store, like the reference at
+`fwd/head64/phase1.cuh:627`. The `D_V/B_EPI = 448/64 = 7` copy loop at
+`phase1.cuh:281` already matches.
+
+### P0 — `SmemLayoutKNoPE_TiledMMA` / `SmemLayoutKRoPE_TiledMMA` are undefined
+
+`phase1.cuh:419-420` references both:
+
+```cpp
+Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.k.k_nope[cur_buf].data()), SmemLayoutKNoPE_TiledMMA{});
+Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.k.k_rope.data()),     SmemLayoutKRoPE_TiledMMA{});
+```
+
+These layouts are defined in `fwd/head64/config.h:92-102` (the dual-gemm
+re-view of K: `B_TOPK*2 × D_V/2` for KNoPE and `B_TOPK*2 × 64/2` for KRoPE).
+The mxfp8 config.h does not declare them.
+
+**Fix:** Copy the two aliases verbatim from
+`fwd/head64/config.h:92-102` into `mxfp8_fwd/head64/config.h`. (They use
+`bf16` atom types — they are used here to build a 128-row × 64-col view of
+the e4m3 bytes; this is a forged layout for CuTe address generation, exactly
+as in the reference.)
+
+### P0 — `tQ_scale` / `tK_scale` / `tS_scale` TMEM fragments
+
+`phase1.cuh:78-79` does:
+
+```cpp
+tQ_scale.data().get() = tmem_cols::Q_Scale;
+tK_scale.data().get() = tmem_cols::K_Scale;
+```
+
+But `tQ_scale` and `tK_scale` are not declared in scope yet — they are
+declared locally at lines 394, 439 inside the `warp_idx == 8` branch. The
+declarations at the function top level are missing.
+
+In addition, `tS_scale` is used at `phase1.cuh:481` (in the `SV` MMA) but is
+never declared and its TMEM region is never populated:
+
+```cpp
+ku::utcmma_blockscaled_ss(tiled_mma_O, sV, sS, tS_scale, tK_scale, tO, k == 1);
+//TODO: We need to produce tS_scale in tmem in warpgroup idx 0
+```
+
+For the second argument of `tmem_cols::K_Scale = 338`, it is set at
+`phase1.cuh:442` (correct). For `tS_scale`, the S_Scale region at
+`tmem_cols::S_Scale = 356` is declared in `config.h:50` but nothing writes to
+it. The scale/exp logic computes `s_scale[g] = e8m0(absmax_p[g] / FP8_MAX)` at
+`phase1.cuh:203` and then the same `s_scale` array is immediately reused for
+the next `g`. To populate the TMEM, this loop must additionally call
+`SM100_UTCCP_*::copy` (matching the Q/K scale pattern) to send each `e8m0`
+value into the S_Scale TMEM region.
+
+**Fix:**
+
+1. Hoist the `tQ_scale` / `tK_scale` declarations to the top of the kernel
+   function (before line 80), so they can be assigned `data().get()`.
+2. Add `tS_scale` as another TMEM fragment and assign
+   `tS_scale.data().get() = tmem_cols::S_Scale;` at the same place.
+3. In the scale/exp block (`phase1.cuh:200-212`), after computing
+   `s_scale[g]`, push the `e8m0` value into the S_Scale TMEM via UTCCP. The
+   simplest path: write `s_scale[g]` into a `e8m0[NUM_QUANT_GROUPS]` SMEM
+   staging buffer, then issue one `SM100_UTCCP_4x32dp128bit_1cta::copy` (or
+   similar `128dp32b`-style atom) into `tS_scale`. Until then, leave
+   `tS_scale` out of the SV MMA and switch the call to
+   `ku::utcmma_ss(tiled_mma_O, sS, sV, tO, k == 1)` (no block scale), so
+   the kernel is at least numerically correct (S is already scaled by
+   `1/scale_g` at `phase1.cuh:209`).
+4. Remove the `//TODO: We need to produce tS_scale in tmem in warpgroup idx 0`
+   comment once the choice is made explicit.
+
+### P0 — The Q-scale copy uses `sQ_scale` that reads from a nonexistent `s_q_rope.q_tail`
+
+`phase1.cuh:389-410` (in the `warp_idx == 8` Q-UTCCP branch) tries to build
+`sQ_scale` from `plan.s_q_rope.q_tail.q_scale.data()`. As noted above, the
+correct member is `plan.s_q_scale.q_scale.data()`. The downstream
+`make_utccp_copy(... SM100_UTCCP_4x32dp128bit_1cta ...)` call then needs the
+SFB fragment shape.
+
+**Fix:** Replace the member access (already covered above) and verify that
+`SmemLayoutQScale` and `TiledMMA_P::FrgTypeSFB` line up. For the typical
+MXFP8 layout used elsewhere in the kernel, `TiledMMA_P::FrgTypeSFB` is the
+correct type for the SFB fragment (see
+`fwd/head64/.../sm100_blockscaled_mma_array_warpspecialized.hpp:652`).
+
+### P0 — `Tensor sQ_rope = make_tensor(make_smem_ptr(...), ...)` and `sQ_nope` use `…` placeholders
+
+`phase1.cuh:376` and `phase1.cuh:382` literally have `...` where a smem
+pointer should be:
+
+```cpp
+Tensor sQ_rope = make_tensor(make_smem_ptr(...));
+Tensor sQ_nope = make_tensor(make_smem_ptr(...));
+```
+
+**Fix:** Replace with the right SMEM pointers and layouts:
+
+```cpp
+Tensor sQ_rope = make_tensor(make_smem_ptr(plan.s_q_scale.q_rope.data()), SmemLayoutQRoPE{});
+Tensor sQ_nope = make_tensor(make_smem_ptr(plan.qkvo.q.q_nope.data()),    SmemLayoutQNoPE{});
+```
+
+(Note: the `q_rope` portion currently does not exist in `s_q_scale`. The
+`SharedMemoryPlan::s_q_scale` union only carries `s` and `q_scale`. Add
+`q_rope` to the union, or alias it onto `qkvo.q.q_rope`. The simplest fix
+that keeps smem union semantics is to also have a `q_rope` slot inside the
+`s_q_scale` union so the struct still works at the `D_QK=512` size.)
+
+### P0 — `K_SCALE_BYTES` and `K_QUANT_GROUP_SIZE` are not defined in this namespace
+
+`phase1.cuh:344` (`e8m0 scale[K_SCALE_BYTES]`) and `phase1.cuh:25`
+(`K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;` in `config.h:25`)
+
+`config.h:25` uses `K_QUANT_GROUP_SIZE` and `K_SCALE_DUP` but only
+`K_SCALE_DUP` is defined. The reference is the `defines.h` file. Check
+`defines.h` for `K_QUANT_GROUP_SIZE` — if absent, add a `constexpr int
+K_QUANT_GROUP_SIZE = 64;` next to `MXFP8_SCALE_VEC_SIZE = 32;` in
+`config.h:22`. Add `constexpr int K_SCALE_BYTES = D_NOPE / K_QUANT_GROUP_SIZE
++ /*padding*/ 1;` so that 8 bytes (one per quant group) plus padding fit
+into 8 uint8_t — the K scale region in the SM100 layout has
+`D_NOPE / 32 = 14` scale values per token, but the Q scale layout is `[B_TOPK,
+B_H, D_NOPE/32]` and a single 32-byte-aligned `int4` (8 bytes) is loaded per
+K-row. The exact value depends on the chosen `K_SCALE_BYTES`; pick the value
+that matches the existing per-row `int4` load in `phase1.cuh:347` and the
+sizeof `e8m0 scale[K_SCALE_BYTES]`.
+
+**Action:** grep `K_QUANT_GROUP_SIZE` and `K_SCALE_BYTES` across `csrc/`
+before deciding; for `D_NOPE=448, K_QUANT_GROUP_SIZE=64`, the natural values
+are `K_SCALE_BYTES=8` (7 used + 1 padding). Document the choice inline.
+
+### P0 — `FP8_MAX` is undefined
+
+`phase1.cuh:203` uses `FP8_MAX` in `e8m0 scale_g = e8m0(absmax_p[g] / FP8_MAX);`
+There is no `FP8_MAX` in scope. The standard E4M3 max is `448.0f`. The
+commented `//TODO: change here to vectorized type conversion` suggests the
+author already knows this is half-finished.
+
+**Fix:** Add a `constexpr float FP8_MAX = 448.0f;` to `config.h:31` (next to
+`MAX_INIT_VAL`).
+
+### P1 — `is_k_valid` mask and `B_TOPK/8` indexing
+
+`phase1.cuh:168`:
+
+```cpp
+uint64_t valid_mask = *(uint64_t*)plan.is_k_valid[k%NUM_BUFS];
+```
+
+`is_k_valid` is a `char[NUM_BUFS][B_TOPK/8]` array. A 64-bit read of 8
+chars is fine, but the loop `kk = k + 32 * g` (line 176) iterates `k = 0..31`
+inside `g = 0..3`, so it covers all 128 elements of the B_TOPK row. The
+mask is read once at the top, before the inner `kk` loop. That is correct.
+
+But `for (int k = 0; k < 32; ++k) { int kk = k + 32 * g; ... }` uses
+`NUM_QUANT_GROUPS = B_TOPK/MXFP8_SCALE_VEC_SIZE = 128/32 = 4`. With
+`MXFP8_SCALE_VEC_SIZE=32`, each scale covers 32 P elements. The MMA `kind::mxf8`
+atom takes scales per 32 K elements along the K-dim, which matches
+`B_TOPK=128`. The math is consistent.
+
+`plan.is_k_valid[cur_buf][lane_idx] = k_validness_mask;` (line 503) writes
+one byte per `lane_idx < B_TOPK/8 = 16` lane — the `init(16)` at line 116
+matches. Keep the TODO removed.
+
+### P1 — Stride check between `k` and `k_row` in the P transpose
+
+`phase1.cuh:158`:
+
+```cpp
+int k_row = lane_idx + (warp_idx&3);  // 0..127
+for (int h = 0; h < B_H; ++h) {
+    plan.p_t[h + B_H * k_row] = p[h];
 }
 ```
 
-Launch one convert for `dk_acc` over `s_kv * D_QK` and one for `dv_acc` over
-`s_kv * D_V`. Vectorize later if bandwidth shows up in profiling.
+`p[h]` is loaded as `B_H` floats from TMEM at `tmem_cols::P + warp_idx *
+NUM_ELEMS_PER_THREAD` (line 154). With `NUM_ELEMS_PER_THREAD = B_H = 64` and
+4 warps, each warp loads a 64×64 piece of P. The transpose writes into
+`p_t[h + B_H * k_row]` (column-major). The subsequent
+`plan.p_t[kk*B_H + h]` (line 177) reads the transposed view. This is correct,
+but the loop only iterates `B_H=64` heads and writes to the right column of
+`p_t` for the lane's `k_row`. Multiple warps write to different `k_row`
+ranges — no race. OK.
 
-`d_attn_sink`:
+**Action:** No change; keep the `// How to improve the transpose efficiency
+here?` comment as a perf TODO, not a correctness TODO.
 
-- Main backward kernel uses FP32 `atomicAdd(&d_attn_sink[h], d_sink_h)`.
-- Contention is `s_q` atomics per head. With `n_q_heads <= 32`, this is
-  acceptable for v1. If profiling shows pressure, switch to per-CTA partials and
-  a final head-wise reduction.
+### P1 — `k` is captured by reference inside the scale/exp branch
 
-## Implementation Milestones
+`phase1.cuh:214-222`:
 
-1. Add backward params.
-   - Inputs: `q`, `kv`, `out`, `do`, `lse`, `indices`, `topk_length`,
-     `attn_sink`.
-   - Outputs/workspaces: BF16 `dq`, BF16 `dk`, BF16 `dv`, FP32 `dk_acc`, FP32
-     `dv_acc`, FP32 `d_attn_sink`.
-   - Remove `max_logits` from the backward interface.
-2. Add `csrc/sm100/prefill/sparse/bwd/head_small/config.h`.
-   - Define SMEM layouts for `do_t`, `prob_t`, `draw_t`, Q/K/V, and dQ epilogue.
-   - Define TMEM columns and width static asserts.
-   - Add SMEM capacity static assert.
-3. Add a slow but structurally correct kernel.
-   - Serial score/dP/draw/dV/dK/dQ sequence.
-   - FP32 `atomicAdd` into `dk_acc/dv_acc`.
-   - FP32 `atomicAdd` into `d_attn_sink`.
-   - Direct BF16 `dQ` store.
-4. Add convert kernels for `dk_acc -> dk` and `dv_acc -> dv`.
-5. Add reference tests.
-   - Compare against PyTorch dense gather reference.
-   - Cover `D_QK=128`, `D_QK=192`, all `B_H` variants, invalid topk tails,
-     cross-query reuse of the same KV row, and sink gradients.
-6. Profile with NCU.
-   - Check tensor pipe utilization, TMEM load/store stalls, shared bank conflicts,
-     FP32 atomic pressure, and register spills.
-7. Optimize pipeline.
-   - Double-buffer Score and related barriers.
-   - Overlap KV load, score MMA, softmax derivative, and dK/dV epilogue.
-   - If FP32 atomics dominate, consider replacing `dk_acc/dv_acc` atomics with a
-     contribution workspace plus segmented reduce.
+```cpp
+if (k > 0) {
+    plan.bar_sv_done[(k-1)%Kernel::NUM_BUFS].wait(((k-1)/Kernel::NUM_BUFS)&1);
+}
+if (k > 0) {
+    ku::tcgen05_after_thread_sync();
+    rescale_O_t<Kernel>(plan.head_scale);
+    ku::tcgen05_before_thread_sync();
+}
+```
 
-## Correctness Checklist
+`k` is the loop variable. This is fine because both blocks are inside the
+same `for (int k = 0; k < num_k_blocks; ++k)` scope. The redundant `if (k > 0)`
+should be merged into a single block; cosmetic, not a bug. The use of
+`Kernel::NUM_BUFS` is fine once `Kernel` is defined (or replace with the
+file-scope `NUM_BUFS` constant).
 
-- Invalid topk rows contribute zero to `prob_t`, `draw_t`, `dV`, `dK`, and `dQ`.
-- `prob = exp(p - lse)` uses only forward `lse`; `max_logits` is not needed.
-- `attn_sink` contributes only `d_attn_sink = -sink_prob * D`, not `dV/dQ/dK`.
-- `dRaw_t` includes `sm_scale`; otherwise `dQ/dK` will be off by that factor.
-- `dP_t = V @ dO^T` is `dProb`, not the final score gradient.
-- `dV` accumulator layout is `[B_TOPK, D_V]` and scatters by `indices[cur][kk]`.
-- Single-query indices have no duplicates; cross-query accumulation still uses
-  FP32 atomics.
-- `D_QK=192` stores NoPE dims `0..127` and RoPE dims `128..191` separately for
-  both `dQ` and `dK`.
-- `NUM_BUFS=2` is safe for optimized K/V buffering because dK/dV epilogue reads
-  TMEM plus double-buffered indices, not K/V SMEM.
+### P1 — Output epilogue: `B_H_TMEM` template arg of `rescale_O_t` and store order
 
-## Resolved Improve.md Items
+`rescale_O_t<B_H, B_H_TMEM, TMEM_COL_START, D_V>` (line 22) takes
+`D_V=448`. The body iterates `tile = 0 .. D_V/64-1` (= 0..6), loads
+`B_H_TMEM=64` floats from `tmem_cols::O + tile * B_H_TMEM`, rescales, stores
+back. That matches `tmem_cols::O = 0` and the kernel-wide convention that
+`D_V` is laid out as 7 tiles of 64 columns of 64 rows. Good.
 
-- Fixed dV notation to use `[B_TOPK, D_V]` consistently.
-- Added explicit TMEM widths and reservation boundaries.
-- Removed `max_logits` from backward inputs; use only `lse`.
-- Added concrete `sum_odo` WG0 reduction mapping.
-- Added worst-case SMEM budget and aliasing notes.
-- Added register allocation starting point.
-- Added launch configuration.
-- Added dQ transpose strategy.
-- Added FP32 `d_attn_sink` atomic strategy.
-- Added FP32-to-BF16 convert kernel deliverable.
-- Clarified sink has no direct dV/dQ/dK contribution.
-- Clarified why `NUM_BUFS=2` is compatible with the optimized pipeline.
-- Resolved first-pass MMA major selections.
+The epilogue at `phase1.cuh:254-264` then loads O with
+`ku::tmem_ld_32dp32bNx<Kernel::B_H_TMEM>(Kernel::tmem_cols::O + tile*Kernel::B_H_TMEM, o_head)`
+and writes to `plan.u.o.data()[h*Kernel::D_V + dv]`. The 7-tile SmemLayoutO
+strides (with the swizzle atom) may not produce a contiguous `[B_H][D_V]`
+view through `data()`. Verify that `data()` returns a pointer that lines up
+with the `UMMA::Layout_K_SW128_Atom<bf16>` swizzle pattern of the bf16 O
+output; for the 7-tile case the data() pointer is at the start of the
+swizzled region, and the bf16 store at `h*D_V + dv` will collide with the
+swizzle if the offset crosses a 128-byte swizzle boundary. The reference
+kernel in `fwd/head64/phase1.cuh:300-352` uses `sO_addrs[i] = &sO(...)`
+instead of `data()[...]` precisely to go through the swizzled layout.
+
+**Fix:** Replace the manual offset with the proper smem layout, mirroring
+the reference:
+
+```cpp
+Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
+// inside the tile loop:
+int dv = warp_idx*32 + lane_idx;
+int tile = dv / 64;
+CUTE_UNROLL for (int h = 0; h < B_H; ++h) {
+    sO(h, dv) = bf16(o_head[h] * plan.head_scale[h]);
+}
+```
+
+The TMA store loop at `phase1.cuh:280-289` already uses the smem layout; it
+will work once `SmemLayoutO` is the 7-tile variant.
+
+### P1 — `topk_length` and `is_k_valid` mask for partial topk tails
+
+`phase1.cuh:51`:
+
+```cpp
+const int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+```
+
+`num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1)`. The validity
+mask producer (`phase1.cuh:493-499`) calls `load_indices_and_generate_mask` with
+the per-block absolute start `k*B_TOPK` and the global `topk_length`. So a
+token with `topk_length=64` will produce valid mask 0xff for block 0 and 0x00
+for block 1. The downstream `if (topk_length % B_TOPK != 0)` is automatically
+handled by the mask. Good.
+
+But the prologue TMA loads at `phase1.cuh:312`:
+
+```cpp
+if (k == 2) {
+    plan.bar_prologue_utccp_nope.wait(0);
+}
+```
+
+With `NUM_BUFS=3` and `k=2` matching `cur_buf=2`, the producer warp 4-7 is
+checking that the UTCCP for K[2] (i.e. `q_nope`) has completed. The reference
+kernel uses the same trick — `q_nope` (which is in SMEM) covers the bytes of
+`k[2]` because the SMEM union is sized so that Q overlaps with the third K
+buffer. The mxfp8 `SharedMemoryPlan` already has the same union structure
+(`qkvo.q` is unioned with `qkvo.kv`), so the trick should work — but only if
+the SMEM layout for `q_nope` covers the exact same byte range as
+`k_nope[2]`. Verify the sizes line up:
+
+- `q_nope`: `B_H*D_NOPE = 64*448 = 28672` bytes
+- `k_nope[3]`: `3 * B_TOPK*D_NOPE = 3 * 128*448 = 172032` bytes
+
+`q_nope` is much smaller than the union. So the producer's `k_nope[2]` data
+will not collide with `q_nope` — but that means the original "since q_nope
+coincidences with k[2]" justification is **not** true for this kernel, and
+the `bar_prologue_utccp_nope.wait(0)` is irrelevant (no UTCCP wrote
+to `k_nope[2]`). It is harmless (the wait will return immediately because
+the UTCCP barrier was arrived in the prologue), but the comment is
+misleading. Either:
+
+- delete the `if (k == 2)` block and rely on `bar_kv_nope_ready[cur_buf].wait(...)`
+  below to gate the MMA, or
+- leave it in but fix the comment.
+
+The simpler choice: remove the `if (k == 2)` block. The producer already does
+`plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1)` (line 319) which
+serialises the writes correctly across NUM_BUFS.
+
+### P1 — `kk` declaration missing in the inner scale/exp loop
+
+`phase1.cuh:206`:
+
+```cpp
+for (int k = 0; k < 32; ++k) {
+    kk = k + g * 32;
+```
+
+`kk` is declared in the outer loop at `phase1.cuh:176`:
+
+```cpp
+for (int k = 0; k < 32; ++k) {
+    int kk = k + 32 * g;
+```
+
+But the inner loop at line 205 **reuses** `kk` without re-declaring it. With
+`g` iterated by the outer `for (int g = 0; g < NUM_QUANT_GROUPS; ++g)`, the
+inner loop's `kk` is the outer-loop variable — which is out of scope. C++
+will not compile this.
+
+**Fix:** Re-declare `int kk = k + g * 32;` at the top of the inner loop at
+`phase1.cuh:205`.
+
+### P1 — The `kk` mask reads `valid_mask` in the inner `p_val` branch
+
+`phase1.cuh:177`:
+
+```cpp
+float p_val = (valid_mask >> kk) & 1 ? plan.p_t[kk*B_H + h] : -CUDART_INF_F;
+```
+
+The mask is `uint64_t`, `kk` is `int`, and the shift amount is at most 127.
+That is undefined behaviour in C++. Use `((valid_mask >> kk) & 1u) != 0u` or
+extract the byte properly.
+
+**Fix:** Replace the condition with a comparison.
+
+### P1 — `bar_p_free` is unused
+
+`phase1.cuh:422` does `plan.bar_p_free.wait(k&1^1);` but the prologue never
+arrives on `bar_p_free` (it is init'd to 128 expectations at line 119 and
+nothing increments it). The wait will deadlock or, in practice, will hang
+the kernel.
+
+Looking at the reference `fwd/head64/phase1.cuh:188`, `bar_p_free.arrive()`
+is called by the scale/exp warp at the end of the `retrieve_mask_and_reduce_p`
+helper. The mxfp8 kernel does its own P-loading at `phase1.cuh:154-160`
+without ever arriving on `bar_p_free`. Either:
+
+- call `plan.bar_p_free.arrive()` in the scale/exp warp at `phase1.cuh:162`
+  (where `bar_k_valid_free` is currently arrived), or
+- delete the `bar_p_free.wait(...)` in the MMA warp and the corresponding
+  `bar_p_free.init(128)` / struct member.
+
+**Fix:** Make the scale/exp warp arrive on `bar_p_free` once per block, after
+`slot_bar_P_empty_arrival()` (the function passed as the helper is never
+defined, so delete that call too). Note `phase1.cuh:157` calls
+`slot_bar_P_empty_arrival();` but `slot_bar_P_empty_arrival` is not defined
+anywhere — this is a build error.
+
+**Fix (combined):** Replace the function-call placeholder at line 157 with
+`plan.bar_p_free.arrive();` and add an `expect_tx` if the buffer also needs
+an mbarrier to release the actual smem region. Verify that 128 threads
+arrive exactly once per block (4 warps × 32 lanes).
+
+### P1 — `bar_so_ready` is never signalled by the rescale step
+
+`phase1.cuh:225` does `plan.bar_so_ready.arrive();` after writing S to
+smem and rescaling O. The MMA warp waits on it at `phase1.cuh:476`. The
+arrive should be a single thread, not 128. If the `bar_so_ready` is init'd
+to 128 expectations, only one arrival would be needed per block (one
+thread); if init'd to 1 expectation, 128 threads arriving would over-arrive
+and the wait would be skipped, but the `cuda::memory::atomic_ref` overflow
+might leave the barrier in a bad state.
+
+**Fix:** Init `bar_so_ready` with `init(1)` and put the `arrive()` inside
+`if (warp_idx == 0 && elect_one_sync()) { ... }`. Right now `init(128)` is
+called at line 120 — change to 1, and gate the arrive with `elect_one_sync()`.
+
+### P1 — `bar_prologue_q_scale` is not awaited on the consumer side
+
+The producer at `phase1.cuh:98` issues
+`ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale,
+plan.bar_prologue_q_scale, ...)` — the TMA will arrive on
+`bar_prologue_q_scale` automatically. The consumer at
+`phase1.cuh:386-387` is:
+
+```cpp
+plan.bar_prologue_q_scale.arrive_and_expect_tx(B_H*(D_V/32)*sizeof(e4m3));
+plan.bar_prologue_q_scale.wait(0);
+```
+
+The `arrive_and_expect_tx` here is wrong — this thread is the **consumer**
+of the Q scale data, not the producer. The data arrives via the TMA. Drop
+the `arrive_and_expect_tx` and just `wait(0)`.
+
+The TX-byte estimate `B_H*(D_V/32)*sizeof(e4m3)` is also wrong: with
+`MXFP8_SCALE_VEC_SIZE=32` and `D_V=448`, there are `D_V/32 = 14` scale
+elements per row of Q, so the TX is `B_H*14*sizeof(e8m0) = 64*14*1 = 896`
+bytes. The TMA copy issued by the producer should match. Verify the TMA
+descriptor at `phase1.cuh:580-590` is set up with a box of `B_H × 14 × 1`
+elements, which it is (line 572).
+
+**Fix:** Remove the `arrive_and_expect_tx` call from the consumer.
+
+### P1 — `bar_prologue_k_scale` is never signalled in the producer
+
+`phase1.cuh:452` does `ku::umma_arrive_noelect(plan.bar_prologue_k_scale);`
+— but no consumer ever waits on `bar_prologue_k_scale`. Instead, the MMA
+warp at `phase1.cuh:435-451` builds `tK_scale` from the K-scale SMEM
+region directly. So either:
+
+- The wait is in the MMA warp at the right place (it currently is not
+  present), or
+- The umma_arrive is dead code and the MMA warp relies on the
+  `bar_kv_nope_ready[cur_buf].wait(...)` to gate everything.
+
+The current MMA warp builds `tK_scale` **after** `bar_kv_nope_ready.wait`,
+which ensures that the K-NoPE data has arrived. The K-scale data is
+written into `plan.qkvo.kv.kv_nope_scale[cur_buf]` by the producer (line
+362) before the same producer arrives on `bar_kv_nope_ready` at line 454.
+So the order is: scale data lands in SMEM → `bar_kv_scale_ready[cur_buf]
+arrive()` (line 362) → `bar_kv_nope_ready.wait(...)` in MMA.
+
+The `bar_prologue_k_scale` is therefore dead and should be removed — or
+the MMA should `bar_prologue_k_scale.wait(0)` before building the
+`tK_compact` (right after `bar_kv_scale_ready.wait` is implicit through
+the ordering above).
+
+**Fix:** Remove the dead `bar_prologue_utccp_k_scale` / `bar_prologue_k_scale`
+arrive; the actual dataflow is `bar_kv_scale_ready` → `bar_kv_nope_ready`
+→ MMA. Update the `SharedMemoryPlan` to drop the prologue barriers that
+are not used and to keep only `bar_kv_scale_ready`.
+
+### P1 — `bar_kv_scale_ready` is not in the MMA wait list
+
+The producer (line 362) arrives on `bar_kv_scale_ready[cur_buf]` but the
+MMA warp at `phase1.cuh:454` only waits on `bar_kv_nope_ready`. Without
+an explicit `bar_kv_scale_ready.wait((k/NUM_BUFS)&1)` in the MMA warp
+before reading `sK_scale`, there is a race: the TMA write to SMEM might
+not have completed by the time the MMA reads it.
+
+**Fix:** Add `plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);`
+before the `sK_scale` SMEM→TMEM UTCCP block in the MMA warp.
+
+### P1 — `num_k_blocks` is `int`; loop bounds on TMEM columns
+
+`num_k_blocks = max(ceil_div(topk_length, B_TOPK), 1)`. With
+`B_TOPK=128` and `topk_length <= 4096` (typical DeepSeek prefill), this is
+≤ 32. The TMEM columns (`O=0..127`, `P=400..463`) are reused per block. No
+TMEM column is indexed by `k`, so no overflow risk. OK.
+
+### P1 — `tP` and `tO` partition shape
+
+`phase1.cuh:73-74`:
+
+```cpp
+Tensor tP = partition_fragment_C(tiled_mma_P, Shape<B_TOPK, Int<B_H>>{});
+Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<D_V>, Int<B_H>>{});
+```
+
+For `TiledMMA_O` (D_V × B_H = 448 × 64), the partition needs a
+constexpr shape. `Int<D_V>` should be a constexpr — `D_V` is `constexpr` in
+the namespace (line 17). OK.
+
+But the `tiled_mma_O` atom is `SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, D_V, B_H, ...>`.
+The M-dim is `D_V=448`, which is `448/64=7` tiles along M. The MMA atom
+requires M to be a power-of-two multiple of 16 — 448 is **not** a
+power-of-two multiple of 16 (it is `7*64`, fine). Verify the cutlass
+atom accepts `M=D_V=448`; if it only accepts M as 64/128/192/256, change to
+`Shape<Int<D_V/2>, Int<B_H>>{}` and run two MMAs (the reference uses
+this dual-gemm pattern). The reference `TiledMMA_O` in `fwd/head64/config.h:146`
+uses M=256, suggesting the atom expects 64/128/192/256/512 along M.
+
+**Fix:** Check the cutlass sm100 mxf8 atom's `M` parameter; if 448 is not
+accepted, set `TiledMMA_O` to use M=224 (1SM shape limit) and run two
+MMAs per O block, or change the M-dim of the O accumulator to 448 only if
+the atom supports it. The
+`flash_attention_4` style pattern uses 128×256 atom for O; we may need
+`Shape<Int<256>, Int<B_H>>` and run the O accumulation in two
+`256×64` passes (224 covers full D_V=448 with 224 = 7*32 not a power of
+two; use 256 then mask or 192 + 256).
+
+**Concrete recommendation:** keep the same M-dim selection as the
+reference (`B_H × 256`), but view the O tile as `[256, 64]` and do two
+MMAs per block (128×2). Specifically:
+
+- Change `TiledMMA_O` to use M=256 (`B_H=64`, the N-dim of P) like the
+  reference at `fwd/head64/config.h:145-147`.
+- Update `tO` partition to `Shape<Int<256>, Int<B_H>>{}` (so two tiles of
+  256 cover D_V=448 fully with 1 tile of 256 and one partial 192; for
+  D_V=448 use two 256×64 MMAs and ignore the upper 64 columns of the
+  second MMA).
+
+This is a deeper change — defer to P2 unless `make_tiled_mma` fails at
+compile time. The compile-time check will catch the wrong shape; if the
+atom accepts 448, no change is needed.
+
+### P2 — `bar_prologue_q_scale` is referenced as if it were the UTCCP barrier
+
+Already covered in P0 / P1 above — the kernel conflates "TMA arrival" and
+"UTCCP completion" barriers. The cleanest fix is to use one set of
+`bar_prologue_*` for TMA, and a second set of `bar_prologue_utccp_*` for
+UTCCP, and make all consumers / producers use the right one.
+
+### P2 — `bar_k_valid_free[cur_buf].arrive()` count
+
+`phase1.cuh:162` does `plan.bar_k_valid_free[k%NUM_BUFS].arrive();` once
+per block, in the scale/exp warp. The barrier is init'd with
+`init(128)` (line 117). 128 threads in the warpgroup will arrive, but the
+code runs in 4 warps (each with 32 threads), all of which will execute
+line 162 — so 128 arrivals per block. This matches the 128 expectations.
+Good.
+
+### P2 — `ku::tmem_ld_32dp32bNx` requires `B_H_TMEM` per row in TMEM
+
+`tmem_ld_32dp32bNx<64>` loads 64 floats from one row in TMEM. The TMEM
+atom is `32dp32b`, which is 32-wide. With B_H=64, we need two
+consecutive 32-wide reads. Verify the helper handles the wider load
+automatically (the reference `tmem_ld_32dp32bNx` is also used with
+`B_TOPK/2=32` and `B_EPI=64`, so it must already work). OK.
+
+### P2 — `CUTE_INVALID_CONTROL_PATH` vs the `__CLION_IDE__` guard
+
+`phase1.cuh:540-541` is the `else` branch for non-SM100 architectures.
+For IDE indexing the `#if` guard is true and the kernel is defined; for
+real SM100 the kernel runs. OK.
+
+### P2 — `k_rope` is `array_aligned<bf16, B_TOPK*D_ROPE>` but used as `SmemLayoutKRoPE` view
+
+`SmemLayoutKRoPE` (config.h:101) is the swizzled UMMA layout. The smem
+storage `kv_rope` is `array_aligned<bf16, B_TOPK*D_ROPE>` (i.e. 128*64 =
+8192 bytes contiguous). The view is correct.
+
+But the `k_rope` cp.async load at `phase1.cuh:510-534` uses
+`ku::cp_async_cacheglobal<...>` with a per-row offset, which writes to
+the smem directly. The strides used (`+ idx_in_group*8`, `+ local_row*NUM_GROUPS*32`)
+need to match the swizzled layout's stride, not the contiguous stride.
+Looking at the reference at `fwd/head64/phase1.cuh:545-571`, the same
+pattern is used (without the swizzle) — for `SmemLayoutKRoPE =
+UMMA::Layout_K_SW64_Atom<bf16>{}` and `B_TOPK=128`, a 64-byte swizzle
+groups 32 bf16 elements per swizzle row. The cp.async writes 8 bf16
+elements per group (`idx_in_group < 8`), so each thread writes 8 bf16
+(16 bytes) per row — that is below the 32-byte cp.async size, which
+underutilises the bandwidth. The reference does the same so this is
+acceptable; keep it as-is.
+
+## Plan to Apply the Fixes
+
+### Step 1 — config.h changes
+
+Edit `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/config.h` to:
+
+1. Add the missing constants:
+   - `constexpr int B_H_TMEM = B_H;`
+   - `constexpr float FP8_MAX = 448.0f;`
+   - `constexpr int K_QUANT_GROUP_SIZE = 64;`
+   - `constexpr int K_SCALE_BYTES = 8;` (7 used + 1 padding byte)
+2. Add the `TmaParams` struct (mirroring `fwd/head64/config.h:17-22`,
+   extended with `tma_Q_scale` and the RoPE/NoPE `tensor_map`s).
+3. Add `SmemLayoutKNoPE_TiledMMA` and `SmemLayoutKRoPE_TiledMMA`
+   (copy from `fwd/head64/config.h:92-102`).
+4. Add `SmemLayoutOBuf_TMA = SmemLayoutOTiles<1>{}`.
+5. Change `SmemLayoutO = SmemLayoutOTiles<8>` to `SmemLayoutOTiles<7>`.
+6. Change `SmemLayoutKNoPE = SmemLayoutKTiles<8>` to `SmemLayoutKTiles<7>`.
+7. Add `q_rope` to the `s_q_scale` union (so the kernel can find
+   `plan.s_q_scale.q_rope`):
+   ```cpp
+   union {
+       e4m3 s[B_H*B_TOPK];
+       e8m0 q_scale[cosize_v<SmemLayoutQScale>];
+       array_aligned<bf16, B_H*D_ROPE> q_rope;
+   } s_q_scale;
+   ```
+8. Remove the dead `bar_prologue_utccp_q_scale` / `bar_prologue_utccp_k_scale`
+   fields from `SharedMemoryPlan` (or rename to `bar_prologue_q_scale` /
+   `bar_prologue_k_scale` if you prefer; the kernel uses both names). The
+   cleanest is to keep the field name as `bar_prologue_utccp_q_scale` but
+   fix the kernel references. Actually the field name is fine; only the
+   *kernel* references the wrong name. See Step 2.
+
+### Step 2 — phase1.cuh changes
+
+Edit `csrc/sm100/prefill/sparse/mxfp8_fwd/head64/phase1.cuh` to:
+
+1. Rename `run_fwd_phase1_kernel` → `run_mxfp8_fwd_phase1_kernel`
+   (matches the header and the instantiation).
+2. Hoist `tQ_scale` / `tK_scale` / `tS_scale` declarations to function
+   top (before line 80), set their `data().get()` to the TMEM columns.
+3. Replace the four `plan.s_q_rope.q_tail.q_scale(...)` /
+   `plan.s_q_rope.s(...)` / `plan.s` references with
+   `plan.s_q_scale.q_scale(...)` / `plan.s_q_scale.s(...)`.
+4. Replace `plan.bar_prologue_utccp_rope.init(...)` →
+   `plan.bar_prologue_utccp_q_scale.init(...)` (line 108).
+5. Replace `plan.bar_prologue_utccp_nope.init(...)` →
+   `plan.bar_prologue_utccp_k_scale.init(...)` (line 109).
+6. Replace `plan.bar_prologue_q_scale.arrive_and_expect_tx(...)` (line 386)
+   with just `plan.bar_prologue_utccp_q_scale.wait(0)`. The TMA hardware
+   already arrived on `bar_prologue_q_scale`; the consumer just needs to
+   wait.
+7. Replace `plan.bar_prologue_k_scale.arrive_and_expect_tx(...)` (line 452
+   expected location) with just the `umma_arrive_noelect`. The data is
+   already in SMEM by virtue of the producer's `bar_kv_scale_ready`
+   ordering.
+8. Add the `bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1)` in the MMA
+   warp before building `tK_compact`.
+9. Replace the `slot_bar_P_empty_arrival()` placeholder call (line 157)
+   with `plan.bar_p_free.arrive();`.
+10. Change `bar_so_ready.init(128)` → `init(1)` and gate the
+    `arrive()` with `elect_one_sync()` and `warp_idx == 0` (line 120 and
+    225).
+11. Re-declare `int kk = k + g * 32;` at the top of the inner loop at
+    line 205.
+12. Fix the `valid_mask` shift expression at line 177 to use an
+    unsigned compare.
+13. Replace the `Tensor sQ_rope = make_tensor(make_smem_ptr(...))` and
+    `Tensor sQ_nope = ...` `...` placeholders (lines 376, 382) with
+    real smem pointers / layouts.
+14. Replace the manual `plan.u.o.data()[h*D_V + dv] = ...` (line 262)
+    with a swizzle-aware `sO(h, dv) = ...` write via `make_tensor(plan.u.o.data(), SmemLayoutO{})`.
+15. Either remove `tS_scale` from the `utcmma_blockscaled_ss` call at
+    line 481 and use the un-scaled `utcmma_ss`, or implement the
+    S_Scale UTCCP in the scale/exp branch and add the
+    `tS_scale.data().get() = tmem_cols::S_Scale;` at top level.
+16. Remove the `if (k == 2) { plan.bar_prologue_utccp_nope.wait(0); }`
+    block (line 312-314) — it is dead in the mxfp8 layout.
+17. At the end of `run_mxfp8_fwd_phase1_kernel`, after all TMA
+    descriptors, build the `TmaParams` struct, set the kernel attribute
+    for max dynamic shared memory, and launch the kernel
+    (`kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params)`).
+18. Drop the `//TODO: …` comments in `config.h:83, 92` and the
+    `//TODO: How to wait for K scale ready in smem?` in `phase1.cuh:434`
+    once the corresponding code is fixed.
+19. Keep the `//TODO: change here to vectorized type conversion` comments
+    at `phase1.cuh:203, 207, 209` — they are performance TODOs, not
+    correctness. Document in the kernel that they are perf-only.
+
+### Step 3 — verify the instantiation and call sites
+
+`csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu`
+already calls `run_mxfp8_fwd_phase1_kernel<512>` — no change needed.
+
+`csrc/api/mxfp8_sparse_fwd.h` is the user-facing entry point; verify that
+it calls `run_mxfp8_fwd_phase1_kernel<512>(params)` (or similar). If the
+existing call uses a different name, update it to match the rename.
+
+### Step 4 — `MmaParams` / `TiledMMA_O` M-dim sanity check
+
+Compile with `nvcc -arch=sm_100 -c -std=c++17 …` and verify that
+`SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, D_V=448, B_H=64,
+UMMA::Major::MN, UMMA::Major::K>` is accepted. If not, fall back to
+`TiledMMA_O = SM100_MMA_MXF8F6F4_SS_NOELECT<..., 256, 64, …>` and run
+two MMAs per O block (256×64 + 192×64 with masking). This is the only
+remaining open question that requires a build to resolve.
+
+## Verification
+
+1. Compile the new kernel with `nvcc -arch=sm_100` (or `sm_100a`).
+   Confirm the renamed function links, the `TmaParams` struct compiles,
+   and the SMEM `static_assert` (if added) shows `sizeof(SharedMemoryPlan)
+   <= 228 * 1024` (SM100 smem cap).
+2. Add a small test driver (`tests/test_mxfp8_dsa.py` or similar) that:
+   - Allocates `Q`, `K`, `V` in MXFP8 + bf16 RoPE layout with known
+     `topk_length`, `attn_sink`, and a deterministic set of `indices`.
+   - Computes the reference attention output with PyTorch in FP32.
+   - Computes the output of the kernel.
+   - Compares the two to within `atol=2e-2, rtol=2e-2` (FP8 precision
+     loss is expected).
+3. Run the existing FlashMLA test suite
+   (`tests/`) — verify the existing tests still pass.
+4. Add an NCU profile (optional) to confirm the kernel is not blowing
+   the SMEM or TMEM budget.
+
+## Out of Scope (deferred)
+
+- Vectorised FP8 store/load (the `//TODO: change here to vectorized`
+  items in `phase1.cuh:203, 207, 209`).
+- A `Kernel` template alias (the code uses `Kernel::B_H`, `Kernel::B_H_TMEM`,
+  `Kernel::D_V`, `Kernel::NUM_BUFS`, `Kernel::NamedBarriers`,
+  `Kernel::tmem_cols`, `Kernel::SmemLayoutO` — all of these can be
+  replaced with the file-scope `B_H`, `B_H_TMEM`, `D_V`, `NUM_BUFS`,
+  `NamedBarriers`, `tmem_cols`, `SmemLayoutO` constants once they exist).
+  Adding the `Kernel` alias is a small refactor — do it after the
+  correctness build passes.
+- Performance tuning of the `p_t` transpose (`// How to improve the
+  transpose efficiency here?` comment in `phase1.cuh:160`).
+- Native block-scaled SV MMA (requires producing `tS_scale` via UTCCP
+  from the scale/exp warp). The current un-scaled fallback is
+  numerically correct but slower.

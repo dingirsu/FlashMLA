@@ -311,7 +311,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 Tensor sK_scale = make_tensor(make_smem_ptr(plan.qkvo.kv.kv_scale[cur_buf].data()), SmemLayoutKScale{});
                 e4m3* sK_base = &sK(warp_idx*4, _0{});
 
-                auto load_kv = [&]() {
+                auto load_kv = [&]() { // change the scale layout here to the end of the kv page/tensor?
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                         CUTE_UNROLL

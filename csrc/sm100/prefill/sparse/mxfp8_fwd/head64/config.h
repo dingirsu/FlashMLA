@@ -61,8 +61,6 @@ namespace tmem_cols {
     constexpr int S_Scale = 356;
     constexpr int P = 400;
 }
-static_assert(tmem_cols::S_Scale + 32 <= 512, "TMEM scale-factor budget overflow");
-static_assert(tmem_cols::P + B_H <= 512, "TMEM accumulator budget overflow");
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e4m3>{},

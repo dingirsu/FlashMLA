@@ -128,7 +128,7 @@ struct SharedMemoryPlan {
 
 using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_SS_NOELECT<bf16, bf16, float, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>{}
-));
+)); // May change to WS to spped up?
 
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_SS_NOELECT<bf16, bf16, float, 64, B_H, UMMA::Major::MN, UMMA::Major::K>{}

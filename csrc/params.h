@@ -102,6 +102,48 @@ struct SparseAttnDecodeParams {
     int num_sm_parts;
 };
 
+struct SparseAttnMxfp8DecodeParams {
+    int b, s_q;
+    int h_q, h_kv;
+    int d_qk, d_v;
+    float sm_scale, sm_scale_div_log2;
+    int num_blocks, page_block_size, topk;
+    ModelType model_type;
+
+    void* __restrict__ q;   // [b, s_q, h_q, d_qk]
+    void* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]
+    int* __restrict__ indices;   // [b, s_q, topk]
+    int* __restrict__ topk_length;  // [b], may be nullptr
+    float* __restrict__ attn_sink;  // [h_q], may be nullptr
+
+    float* __restrict__ lse;    // [b, s_q, h_q]
+    cutlass::bfloat16_t* __restrict__ out;   // [b, s_q, h_q, d_v]
+    
+    int extra_num_blocks, extra_page_block_size, extra_topk;
+    void* __restrict__ extra_kv;  // [extra_num_blocks, extra_page_block_size, d_qk]
+    int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
+    int* __restrict__ extra_topk_length;  // [b], may be nullptr
+    
+    int stride_q_b, stride_q_s_q, stride_q_h_q;
+    int stride_kv_block, stride_kv_row;
+    int stride_indices_b, stride_indices_s_q;
+    int stride_lse_b, stride_lse_s_q;
+    int stride_o_b, stride_o_s_q, stride_o_h_q;
+    int stride_extra_kv_block, stride_extra_kv_row;
+    int stride_extra_indices_b, stride_extra_indices_s_q;
+    
+    cudaStream_t stream;
+    
+    // SplitKV-related parameters
+    float* __restrict__ lse_accum;  // [num_splits, s_q, h_q]
+    float* __restrict__ o_accum;    // [num_splits, s_q, h_q, d_v]
+    int stride_lse_accum_split, stride_lse_accum_s_q;
+    int stride_o_accum_split, stride_o_accum_s_q, stride_o_accum_h_q;
+    DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
+    int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
+    int num_sm_parts;
+};
+
 struct CombineParams {
     int b, s_q, h_q, d_v;
 

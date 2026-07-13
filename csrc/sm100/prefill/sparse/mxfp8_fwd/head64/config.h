@@ -61,6 +61,8 @@ namespace tmem_cols {
     constexpr int S_Scale = 356;
     constexpr int P = 400;
 }
+static_assert(tmem_cols::S_Scale + 32 <= 512, "TMEM scale-factor budget overflow");
+static_assert(tmem_cols::P + B_H <= 512, "TMEM accumulator budget overflow");
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e4m3>{},
@@ -159,8 +161,7 @@ struct SharedMemoryPlan {
     float head_scale[B_H], head_mi[B_H], head_li[B_H], head_real_mi[B_H];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     float p_t[B_TOPK*B_H];
-    transac_bar_t bar_prologue_q;
-    transac_bar_t bar_prologue_utccp_q_scale, bar_prologue_utccp_k_scale;
+    transac_bar_t bar_prologue_q, bar_prologue_q_scale;
     transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
     transac_bar_t bar_kv_ready[NUM_BUFS], bar_kv_scale_ready[NUM_BUFS];

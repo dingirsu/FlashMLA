@@ -68,14 +68,12 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     TiledMMA tiled_mma_O = TiledMMA_O{};
 
     Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<B_TOPK>, Int<B_H>>{});
-    Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_TOPK>, Int<B_H>>{});
     Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
     Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
     Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFA>(shape(SmemLayoutOScaleAAtom{}));
     Tensor tS_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutOScaleBAtom{}));
 
     tP.data().get() = tmem_cols::P;
-    tO.data().get() = tmem_cols::O;
     tQ_scale.data().get() = tmem_cols::Q_Scale;
     tK_scale.data().get() = tmem_cols::K_Scale;
     tV_scale.data().get() = tmem_cols::K_Scale;
@@ -84,7 +82,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     if (warp_idx == 0) {
         if(elect_one_sync()) {
             plan.bar_prologue_q.init(1);
-            plan.bar_prologue_utccp_q_scale.init(1);
+            plan.bar_prologue_q_scale.init(1);
             fence_barrier_init();
 
             // Q is stored as e4m3 data followed by e8m0 block scales.
@@ -97,9 +95,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             );
             Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx);
             Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_q_scale.q_scale.data()), SmemLayoutQScaleTMA{});
-            ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale, plan.bar_prologue_utccp_q_scale, TMA::CacheHintSm90::EVICT_FIRST);
+            ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale, plan.bar_prologue_q_scale, TMA::CacheHintSm90::EVICT_FIRST);
 
-        plan.bar_prologue_utccp_k_scale.init(1);
         CUTE_UNROLL
         for (int i = 0; i < NUM_BUFS; ++i) {
             plan.bar_qk_done[i].init(1);
@@ -141,11 +138,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
             // load P
             float p[NUM_ELEMS_PER_THREAD];
-            ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(tmem_cols::P + warp_idx * NUM_ELEMS_PER_THREAD, p);
+            ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(tmem_cols::P + warp_idx * (B_H_TMEM / 4), p);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
             plan.bar_p_free.arrive();
-            int k_row = lane_idx + (warp_idx&3);
+            int k_row = warp_idx * 32 + lane_idx;
             for (int h = 0; h < B_H; ++h) {
                 plan.p_t[h + B_H * k_row] = p[h]; // How to improve the transpose efficiency here?
             }
@@ -369,7 +366,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
             plan.bar_prologue_q.wait(0);
 
-            plan.bar_prologue_utccp_q_scale.wait(0);
+            plan.bar_prologue_q_scale.wait(0);
 
             Tensor sQ_scale = make_tensor(
                 make_smem_ptr(plan.s_q_scale.q_scale.data()),
@@ -389,8 +386,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             auto dst_Q = thr_Q.partition_D(tQ_compact);
 
             cute::copy(copy_Q_scale, src_Q, dst_Q);
-            
-            ku::umma_arrive_noelect(plan.bar_prologue_utccp_q_scale);
 
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks+1; ++k) {
@@ -416,7 +411,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
                     auto dst_K = thr_K.partition_D(tK_compact);
                     cute::copy(copy_K_scale, src_K, dst_K);
-                    ku::umma_arrive_noelect(plan.bar_prologue_utccp_k_scale);
 
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                     plan.bar_kv_ready[cur_buf].wait((k/NUM_BUFS)&1);

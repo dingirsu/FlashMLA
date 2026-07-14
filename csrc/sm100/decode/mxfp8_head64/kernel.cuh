@@ -143,8 +143,8 @@ KernelTemplate<MODEL_TYPE>
         for (int i = 0; i < B_EPI/8; ++i)
             sO_bases[i] = &sO(idx_in_warpgroup%64, (idx_in_warpgroup/64)*128 + i*8);
 
-        const float2 scale = float2 {params.sm_scale_div_log2, params.sm_scale_div_log2};
-        e4m3* sS_base = plan.s_p.s.data() + lane_idx*8 + (warp_idx&1)*(B_H/2)*8 + (warp_idx/2)*B_H*(B_TOPK/2);
+        Tensor sS = make_tensor(make_smem_ptr(plan.s_p.s.data()), SmemLayoutS{});
+        Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutSscale{});
 
         float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%64)) * CUDART_L2E_F;
 
@@ -232,61 +232,35 @@ KernelTemplate<MODEL_TYPE>
                 }
                 mi = new_max;
 
-                // MXFP8-quantize S
-                // For each 32-element group, compute the e8m0 scale and e4m3 data.
-                // S is stored in SmemLayoutS (e4m3 (B_H, B_TOPK) K-major).
-                // We write S scales to plan.s_scale in SmemLayoutSscale (B_H, B_TOPK/32 e8m0 groups).
-                int h = idx_in_warpgroup;
-                bool is_h_in_range = (h < B_H);
-                constexpr int NUM_QUANT_GROUPS = B_TOPK / MXFP8_SCALE_VEC_SIZE;  // 4
-                float absmax_p[NUM_QUANT_GROUPS];
-                CUTE_UNROLL
-                for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
-                    absmax_p[g] = -CUDART_INF_F;
-                    CUTE_UNROLL
-                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
-                        int kk = i + MXFP8_SCALE_VEC_SIZE * g;
-                        float p_val = p[kk] * params.sm_scale_div_log2;
-                        absmax_p[g] = max(absmax_p[g], p_val);
-                        // NOTE: p[i] is still in original (pre-scale) form; we multiply by scale when quantizing.
-                    }
-                }
-                float scale_f[NUM_QUANT_GROUPS];
-                e8m0 s_scale[NUM_QUANT_GROUPS];
-                CUTE_UNROLL
-                for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
-                    scale_f[g] = absmax_p[g] > 0.0f ? absmax_p[g] / FP8_MAX : 1.0f;
-                    s_scale[g] = e8m0(scale_f[g]);
-                    if (is_h_in_range) {
-                        plan.s_scale[h * NUM_QUANT_GROUPS + g] = s_scale[g];
-                    }
-                }
-
-                // Now compute the S values: s = exp2f(p * sm_scale - new_max) / scale_f[g]
-                __nv_bfloat162 s[(B_TOPK/2)/2];
-                float2 neg_new_max = float2 {-new_max, -new_max};
+                // Threads h and h+64 own the two 64-token halves of one head.
+                constexpr int NUM_LOCAL_GROUPS = (B_TOPK / 2) / MXFP8_SCALE_VEC_SIZE;
+                int h = idx_in_warpgroup % B_H;
+                int token_base = (idx_in_warpgroup / B_H) * (B_TOPK / 2);
                 float cur_sum = 0.0f;
                 CUTE_UNROLL
-                for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
-                    float inv_scale = 1.0f / scale_f[g];
+                for (int g = 0; g < NUM_LOCAL_GROUPS; ++g) {
+                    float group_max_logit = -CUDART_INF_F;
                     CUTE_UNROLL
-                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE/2; ++i) {
-                        int kk = g * MXFP8_SCALE_VEC_SIZE + i*2;
-                        float v0 = p[kk]   * params.sm_scale_div_log2 - new_max;
-                        float v1 = p[kk+1] * params.sm_scale_div_log2 - new_max;
-                        v0 = exp2f(v0) * inv_scale;
-                        v1 = exp2f(v1) * inv_scale;
-                        cur_sum += v0 + v1;
-                        s[g*(MXFP8_SCALE_VEC_SIZE/2) + i] = __floats2bfloat162_rn(v0, v1);
+                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
+                        int local_token = g * MXFP8_SCALE_VEC_SIZE + i;
+                        group_max_logit = max(group_max_logit, p[local_token] * params.sm_scale_div_log2);
+                    }
+
+                    float group_max_s = exp2f(group_max_logit - new_max);
+                    e8m0 scale_g = e8m0(group_max_s > 0.0f ? group_max_s / FP8_MAX : 1.0f);
+                    float inv_scale = 1.0f / float(scale_g);
+                    int group_token = token_base + g * MXFP8_SCALE_VEC_SIZE;
+                    sS_scale(h, group_token, _0{}) = scale_g;
+
+                    CUTE_UNROLL
+                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
+                        int local_token = g * MXFP8_SCALE_VEC_SIZE + i;
+                        float s_val = exp2f(p[local_token] * params.sm_scale_div_log2 - new_max);
+                        cur_sum += s_val;
+                        sS(h, group_token + i) = e4m3(s_val * inv_scale);
                     }
                 }
                 li = fma(li, scale_for_old, cur_sum);
-
-                // Write S to smem
-                CUTE_UNROLL
-                for (int i = 0; i < (B_TOPK/2)/8; i += 1) {
-                    *(uint128_t*)(sS_base + B_H*8*i) = *(uint128_t*)(s + i*4);
-                }
 
                 // Scale O in tmem (only when should_scale_o and not first block)
                 if (block_idx != args.start_block_idx && should_scale_o) {
@@ -486,7 +460,7 @@ KernelTemplate<MODEL_TYPE>
                         SmemLayoutQScale{}
                     );
                     auto sQ_compact = make_tensor(sQ_scale.data(), filter_zeros(sQ_scale.layout()));
-                    Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutQScale{}));
+                    Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
                     tQ_scale.data().get() = tmem_cols::QScale;
 
                     auto tQ_compact = make_tensor(tQ_scale.data(), filter_zeros(tQ_scale.layout()));
@@ -526,7 +500,7 @@ KernelTemplate<MODEL_TYPE>
                             SmemLayoutKScale{}
                         );
                         auto sK_compact = make_tensor(sK_scale.data(), filter_zeros(sK_scale.layout()));
-                        Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutKScale{}));
+                        Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
                         tK_scale.data().get() = tmem_cols::KScale;
 
                         auto tK_compact = make_tensor(tK_scale.data(), filter_zeros(tK_scale.layout()));
@@ -541,9 +515,9 @@ KernelTemplate<MODEL_TYPE>
                     ku::tcgen05_after_thread_sync();
 
                     // KQ^T MMA: P = K @ Q^T (both operands in smem, tmem accum P)
-                    Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutQScale{}));
+                    Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
                     tQ_scale.data().get() = tmem_cols::QScale;
-                    Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutKScale{}));
+                    Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
                     tK_scale.data().get() = tmem_cols::KScale;
 
                     Tensor sK = make_tensor(make_smem_ptr(plan.u.kv.kv[rs.buf_idx].data()), SmemLayoutKTiles_SW128<D_K/64>{});
@@ -797,10 +771,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnMxfp8DecodeParams &params) 
     KU_ASSERT(params.stride_q_s_q == Q_BYTES_PER_TOKEN,
         "stride_q_s_q must equal Q_BYTES_PER_TOKEN (D_Q + NUM_SCALES_EACH_TOKEN = %d), got %d",
         Q_BYTES_PER_TOKEN, params.stride_q_s_q);
-    // Each KV page is page_block_size * D_K e4m3 + page_block_size * NUM_SCALES_EACH_TOKEN e8m0
-    constexpr int KV_BYTES_PER_TOKEN = D_K + NUM_SCALES_EACH_TOKEN;
-    constexpr int KV_BYTES_PER_PAGE = 0;  // page_block_size is dynamic; checked below
-    (void)KV_BYTES_PER_PAGE;
+    // Each KV page stores all e4m3 rows followed by all per-row UE8M0 scales.
     // The K data must be 16-byte aligned and stride_kv_block must be a multiple of TMA_K_STRIDE
     KU_ASSERT(params.stride_kv_block % TMA_K_STRIDE == 0,
         "stride_kv_block (%d) must be a multiple of TMA_K_STRIDE (%d); padding may be necessary",

@@ -29,19 +29,21 @@ constexpr int D = 512;
 constexpr int D_Q = D;
 constexpr int D_K = D;
 constexpr int D_V = D;
-constexpr int NUM_SCALES_EACH_TOKEN = 8;
-constexpr int SCALE_GROUP_SIZE = 64;
 constexpr int MXFP8_SCALE_VEC_SIZE = 32;
-constexpr int K_QUANT_GROUP_SIZE = SCALE_GROUP_SIZE;
-constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
-constexpr int K_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
-constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE; 
-// k sclae group is wider than mxfp8 quant group so we need to duplicate
-constexpr int BYTES_PER_TOKEN = D + NUM_SCALES_EACH_TOKEN;
+constexpr int Q_QUANT_GROUP_SIZE = 32;
+constexpr int K_QUANT_GROUP_SIZE = 64;
+constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
+constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
+constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
+constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
+constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
+constexpr int TMA_K_CHUNK_BYTES = 64;
+constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 128;
-constexpr int NUM_BUFS = 3;
+constexpr int NUM_BUFS = 2;
+constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
@@ -49,7 +51,10 @@ constexpr float FP8_MAX = 448.0f;
 constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D / MXFP8_SCALE_VEC_SIZE);
 constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D / MXFP8_SCALE_VEC_SIZE);
 
-static_assert(BYTES_PER_TOKEN == 520);
+static_assert(Q_BYTES_PER_TOKEN == 528);
+static_assert(KV_BYTES_PER_TOKEN == 520);
+static_assert(K_SCALE_DUP == 2);
+static_assert(D_K % TMA_K_CHUNK_BYTES == 0);
 
 // Tensor memory columns
 namespace tmem_cols {
@@ -143,14 +148,14 @@ using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
 ));
 
 struct SharedMemoryPlan {
+    array_aligned<e4m3, B_H*D_Q> q;
     union {
-        array_aligned<e4m3, B_H*D_Q> q;
         struct {
             array_aligned<e4m3, B_TOPK*D_K> kv[NUM_BUFS];
             array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_scale[NUM_BUFS];
         } kv;
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
-    } qkvo;
+    } kvo;
     union {
         e4m3 s[B_H*B_TOPK];
         array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
@@ -158,6 +163,8 @@ struct SharedMemoryPlan {
     array_aligned<e8m0, cosize_v<SmemLayoutOScaleBAtom>> s_scale;
     float head_scale[B_H], head_mi[B_H], head_li[B_H], head_real_mi[B_H];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
+    char kv_warp_has_valid[NUM_BUFS][NUM_KV_PRODUCER_WARPS];
+    char kv_skip_tma[NUM_BUFS];
     float p_t[B_TOPK*B_H];
     transac_bar_t bar_prologue_q, bar_prologue_q_scale;
     transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
@@ -170,11 +177,11 @@ struct SharedMemoryPlan {
     float rowwise_max_buf[128], rowwise_li_buf[128];
 };
 
+static_assert(sizeof(SharedMemoryPlan) < 227 * 1024, "MXFP8 prefill shared memory exceeds the SM100 limit");
+
 enum NamedBarriers : int {
     wg0_sync = 0,
-    wg0_warp02_sync = 1,
-    wg0_warp13_sync = 2,
-    pepi_sync = 3,
+    wg1_tma_sync = 1,
 };
 
 } // namespace sm100::mxfp8_fwd::head64

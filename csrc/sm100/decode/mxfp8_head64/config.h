@@ -17,7 +17,7 @@ namespace sm100::decode::mxfp8_head64 {
 
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
-using e8m0 = __nv_fp8_e8m0;
+using e8m0 = cutlass::float_ue8m0_t;
 using e4m3 = cutlass::float_e4m3_t;
 using namespace cute;
 
@@ -48,11 +48,9 @@ static constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
 static constexpr int TMA_K_STRIDE = D_K;  // 512 — pure e4m3, no per-token scales interleaved
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 128;
-constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D_K / MXFP8_SCALE_VEC_SIZE);  // 128 * 16 = 2048
-constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D_Q / MXFP8_SCALE_VEC_SIZE);    // 64 * 16 = 1024
-constexpr int S_SCALE_SMEM_ELEMS = B_H * (B_TOPK / MXFP8_SCALE_VEC_SIZE);  // 64 * 4 = 256
-constexpr int K_SCALE_DUP = 1;  // Input KV cache stores 1 e8m0 per 32 e4m3, so no expansion needed.
-                                // (Note: mxfp8 prefill's K_QUANT_GROUP_SIZE=64 used DUP=2 there.)
+static constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D_K / MXFP8_SCALE_VEC_SIZE);  // 128 * 16 = 2048
+static constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D_Q / MXFP8_SCALE_VEC_SIZE);    // 64 * 16 = 1024
+static constexpr int S_SCALE_SMEM_ELEMS = B_H * (B_TOPK / MXFP8_SCALE_VEC_SIZE);  // 64 * 4 = 256
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 32 utcmma + 32 raw KV producer + 32 kv-scale/idx producer + 128 reserved
@@ -182,14 +180,14 @@ struct SharedMemoryPlan {
     union {
         struct {
             array_aligned<e4m3, cosize_v<SmemLayoutQ_SW128>> q;
-            array_aligned<e8m0, cosize_v<SmemLayoutQScale>> q_scale;
+            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
             union {
                 array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
                 array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
             } o;
         } qo;
         struct {
-            array_aligned<e8m0, cosize_v<SmemLayoutKScale>> kv_scale[NUM_BUFS];
+            array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_scale[NUM_BUFS];
             array_aligned<e4m3, cosize_v<SmemLayoutKTiles_SW128<D_K/64>>> kv[NUM_BUFS];  // Raw (quantized) K data
         } kv;
     } u;

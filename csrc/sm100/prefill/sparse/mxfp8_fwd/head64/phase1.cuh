@@ -48,7 +48,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     const int lane_idx = threadIdx.x % 32;
     const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
     const int idx_in_warpgroup = threadIdx.x % 128;
-    const int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+    const int requested_topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
+    const int topk_length = max(0, min(requested_topk_length, params.topk));
     const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
 
     // Define shared tensors
@@ -86,15 +87,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             fence_barrier_init();
 
             // Q is stored as e4m3 data followed by e8m0 block scales.
+            plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
             cute::SM90_TMA_LOAD_3D::copy(
                 &tma_params.tensor_map_q,
                 (uint64_t*)&plan.bar_prologue_q,
                 (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
-                plan.qkvo.q.data(),
+                plan.q.data(),
                 0, 0, s_q_idx
             );
             Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx);
             Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_q_scale.q_scale.data()), SmemLayoutQScaleTMA{});
+            plan.bar_prologue_q_scale.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
             ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale, plan.bar_prologue_q_scale, TMA::CacheHintSm90::EVICT_FIRST);
 
         CUTE_UNROLL
@@ -102,7 +105,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_qk_done[i].init(1);
             plan.bar_sv_done[i].init(1);
             plan.bar_kv_ready[i].init(1);
-            plan.bar_kv_scale_ready[i].init(1);
+            plan.bar_kv_scale_ready[i].init(NUM_KV_PRODUCER_WARPS);
             plan.bar_k_valid_ready[i].init(B_TOPK/8);
             plan.bar_k_valid_free[i].init(128);
         }
@@ -170,14 +173,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             }
             
             float old_mi = plan.head_mi[h];
-            float new_max = max(cur_pi_max, old_mi);
+            bool should_scale_o = cur_pi_max - old_mi > 6.0f;
+            float new_max = should_scale_o ? max(cur_pi_max, old_mi) : old_mi;
             CUTE_UNROLL
             for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
                 absmax_p[g] = exp2f(absmax_p[g] - new_max);
             }
-            float scale_for_old = exp2f(old_mi - new_max);
-            bool should_scale_o = cur_pi_max - old_mi > 6.0f;
-            plan.head_scale[h] = should_scale_o ? scale_for_old : 1.0f;
+            float scale_for_old = should_scale_o ? exp2f(old_mi - new_max) : 1.0f;
+            plan.head_scale[h] = scale_for_old;
             plan.head_mi[h] = new_max;
             plan.head_real_mi[h] = max(plan.head_real_mi[h], cur_pi_max);
 
@@ -222,6 +225,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             if (real_mi == -CUDART_INF_F) {
                 li = 0.0f;
                 mi = -CUDART_INF_F;
+                plan.head_li[idx_in_warpgroup] = li;
+                plan.head_mi[idx_in_warpgroup] = mi;
             }
             int global_index = s_q_idx*params.h_q + idx_in_warpgroup;
             float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
@@ -236,13 +241,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         if (idx_in_warpgroup < B_H) {
             int h = idx_in_warpgroup;
             float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + h)*CUDART_L2E_F;
-            float output_scale = __fdividef(1.0f, plan.head_li[h] + exp2f(attn_sink - plan.head_mi[h]));
+            float output_scale = plan.head_li[h] == 0.0f
+                ? 0.0f
+                : __fdividef(1.0f, plan.head_li[h] + exp2f(attn_sink - plan.head_mi[h]));
             plan.head_scale[h] = output_scale;
         }
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
         {
-            Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.data()), SmemLayoutO{});
+            Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.data()), SmemLayoutO{});
             float o_head[B_H_TMEM];
             CUTE_UNROLL
             for (int tile = 0; tile < D_V/B_TOPK; ++tile) {
@@ -259,7 +266,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
         // Store O using TMA
         constexpr int B_EPI = 64;
-        Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.data()), SmemLayoutO{});
+        Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.data()), SmemLayoutO{});
         Tensor tma_gO = flat_divide(
             tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
             Shape<Int<B_H>, Int<B_EPI>>{}
@@ -286,84 +293,108 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         }
     } else if (warpgroup_idx == 1) {
         // Producer warp for KV
-        int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
-        constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_WARPS;
+        int producer_warp_idx = cutlass::canonical_warp_idx_sync() - 4;
+        constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_KV_PRODUCER_WARPS;
         if (elect_one_sync()) {
+            // KV is one packed page: all e4m3 rows first, followed by all
+            // per-token UE8M0 scales at the end of the page.
+            const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
+                + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
+
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
-                int4 indices[NUM_LOCAL_ROWS_PER_WARP];
-                int max_indices = -1, min_indices = params.s_kv;
-                CUTE_UNROLL
-                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                    indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
-                    max_indices = max(max_indices, int4_max(indices[local_row]));
-                    min_indices = min(min_indices, int4_min(indices[local_row]));
-                }
-                bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
-                bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
-
                 // Copy NoPE data with gather4. Scale factors are scattered into the
                 // SM100 block-scale SFA shared layout expected by tcgen05 block_scale MMA.
                 int cur_buf = k%NUM_BUFS;
                 plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
 
-                Tensor sK = make_tensor(make_smem_ptr(plan.qkvo.kv.kv[cur_buf].data()), SmemLayoutK{});
-                Tensor sK_scale = make_tensor(make_smem_ptr(plan.qkvo.kv.kv_scale[cur_buf].data()), SmemLayoutKScale{});
-                e4m3* sK_base = &sK(warp_idx*4, _0{});
-
-                auto load_kv = [&]() { // change the scale layout here to the end of the kv page/tensor?
+                int4 indices[NUM_LOCAL_ROWS_PER_WARP];
+                bool has_valid_index = false;
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    int vector_idx = local_row*NUM_KV_PRODUCER_WARPS + producer_warp_idx;
+                    indices[local_row] = __ldg(reinterpret_cast<int4*>(gIndices + k*B_TOPK) + vector_idx);
                     CUTE_UNROLL
-                    for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    for (int i = 0; i < 4; ++i) {
+                        int row = vector_idx*4 + i;
+                        int& index = reinterpret_cast<int*>(&indices[local_row])[i];
+                        if (index < 0 || index >= params.s_kv || k*B_TOPK + row >= topk_length) {
+                            index = -1;
+                        } else {
+                            has_valid_index = true;
+                        }
+                    }
+                }
+                plan.kv_warp_has_valid[cur_buf][producer_warp_idx] = has_valid_index;
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
+
+                if (producer_warp_idx == 0) {
+                    bool all_invalid = true;
+                    CUTE_UNROLL
+                    for (int producer = 0; producer < NUM_KV_PRODUCER_WARPS; ++producer) {
+                        all_invalid &= !plan.kv_warp_has_valid[cur_buf][producer];
+                    }
+                    plan.kv_skip_tma[cur_buf] = all_invalid;
+                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
+                    if (all_invalid) {
+                        plan.bar_kv_ready[cur_buf].complete_transaction(B_TOPK*D_K*sizeof(e4m3));
+                    }
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
+
+                Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
+                Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutKScale{});
+                e4m3* sK_base = &sK(producer_warp_idx*4, _0{});
+
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                    if (!plan.kv_skip_tma[cur_buf]) {
                         CUTE_UNROLL
-                        for (int local_col = 0; local_col < D_K/64; ++local_col) {
+                        for (int local_col = 0; local_col < D_K/TMA_K_CHUNK_BYTES; ++local_col) {
                             ku::tma_gather4(
                                 &(tma_params.tensor_map_kv),
                                 plan.bar_kv_ready[cur_buf],
-                                sK_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
-                                local_col*64,
+                                sK_base + local_row*(4*NUM_KV_PRODUCER_WARPS)*TMA_K_CHUNK_BYTES
+                                    + local_col*(B_TOPK*TMA_K_CHUNK_BYTES),
+                                local_col*TMA_K_CHUNK_ELEMS,
                                 indices[local_row],
                                 (int64_t)TMA::CacheHintSm90::EVICT_LAST
                             );
                         }
+                    }
 
+                    CUTE_UNROLL
+                    for (int i = 0; i < 4; ++i) {
+                        int src_idx = reinterpret_cast<int*>(&indices[local_row])[i];
+                        int row = local_row*(4*NUM_KV_PRODUCER_WARPS) + producer_warp_idx*4 + i;
+                        e8m0 scale[K_SCALE_BYTES];
+                        if (src_idx >= 0) {
+                            const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
+                                + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;
+                            *reinterpret_cast<uint64_t*>(scale) = __ldg(reinterpret_cast<const uint64_t*>(src_scale));
+                        } else {
+                            *reinterpret_cast<uint64_t*>(scale) = 0;
+                        }
                         CUTE_UNROLL
-                        for (int i = 0; i < 4; ++i) {
-                            int src_idx = (&indices[local_row].x)[i];
-                            int row = local_row*(4*NUM_WARPS) + warp_idx*4 + i;
-                            e8m0 scale[K_SCALE_BYTES];
-                            uint8_t* src_scale = (uint8_t*)params.kv + (int64_t)src_idx*params.stride_kv_s_kv + D_K;
-                            if (src_idx >= 0 && src_idx < params.s_kv) {
-                                *reinterpret_cast<uint64_t*>(scale) = *reinterpret_cast<uint64_t*>(src_scale);
-                            } else {
-                                *reinterpret_cast<uint64_t*>(scale) = 0;
-                            }
+                        for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
                             CUTE_UNROLL
-                            for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
-                                CUTE_UNROLL
-                                for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
-                                    int dst_sf_idx = src_sf_idx*K_SCALE_DUP + dup;
-                                    sK_scale(row, dst_sf_idx*MXFP8_SCALE_VEC_SIZE, _0{}) = scale[src_sf_idx];
-                                }
+                            for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
+                                int dst_sf_idx = src_sf_idx*K_SCALE_DUP + dup;
+                                sK_scale(row, dst_sf_idx*MXFP8_SCALE_VEC_SIZE, _0{}) = scale[src_sf_idx];
                             }
                         }
                     }
-                    fence_view_async_shared();
-                    plan.bar_kv_scale_ready[cur_buf].arrive();
-                };
-
-                if (!should_skip_tma) {
-                    load_kv();
-                } else {
-                    plan.bar_kv_ready[cur_buf].complete_transaction(B_TOPK*D_K*sizeof(e4m3));
-                    plan.bar_kv_scale_ready[cur_buf].arrive();
                 }
+                fence_view_async_shared();
+                plan.bar_kv_scale_ready[cur_buf].arrive();
             }
         }
     } else {
         if (warp_idx == 8 && elect_one_sync()) {
 
-            Tensor sQ = make_tensor(make_smem_ptr(plan.qkvo.q.data()), SmemLayoutQ{});
-            plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
+            Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
             plan.bar_prologue_q.wait(0);
 
             plan.bar_prologue_q_scale.wait(0);
@@ -392,14 +423,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 if (k < num_k_blocks) {
                     // Pi = QKi^T
                     int cur_buf = k%NUM_BUFS;
-                    Tensor sK = make_tensor(make_smem_ptr(plan.qkvo.kv.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
+                    Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
 
                     plan.bar_p_free.wait(k&1^1);
                     ku::tcgen05_after_thread_sync();
 
                     plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     Tensor sK_scale = make_tensor(
-                        make_smem_ptr(plan.qkvo.kv.kv_scale[cur_buf].data()),
+                        make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
                         SmemLayoutKScale{}
                     );
                     auto sK_compact = make_tensor(sK_scale.data(), filter_zeros(sK_scale.layout()));
@@ -412,7 +443,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     auto dst_K = thr_K.partition_D(tK_compact);
                     cute::copy(copy_K_scale, src_K, dst_K);
 
-                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                     plan.bar_kv_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     ku::tcgen05_after_thread_sync();
 
@@ -431,7 +461,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
                     Tensor sS = make_tensor(make_smem_ptr(plan.s_q_scale.s), SmemLayoutS{});
                     Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutOScaleBAtom{});
-                    Tensor sV = make_tensor(make_smem_ptr(plan.qkvo.kv.kv[cur_buf].data()), SmemLayoutV{});
+                    Tensor sV = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutV{});
 
                     // Wait for S(i-1) and O to be scaled
                     plan.bar_so_ready.wait((k-1)&1);
@@ -446,6 +476,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
                     auto dst_S = thr_S.partition_D(tS_compact);
                     cute::copy(copy_S_scale, src_S, dst_S);
+                    ku::tcgen05_after_thread_sync();
 
                     // O += sS @ sV
                     CUTE_UNROLL
@@ -496,12 +527,21 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
 template<int D_QK>
 void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
+    KU_ASSERT(params.s_q > 0);
+    KU_ASSERT(params.s_kv > 0);
+    KU_ASSERT(params.topk > 0);
     KU_ASSERT(params.topk % B_TOPK == 0, "topk (%d) mod B_TOPK (%d) must be 0", params.topk, B_TOPK);
     KU_ASSERT(params.h_q == B_H);
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == D_QK);
     KU_ASSERT(params.d_v == D_V);
-    static_assert(D_QK == 576 || D_QK == 512);
+    KU_ASSERT(params.stride_kv_h_kv == KV_BYTES_PER_TOKEN,
+        "packed KV storage must use a %d-byte logical token envelope", KV_BYTES_PER_TOKEN);
+    KU_ASSERT(params.stride_kv_s_kv == params.h_kv * KV_BYTES_PER_TOKEN,
+        "packed KV storage must be contiguous across tokens");
+    KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0, "q must be 16-byte aligned");
+    KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0, "kv must be 16-byte aligned");
+    static_assert(D_QK == D_Q);
 
     auto shape_O = make_shape(B_H, D_V, params.s_q);
     auto tma_O = cute::make_tma_copy(
@@ -540,9 +580,9 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     );
 
     CUtensorMap tensor_map_kv = ku::make_tensor_map(
-            {D_K / 8, (uint64_t)params.h_kv, (uint64_t)params.s_kv},
-            ku::make_stride_helper(std::vector<int64_t>{params.stride_kv_h_kv, params.stride_kv_s_kv}, sizeof(uint64_t)),
-            {D_K / 8, (uint32_t)params.h_kv, 1},
+            {D_K / 8, static_cast<uint64_t>(params.s_kv)},
+            {D_K},
+            {TMA_K_CHUNK_ELEMS, 1},
             params.kv,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,

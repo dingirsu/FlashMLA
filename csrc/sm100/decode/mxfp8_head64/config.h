@@ -6,6 +6,8 @@
 #include <cutlass/barrier.h>
 #include <cute/tensor.hpp>
 
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
+
 #include <kerutils/kerutils.cuh>
 
 #include "defines.h"
@@ -30,28 +32,41 @@ enum NamedBarriers : uint32_t {
 template<ModelType MODEL_TYPE>
 struct KernelTemplate {
 
+// We currently only support the 512 head-dim (MODEL1) case. V32 (576) needs
+// a separate config because of the differing K-major length.
+static constexpr bool V32_SUPPORTED = false;
+static_assert(MODEL_TYPE == ModelType::MODEL1 || V32_SUPPORTED,
+    "mxfp8 decode kernel only supports ModelType::MODEL1 (d_qk=512) at this time");
+
 static constexpr int D_Q = 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
-static constexpr int QUANT_TILE_SIZE = 64;
-static constexpr int NUM_SCALES_EACH_TOKEN = 8;   
-static constexpr int TMA_K_STRIDE = 512;
+static constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+static constexpr int QUANT_TILE_SIZE = MXFP8_SCALE_VEC_SIZE;
+static constexpr int NUM_SCALES_EACH_TOKEN = D_K / MXFP8_SCALE_VEC_SIZE;  // 16
+static constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
+static constexpr int TMA_K_STRIDE = D_K;  // 512 — pure e4m3, no per-token scales interleaved
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 128;
-constexpr int MXFP8_SCALE_VEC_SIZE = 32;
-constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
-constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D_K / MXFP8_SCALE_VEC_SIZE);
+constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D_K / MXFP8_SCALE_VEC_SIZE);  // 128 * 16 = 2048
+constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D_Q / MXFP8_SCALE_VEC_SIZE);    // 64 * 16 = 1024
+constexpr int S_SCALE_SMEM_ELEMS = B_H * (B_TOPK / MXFP8_SCALE_VEC_SIZE);  // 64 * 4 = 256
+constexpr int K_SCALE_DUP = 1;  // Input KV cache stores 1 e8m0 per 32 e4m3, so no expansion needed.
+                                // (Note: mxfp8 prefill's K_QUANT_GROUP_SIZE=64 used DUP=2 there.)
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
-static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
+static constexpr int NUM_THREADS = 128*3;  // 128 exp + 32 utcmma + 32 raw KV producer + 32 kv-scale/idx producer + 128 reserved
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
+static constexpr float FP8_MAX = 448.0f;  // Max e4m3 value used in mxfp8 quantize
 
 template<
     typename Shape_Q, typename TMA_Q,
+    typename Shape_Q_Scale, typename TMA_Q_Scale,
     typename Shape_O, typename TMA_O
 >
 struct TmaParams {
     Shape_Q shape_Q; TMA_Q tma_Q;
+    Shape_Q_Scale shape_Q_scale; TMA_Q_Scale tma_Q_scale;
     Shape_O shape_O; TMA_O tma_O;
     CUtensorMap tensor_map_kv;
     CUtensorMap tensor_map_extra_kv;
@@ -59,9 +74,12 @@ struct TmaParams {
 
 // Tensor memory columns
 struct tmem_cols {
-    //   0 ~ 256: output
-    // 256 ~ 256 + 64*D_Q/256: Q
-    // 400 ~ 464: P
+    //   0 ~ 256: O (D_V / 2 cols of 32-bit FP32 per row, fp32 acc)
+    // 256 ~ 320: unused
+    // 320 ~ 338: Q scale (e8m0)        (Q_Scale: 16 cols)
+    // 338 ~ 356: K/V scale (e8m0)      (K_Scale: 16 cols, reused for V after QK^T)
+    // 356 ~ 376: S scale (e8m0)        (S_Scale: 16 cols + 4 cols padding)
+    // 400 ~ 464: P (fp32, (B_TOPK, B_H) = 128x64)  (P: 64 cols)
     static constexpr int O = 0;
     static constexpr int QScale = 320;
     static constexpr int KScale = 338;
@@ -103,7 +121,7 @@ using SmemLayoutS = decltype(tile_to_shape(
 template<int NUM_TILES>
 using SmemLayoutKTiles_SW128 = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e4m3>{},
-    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
+    Shape<Int<B_TOPK>, Int<64*NUM_TILES>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
@@ -116,40 +134,70 @@ using SmemLayoutKTilesTransposed_SW128 = decltype(composition(
     >{}
 ));
 
+// Tiled MMAs
+using TiledMMA_P = decltype(make_tiled_mma(
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>{}
+));
+
+using TiledMMA_O = decltype(make_tiled_mma(
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
+));
+
+// Q scale smem layout (Q is the B operand of the KQ GEMM, so its scales are SFB)
 using SmemLayoutQScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFB(
     Shape<Int<B_TOPK>, Int<B_H>, Int<D_Q>>{}
 ));
 
+// K scale smem layout (K is the A operand of the KQ GEMM, so its scales are SFA)
+using SmemLayoutKScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFA(
+    Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
+));
+
+// Atom layouts derived from the MMA tiles — needed for the UTCCP src layout
+// of the S scales and V scales (tV_scale uses the O atom's SFA even though the
+// data is physically written by the KQ MMA's SFA UTCCP).
+using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_P{}, Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
+));
+using SmemLayoutPScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_P{}, Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
+));
+using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
+    TiledMMA_O{}, Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+));
+using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
+    TiledMMA_O{}, Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+));
+
+// S scale smem layout (S is the B operand of the VS GEMM, so its scales are SFB)
+using SmemLayoutSscale = SmemLayoutOScaleBAtom;
+
+// Q scale smem layout for TMA (a simple (B_H, NUM_SCALES_EACH_TOKEN) layout)
 using SmemLayoutQScaleTMA = Layout<
     Shape<Int<B_H>, Int<Q_SCALE_BYTES>>,
     Stride<Int<Q_SCALE_BYTES>, _1>
 >;
 
-using SmemLayoutKScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFA(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
-));
-
-using SmemLayoutSscale = SmemLayoutQScale;
-
 struct SharedMemoryPlan {
     union {
         struct {
             array_aligned<e4m3, cosize_v<SmemLayoutQ_SW128>> q;
-            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
+            array_aligned<e8m0, cosize_v<SmemLayoutQScale>> q_scale;
             union {
                 array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
                 array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
             } o;
         } qo;
         struct {
-            array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_scale[NUM_BUFS];
-            array_aligned<e4m3, B_H*D_K> kv[NUM_BUFS];  // Raw (quantized) NoPE part
+            array_aligned<e8m0, cosize_v<SmemLayoutKScale>> kv_scale[NUM_BUFS];
+            array_aligned<e4m3, cosize_v<SmemLayoutKTiles_SW128<D_K/64>>> kv[NUM_BUFS];  // Raw (quantized) K data
         } kv;
     } u;
     union {
         float4 p_exchange_buf[4][16 * B_TOPK / 4]; // why this layout?
         array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
     } s_p;
+    array_aligned<e8m0, cosize_v<SmemLayoutSscale>> s_scale;
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
@@ -158,25 +206,17 @@ struct SharedMemoryPlan {
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;
     transac_bar_t bar_q_scale_tma, bar_q_scale_utccp;
-    transac_bar_t bar_ready[NUM_BUFS];
-    transac_bar_t bar_kv_ready[NUM_BUFS], bar_kv_scale_ready[NUM_BUFS];
+    transac_bar_t bar_kv_ready[NUM_BUFS];
+    transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
 };
 
-using TiledMMA_P = decltype(make_tiled_mma( // make the type name shorter
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
-));
-
 template<typename TmaParam>
 static __device__ void
-flash_fwd_splitkv_mla_mxfp8_sparse_kernel_devfunc(const SparseAttnDecodeParams &params, const TmaParam &tma_params);
+flash_fwd_splitkv_mla_mxfp8_sparse_kernel_devfunc(const SparseAttnMxfp8DecodeParams &params, const TmaParam &tma_params);
 
-static void run(const SparseAttnDecodeParams &params);
+static void run(const SparseAttnMxfp8DecodeParams &params);
 
 };
 

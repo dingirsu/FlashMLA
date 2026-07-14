@@ -166,4 +166,3 @@ def assert_close(
             f"{name}: max_abs={diff.max().item():.6g}, "
             f"mean_abs={diff.mean().item():.6g}, atol={atol}, rtol={rtol}"
         )
-

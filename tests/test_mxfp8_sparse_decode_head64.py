@@ -61,4 +61,3 @@ def test_mxfp8_sparse_decode_head64_precision() -> None:
 if __name__ == "__main__":
     test_mxfp8_sparse_decode_head64_precision()
     print("MXFP8 sparse decode head64 precision test passed")
-

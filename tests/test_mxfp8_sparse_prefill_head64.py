@@ -49,4 +49,3 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
 if __name__ == "__main__":
     test_mxfp8_sparse_prefill_head64_precision()
     print("MXFP8 sparse prefill head64 precision test passed")
-

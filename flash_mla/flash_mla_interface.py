@@ -483,16 +483,16 @@ def flash_mla_mxfp8_sparse_prefill(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    MXFP8 sparse attention prefill kernel with BF16 RoPE (SM100 only).
-    Both Q and KV use the same format as existing FP8 KV cache:
-    NoPE part: e4m3 data + per-128-element float32 block scales
-    RoPE part: BF16 (not quantized)
+    MXFP8 sparse attention prefill kernel (SM100 only).
+
+    Q uses 32-value groups and stores 16 UE8M0 scales after each 512-byte
+    e4m3 token. KV uses 64-value groups and is a packed page containing all
+    e4m3 rows first, followed by 8 UE8M0 scales for every token.
 
     Args:
-        q: [s_q, h_q, bytes_per_token], uint8 or float8_e4m3fn.
-           For d_qk=512 (MODEL1): bytes_per_token = 448 + 8 + 128 = 584
-           For d_qk=576 (V32): bytes_per_token = 512 + 16 + 128 = 656
-        kv: [s_kv, h_kv, bytes_per_token], uint8 or float8_e4m3fn. Same layout as q.
+        q: [s_q, h_q, 528], uint8 or float8_e4m3fn.
+        kv: [s_kv, h_kv, 520], uint8 or float8_e4m3fn storage envelope.
+            Its underlying bytes must be [all 512-byte rows][all 8-byte scales].
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or >= s_kv.
         sm_scale: float. Softmax scale factor.
         d_qk: int. The logical head dimension for Q/K (512 or 576).

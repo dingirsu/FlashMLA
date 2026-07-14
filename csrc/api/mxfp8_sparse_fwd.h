@@ -40,11 +40,12 @@ protected:
 /*
  * mxfp8_sparse_attn_prefill_interface
  *
- * MXFP8 sparse attention prefill. Both Q and KV are stored as e4m3 data
- * followed by e8m0 block scales. SM100 only.
+ * MXFP8 sparse attention prefill. Q stores its scales after each token;
+ * KV is a packed page with all e4m3 rows followed by all page scales.
  *
- * Token layout:
- *   - d_qk=512: 512 bytes e4m3 + 8 bytes scales = 520 bytes/token
+ * Layout for d_qk=512:
+ *   - Q: 512 e4m3 bytes + 16 UE8M0 scales per token (32-value groups)
+ *   - KV page: s_kv*512 e4m3 bytes, then s_kv*8 UE8M0 scales (64-value groups)
  */
 static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     const at::Tensor &q,        // [s_q, h_q, bytes_per_token_q]
@@ -76,17 +77,13 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     TORCH_CHECK(d_qk == 512, "MXFP8 sparse prefill head64 currently supports only d_qk=512, got ", d_qk);
     TORCH_CHECK(d_v == 512, "MXFP8 sparse prefill head64 currently supports only d_v=512, got ", d_v);
 
-    // Compute expected bytes per token.
-    int bytes_per_token;
-    if (d_qk == 512 && d_v == 512) {
-        bytes_per_token = 512 + 8;
-    } else {
-        TORCH_CHECK(false, "Unsupported head sizes for MXFP8");
-    }
-    TORCH_CHECK(q.size(2) == bytes_per_token,
-        "q last dim must be ", bytes_per_token, " for MXFP8 with d_qk=", d_qk, ", got ", q.size(2));
-    TORCH_CHECK(kv.size(2) == bytes_per_token,
-        "kv last dim must be ", bytes_per_token, " for MXFP8 with d_qk=", d_qk, ", got ", kv.size(2));
+    constexpr int q_bytes_per_token = 512 + 16;
+    constexpr int kv_bytes_per_token = 512 + 8;
+    TORCH_CHECK(q.size(2) == q_bytes_per_token,
+        "q last dim must be ", q_bytes_per_token, " for MXFP8 with d_qk=", d_qk, ", got ", q.size(2));
+    TORCH_CHECK(kv.size(2) == kv_bytes_per_token,
+        "kv storage envelope must provide ", kv_bytes_per_token,
+        " bytes per token for page-tail scales, got ", kv.size(2));
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -103,7 +100,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     KU_CHECK_DTYPE(topk_length, torch::kInt32);
 
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
-    KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+    KU_CHECK_CONTIGUOUS(kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);

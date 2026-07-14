@@ -31,9 +31,7 @@ class MxFp8Fwd_Sm100_Head64_Impl : public MxFp8FwdImplBase {
 
 protected:
     void run_(const MxFp8SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::mxfp8_fwd::head64::run_mxfp8_fwd_phase1_kernel<HEAD_DIM_QK>(params);
-        });
+        sm100::mxfp8_fwd::head64::run_mxfp8_fwd_phase1_kernel<512>(params);
     }
 };
 

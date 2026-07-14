@@ -6,7 +6,7 @@
 #include "dense_decode.h"
 #include "dense_fwd.h"
 #include "mxfp8_sparse_fwd.h"
-// #include "mxfp8_sparse_decode.h"
+#include "mxfp8_sparse_decode.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
@@ -17,5 +17,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
     m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
     m.def("mxfp8_sparse_prefill_fwd", &mxfp8_sparse_attn_prefill_interface);
-    // m.def("mxfp8_sparse_decode_fwd", &mxfp8_sparse_attn_decode_interface);
+    m.def("mxfp8_sparse_decode_fwd", &mxfp8_sparse_attn_decode_interface);
 }

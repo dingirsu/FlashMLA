@@ -27,7 +27,7 @@ struct MxFp8DecodeImplMeta {
 };
 
 class MxFp8DecodeImplBase : public ImplBase<
-    MxFp8SparseAttnDecodeParams,
+    SparseAttnMxfp8DecodeParams,
     MxFp8DecodeFeatures
 > {
 public:
@@ -38,7 +38,6 @@ class MxFp8Decode_Sm100_Head64_Impl : public MxFp8DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         MxFp8DecodeFeatures::HEAD_64,
         MxFp8DecodeFeatures::HEAD_DIM_512,
-        MxFp8DecodeFeatures::HEAD_DIM_576,
         MxFp8DecodeFeatures::ATTN_SINK,
         MxFp8DecodeFeatures::TOPK_LENGTH,
         MxFp8DecodeFeatures::EXTRA_KVCACHE,
@@ -56,14 +55,8 @@ public:
     }
 
 protected:
-    void run_(const MxFp8SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            if constexpr (HEAD_DIM_QK == 512) {
-                sm100::decode::mxfp8_head64::run_flash_splitkv_mla_mxfp8_sparse_kernel<ModelType::MODEL1>(params);
-            } else {
-                sm100::decode::mxfp8_head64::run_flash_splitkv_mla_mxfp8_sparse_kernel<ModelType::V32>(params);
-            }
-        });
+    void run_(const SparseAttnMxfp8DecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        sm100::decode::mxfp8_head64::run_flash_splitkv_mla_mxfp8_sparse_kernel<ModelType::MODEL1>(params);
     }
 };
 
@@ -71,7 +64,6 @@ class MxFp8Decode_Sm100_Head64x2_Impl : public MxFp8DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         MxFp8DecodeFeatures::HEAD_128,
         MxFp8DecodeFeatures::HEAD_DIM_512,
-        MxFp8DecodeFeatures::HEAD_DIM_576,
         MxFp8DecodeFeatures::ATTN_SINK,
         MxFp8DecodeFeatures::TOPK_LENGTH,
         MxFp8DecodeFeatures::EXTRA_KVCACHE,
@@ -89,11 +81,9 @@ public:
     }
 
 protected:
-    void run_(const MxFp8SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            constexpr ModelType MODEL_TYPE = (HEAD_DIM_QK == 512) ? ModelType::MODEL1 : ModelType::V32;
+    void run_(const SparseAttnMxfp8DecodeParams &params, const std::vector<FeatureT> &required_features) override {
             for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
-                MxFp8SparseAttnDecodeParams cur_params = params;
+                SparseAttnMxfp8DecodeParams cur_params = params;
                 cur_params.q = (char*)cur_params.q + start_head_idx * params.stride_q_h_q;
                 if (cur_params.attn_sink) {
                     cur_params.attn_sink += start_head_idx;
@@ -103,21 +93,20 @@ protected:
                 cur_params.lse_accum += start_head_idx;
                 cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
                 cur_params.h_q = 64;
-                sm100::decode::mxfp8_head64::run_flash_splitkv_mla_mxfp8_sparse_kernel<MODEL_TYPE>(cur_params);
+                sm100::decode::mxfp8_head64::run_flash_splitkv_mla_mxfp8_sparse_kernel<ModelType::MODEL1>(cur_params);
             }
-        });
     }
 };
 
 /*
  * mxfp8_sparse_attn_decode_interface
  *
- * MXFP8 sparse attention decode with BF16 RoPE. Both Q and KV use the same format
- * as existing FP8 KV cache: NoPE part is e4m3 + block scales, RoPE part is BF16. SM100 only.
+ * Pure MXFP8 sparse attention decode for d_qk=d_v=512. SM100 only.
  *
- * Token layout (same as existing FP8 KV cache):
- *   - d_qk=512 (MODEL1): 448 bytes NoPE (e4m3) + 8 bytes scales + 128 bytes RoPE (BF16) = 584 bytes/token
- *   - d_qk=576 (V32): 512 bytes NoPE (e4m3) + 16 bytes scales + 128 bytes RoPE (BF16) = 656 bytes/token
+ * Q token layout: 512 e4m3 bytes followed by 16 UE8M0 scales (32-value groups).
+ * Each KV page stores all 512-byte e4m3 rows first, then 8 UE8M0 scales per
+ * row (64-value groups). The KV tensor's 520-byte last dimension is a storage
+ * envelope; scales are not interleaved after individual tokens.
  */
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 mxfp8_sparse_attn_decode_interface(
@@ -170,21 +159,12 @@ mxfp8_sparse_attn_decode_interface(
     TORCH_CHECK(s_q > 0);
     TORCH_CHECK(h_q > 0);
     TORCH_CHECK(h_kv == 1, "Currently only MQA (h_kv == 1) is supported for MXFP8 sparse decoding");
-    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Only d_qk == 576 or 512 is supported");
+    TORCH_CHECK(d_qk == 512, "MXFP8 decode head64 currently supports only d_qk == 512");
     TORCH_CHECK(d_v == 512, "Only d_v == 512 is supported");
     TORCH_CHECK(topk > 0);
 
-    // Compute expected bytes per token (same as existing FP8 KV cache format)
-    int bytes_per_token;
-    if (d_qk == 576 && d_v == 512) {
-        // V3.2 style: 512 bytes NoPE (e4m3) + 16 bytes scales + 128 bytes RoPE (BF16)
-        bytes_per_token = 512 + 16 + 128;
-    } else if (d_qk == 512 && d_v == 512) {
-        // MODEL1 style: 448 bytes NoPE (e4m3) + 8 bytes scales + 128 bytes RoPE (BF16)
-        bytes_per_token = 448 + 8 + 128;
-    } else {
-        TORCH_CHECK(false, "Unsupported head sizes for MXFP8");
-    }
+    constexpr int q_bytes_per_token = 512 + 16;
+    constexpr int kv_bytes_per_token = 512 + 8;
 
     if (have_extra_kcache) {
         TORCH_CHECK(extra_indices.has_value(), "extra_indices must be provided when extra_kv is provided");
@@ -231,12 +211,16 @@ mxfp8_sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
 
-    KU_CHECK_SHAPE(q, b, s_q, h_q, bytes_per_token);
-    KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, bytes_per_token);
-    TORCH_CHECK(kv.stride(1) == bytes_per_token, "KV cache block must be contiguous");
+    KU_CHECK_SHAPE(q, b, s_q, h_q, q_bytes_per_token);
+    KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_bytes_per_token);
+    TORCH_CHECK(kv.is_contiguous(), "KV cache storage envelope must be contiguous");
+    TORCH_CHECK(kv.stride(0) % 512 == 0,
+        "packed KV page stride must be a multiple of 512 bytes, got ", kv.stride(0));
     if (have_extra_kcache) {
-        KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token);
-        TORCH_CHECK(extra_kv->stride(1) == bytes_per_token, "Extra KV cache block must be contiguous");
+        KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_bytes_per_token);
+        TORCH_CHECK(extra_kv->is_contiguous(), "Extra KV cache storage envelope must be contiguous");
+        TORCH_CHECK(extra_kv->stride(0) % 512 == 0,
+            "packed extra KV page stride must be a multiple of 512 bytes, got ", extra_kv->stride(0));
     }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
@@ -258,13 +242,7 @@ mxfp8_sparse_attn_decode_interface(
     } else {
         TORCH_CHECK(false, "Unsupported h_q: ", h_q);
     }
-    if (d_qk == 576) {
-        features.push_back(MxFp8DecodeFeatures::HEAD_DIM_576);
-    } else if (d_qk == 512) {
-        features.push_back(MxFp8DecodeFeatures::HEAD_DIM_512);
-    } else {
-        TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
-    }
+    features.push_back(MxFp8DecodeFeatures::HEAD_DIM_512);
     if (have_attn_sink) {
         features.push_back(MxFp8DecodeFeatures::ATTN_SINK);
     }
@@ -289,10 +267,11 @@ mxfp8_sparse_attn_decode_interface(
 
     MxFp8DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
 
-    MxFp8SparseAttnDecodeParams params = {
+    SparseAttnMxfp8DecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
+        ModelType::MODEL1,
 
         q.data_ptr(),
         kv.data_ptr(),

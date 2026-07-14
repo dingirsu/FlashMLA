@@ -528,18 +528,19 @@ def flash_mla_mxfp8_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    MXFP8 sparse attention decode with BF16 RoPE (SM100 only).
-    Both Q and KV cache use the same format as existing FP8 KV cache:
-    NoPE part: e4m3 data + per-128-element float32 block scales
-    RoPE part: BF16 (not quantized)
+    Pure MXFP8 sparse attention decode for d_qk=head_dim_v=512 (SM100 only).
+
+    Q uses 32-value groups and stores 16 UE8M0 scales after each 512-byte
+    e4m3 token. Every KV page stores all of its 512-byte e4m3 rows first,
+    followed by 8 UE8M0 scales per row (64-value groups).
 
     Args:
-        q: (batch_size, seq_len_q, num_heads_q, bytes_per_token), uint8 or float8_e4m3fn.
-           For d_qk=512 (MODEL1): bytes_per_token = 448 + 8 + 128 = 584
-           For d_qk=576 (V32): bytes_per_token = 512 + 16 + 128 = 656
-        k_cache: (num_blocks, page_block_size, num_heads_k, bytes_per_token), uint8 or float8_e4m3fn.
+        q: (batch_size, seq_len_q, num_heads_q, 528), uint8 or float8_e4m3fn.
+        k_cache: (num_blocks, page_block_size, 1, 520), uint8 or float8_e4m3fn.
+            The final dimension is a storage envelope; each page's scale bytes
+            are physically stored after all page data rows, not per token.
         indices: (batch_size, seq_len_q, topk), int32.
-        d_qk: int. Logical head dimension (512 or 576).
+        d_qk: int. Logical head dimension. Must be 512.
         head_dim_v: int. Must be 512.
         tile_scheduler_metadata: FlashMLASchedMeta.
         num_splits: must be None.

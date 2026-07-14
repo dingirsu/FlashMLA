@@ -611,9 +611,9 @@ KernelTemplate<MODEL_TYPE>
             });
         } else if (warp_idx == 6 && elect_one_sync()) {
             // ===== K scale layout producer warp =====
-            // Reads `plan.scales[ib][row]` (16 e8m0 bytes per token, raw) and scatters them
-            // into `plan.u.kv.kv_scale[buf]` in the K-major `SmemLayoutKScale` layout, with
-            // the K_SCALE_DUP=1 element-wise repetition. The smem layout is 3D (B_TOPK, D_K, 1)
+            // Reads 8 raw e8m0 scales per token and duplicates each one into
+            // `plan.u.kv.kv_scale[buf]` for tcgen05's 32-element scale vectors.
+            // The smem layout is 3D (B_TOPK, D_K, 1)
             // and the scales occupy positions row, g*32 in the (row, K) plane.
             run_main_loop([&](const MainLoopArgs &args) {
                 plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
@@ -631,7 +631,7 @@ KernelTemplate<MODEL_TYPE>
                         make_smem_ptr(plan.u.kv.kv_scale[cur_buf].data()),
                         SmemLayoutKScale{}
                     );
-                    e8m0 (*scales_base)[NUM_SCALES_EACH_TOKEN] = plan.scales[ib];
+                    e8m0 (*scales_base)[K_SCALE_BYTES] = plan.scales[ib];
 
                     // 32 threads * 4 rows = 128 = B_TOPK
                     int rows_per_thread = B_TOPK / 32;  // 4
@@ -641,8 +641,12 @@ KernelTemplate<MODEL_TYPE>
                         int row = row_base + lr;
                         e8m0* src = scales_base[row];
                         CUTE_UNROLL
-                        for (int g = 0; g < NUM_SCALES_EACH_TOKEN; ++g) {
-                            sK_scale(row, g * MXFP8_SCALE_VEC_SIZE, _0{}) = src[g];
+                        for (int g = 0; g < K_SCALE_BYTES; ++g) {
+                            CUTE_UNROLL
+                            for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
+                                int dst_group = g * K_SCALE_DUP + dup;
+                                sK_scale(row, dst_group * MXFP8_SCALE_VEC_SIZE, _0{}) = src[g];
+                            }
                         }
                     }
                     fence_view_async_shared();
@@ -654,8 +658,8 @@ KernelTemplate<MODEL_TYPE>
         } else if (warp_idx == 7) {
             // ===== Indices / K scale / valid-mask producer =====
             // The e8m0 K scales live at the END of each KV page (offset
-            // `page_block_size * D_K` from the page start), 16 bytes per token.
-            // They are loaded with a manual `__ldg` 16-byte load, packed into
+            // `page_block_size * D_K` from the page start), 8 bytes per token.
+            // Two rows are loaded with one manual `__ldg` 16-byte load and packed into
             // `plan.scales[ib][row]`, alongside the TMA coordinates and the
             // validity mask.
             static_assert(B_TOPK == 128);
@@ -674,6 +678,7 @@ KernelTemplate<MODEL_TYPE>
                 auto process_one_block = [&](int block_idx, auto is_extra_block_t) {
                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
+                    int cur_num_blocks = IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks;
                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
                     uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
                     int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
@@ -690,24 +695,23 @@ KernelTemplate<MODEL_TYPE>
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
 
                     int tma_coords[2];
-                    e8m0 scales[2*NUM_SCALES_EACH_TOKEN];
+                    e8m0 scales[2*K_SCALE_BYTES];
                     char valid_mask = 0;
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
                         int block_idx, idx_in_block;
                         block_idx = (unsigned int)my_indices[i] / cur_block_size;
                         idx_in_block = (unsigned int)my_indices[i] % cur_block_size;
-                        bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        bool is_token_valid = my_indices[i] >= 0
+                            && my_indices[i] < cur_num_blocks * cur_block_size
+                            && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
                         valid_mask |= is_token_valid << i;
                         tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1;
                         // K scales at the end of the page
-                        int64_t scale_offset = block_idx*cur_k_block_stride + page_scale_offset + idx_in_block*NUM_SCALES_EACH_TOKEN;
-                        if (is_token_valid) {
-                            int4 scalesx16_v = __ldg((int4*)(cur_k_scales_ptr + scale_offset));
-                            *reinterpret_cast<int4*>(scales + i*NUM_SCALES_EACH_TOKEN) = scalesx16_v;
-                        } else {
-                            *reinterpret_cast<int4*>(scales + i*NUM_SCALES_EACH_TOKEN) = int4{0,0,0,0};
-                        }
+                        int64_t scale_offset = block_idx*cur_k_block_stride + page_scale_offset + idx_in_block*K_SCALE_BYTES;
+                        *reinterpret_cast<uint64_t*>(scales + i*K_SCALE_BYTES) = is_token_valid
+                            ? __ldg(reinterpret_cast<const uint64_t*>(cur_k_scales_ptr + scale_offset))
+                            : uint64_t(0);
                     }
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
@@ -767,10 +771,10 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnMxfp8DecodeParams &params) 
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
     // Each Q token is D_Q e4m3 + D_Q/32 e8m0 = 512 + 16 = 528 bytes
-    constexpr int Q_BYTES_PER_TOKEN = D_Q + NUM_SCALES_EACH_TOKEN;
-    KU_ASSERT(params.stride_q_s_q == Q_BYTES_PER_TOKEN,
-        "stride_q_s_q must equal Q_BYTES_PER_TOKEN (D_Q + NUM_SCALES_EACH_TOKEN = %d), got %d",
-        Q_BYTES_PER_TOKEN, params.stride_q_s_q);
+    constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
+    KU_ASSERT(params.stride_q_h_q == Q_BYTES_PER_TOKEN,
+        "stride_q_h_q must equal Q_BYTES_PER_TOKEN (D_Q + Q_SCALE_BYTES = %d), got %d",
+        Q_BYTES_PER_TOKEN, params.stride_q_h_q);
     // Each KV page stores all e4m3 rows followed by all per-row UE8M0 scales.
     // The K data must be 16-byte aligned and stride_kv_block must be a multiple of TMA_K_STRIDE
     KU_ASSERT(params.stride_kv_block % TMA_K_STRIDE == 0,

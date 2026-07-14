@@ -42,14 +42,16 @@ static constexpr int D_Q = 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
 static constexpr int MXFP8_SCALE_VEC_SIZE = 32;
-static constexpr int QUANT_TILE_SIZE = MXFP8_SCALE_VEC_SIZE;
-static constexpr int NUM_SCALES_EACH_TOKEN = D_K / MXFP8_SCALE_VEC_SIZE;  // 16
-static constexpr int Q_SCALE_BYTES = NUM_SCALES_EACH_TOKEN;
+static constexpr int Q_QUANT_GROUP_SIZE = 32;
+static constexpr int K_QUANT_GROUP_SIZE = 64;
+static constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;  // 16
+static constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;  // 8
+static constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;  // 2
 static constexpr int TMA_K_STRIDE = D_K;  // 512 — pure e4m3, no per-token scales interleaved
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 128;
-static constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * (D_K / MXFP8_SCALE_VEC_SIZE);  // 128 * 16 = 2048
-static constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D_Q / MXFP8_SCALE_VEC_SIZE);    // 64 * 16 = 1024
+static constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * K_SCALE_BYTES * K_SCALE_DUP;  // 128 * 16 = 2048
+static constexpr int Q_SCALE_SMEM_ELEMS = B_H * Q_SCALE_BYTES;                    // 64 * 16 = 1024
 static constexpr int S_SCALE_SMEM_ELEMS = B_H * (B_TOPK / MXFP8_SCALE_VEC_SIZE);  // 64 * 4 = 256
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
@@ -170,7 +172,7 @@ using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
 // S scale smem layout (S is the B operand of the VS GEMM, so its scales are SFB)
 using SmemLayoutSscale = SmemLayoutOScaleBAtom;
 
-// Q scale smem layout for TMA (a simple (B_H, NUM_SCALES_EACH_TOKEN) layout)
+// Q scale smem layout for TMA (a simple (B_H, Q_SCALE_BYTES) layout)
 using SmemLayoutQScaleTMA = Layout<
     Shape<Int<B_H>, Int<Q_SCALE_BYTES>>,
     Stride<Int<Q_SCALE_BYTES>, _1>
@@ -199,7 +201,7 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
-    e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    e8m0 scales[NUM_INDEX_BUFS][B_TOPK][K_SCALE_BYTES];
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;

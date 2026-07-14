@@ -112,6 +112,7 @@ ext_modules.append(
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
+            "csrc/sm100/decode/mxfp8_head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
             "csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu",
         ],
@@ -139,6 +140,7 @@ ext_modules.append(
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
             Path(this_dir) / "csrc" / "sm90",
+            Path(this_dir) / "csrc" / "sm100",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
             *cuda_extra_include_dirs,

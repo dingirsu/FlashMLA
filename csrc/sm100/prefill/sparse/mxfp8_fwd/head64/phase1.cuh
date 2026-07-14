@@ -557,11 +557,11 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     );
 
     CUtensorMap tensor_map_q = ku::make_tensor_map(
-            {D_Q, (uint64_t)params.h_q, (uint64_t)params.s_q},
+            {D_Q / 8, (uint64_t)params.h_q, (uint64_t)params.s_q},
             ku::make_stride_helper(std::vector<int64_t>{params.stride_q_h_q, params.stride_q_s_q}, sizeof(uint8_t)),
-            {D_Q, B_H, 1},
+            {D_Q / 8, B_H, 1},
             params.q,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );

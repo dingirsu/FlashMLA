@@ -20,7 +20,7 @@ template<ModelType MODEL_TYPE>
 template<typename TmaParam>
 __device__ void
 KernelTemplate<MODEL_TYPE>
-::flash_fwd_splitkv_mla_mxfp8_sparse_kernel_devfunc(const SparseAttnDecodeParams &params, const TmaParam &tma_params) {
+::flash_fwd_splitkv_mla_mxfp8_sparse_kernel_devfunc(const SparseAttnMxfp8DecodeParams &params, const TmaParam &tma_params) {
 #if defined(KERUTILS_ENABLE_SM100A)
     const int s_q_idx = blockIdx.x;
     const int partition_idx = blockIdx.y;
@@ -45,6 +45,8 @@ KernelTemplate<MODEL_TYPE>
             plan.bar_last_store_done.init(128);
             plan.bar_q_tma.init(1);
             plan.bar_q_utccp.init(1);
+            plan.bar_q_scale_tma.init(1);
+            plan.bar_q_scale_utccp.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
                 plan.bar_rope_ready[i].init(1);
                 plan.bar_nope_ready[i].init(128); 
@@ -53,6 +55,8 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_qk_done[i].init(1);
                 plan.bar_so_ready[i].init(128);
                 plan.bar_sv_done[i].init(1);
+                plan.bar_kv_ready[i].init(128);
+                plan.bar_kv_scale_ready.init(128);
             }
             for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
                 plan.bar_valid_coord_scale_ready[i].init(32);
@@ -447,71 +451,10 @@ KernelTemplate<MODEL_TYPE>
                         TMA::CacheHintSm90::EVICT_FIRST
                     );
                 }
-                // Issue Q (SW64) G -> S
-                if constexpr (D_Q_SW64 > 0) {
-                    cute::SM90_TMA_LOAD_5D::copy(
-                        &tma_params.tensor_map_q_sw64,
-                        (uint64_t*)&plan.bar_q_tma,
-                        (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
-                        plan.u.qo.q_sw64,
-                        0, 0, 0,
-                        s_q_idx, args.batch_idx
-                    );
-                }
-                plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
+                
+                plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
                 plan.bar_q_tma.wait(args.bar_phase_batch_rel);
                 ku::tcgen05_after_thread_sync();
-                // Issue Q (SW128) UTCCP
-                {
-                    UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                        make_tensor(
-                            make_smem_ptr(plan.u.qo.q.data()),
-                            tile_to_shape(
-                                UMMA::Layout_K_SW128_Atom<bf16>{},
-                                Shape<Int<B_H*2>, Int<64>>{}  // *2 to leverage dual GEMM
-                            )
-                        )
-                    );
-                    static_assert(D_Q_SW128%128 == 0);
-                    CUTE_UNROLL
-                    for (int tile_idx = 0; tile_idx < D_Q_SW128/128; ++tile_idx) {
-                        // Each tile: 64 x (64*2) logically, 128 x 64 bf16 on TMEM
-                        CUTE_UNROLL
-                        for (int subtile_idx = 0; subtile_idx < 64/16; ++subtile_idx) {
-                            // Each subtile: 64 x (16*2) logically, 128 x 16 bf16 (128dp256b) on TMEM
-                            SM100_UTCCP_128dp256bit_1cta::copy(
-                                sQ_desc + (tile_idx*(B_H*128) + subtile_idx*16) * 2 / 16,
-                                tmem_cols::Q + tile_idx*32 + subtile_idx*8
-                            );
-                        }
-                    }
-                }
-                // Issue Q (SW64) UTCCP
-                if constexpr (D_Q_SW64 > 0) {
-                    UMMA::SmemDescriptor sQ_SW64_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                        make_tensor(
-                            make_smem_ptr(plan.u.qo.q_sw64),
-                            tile_to_shape(
-                                UMMA::Layout_K_SW64_Atom<bf16>{},
-                                Shape<Int<B_H*2>, Int<32>>{}  // *2 to leverage dual GEMM
-                            )
-                        )
-                    );
-                    static_assert(D_Q_SW64%64 == 0);
-                    CUTE_UNROLL
-                    for (int tile_idx = 0; tile_idx < D_Q_SW64/64; ++tile_idx) {
-                        // Each tile: 64 x (32*2) logically, 128 x 32 bf16 on TMEM
-                        CUTE_UNROLL
-                        for (int subtile_idx = 0; subtile_idx < 32/16; ++subtile_idx) {
-                            // Each subtile: 64 x (16*2) logically, 128 x 16 bf16 (128dp256b) on TMEM
-                            SM100_UTCCP_128dp256bit_1cta::copy(
-                                sQ_SW64_desc + (tile_idx*(B_H*64) + subtile_idx*16) * 2 / 16,
-                                tmem_cols::Q + (B_H*D_Q_SW128/2/128) + tile_idx*16 + subtile_idx*8
-                            );
-                        }
-                    }
-                }
-                ku::umma_arrive_noelect(plan.bar_q_utccp);
 
                 // Allocate tmem tensors
                 TiledMMA tiled_mma_P = TiledMMA_P{};
@@ -530,21 +473,10 @@ KernelTemplate<MODEL_TYPE>
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     if constexpr (MODEL_TYPE == ModelType::V32) {
-                        // V3.2: RoPE behaves like an extra block with size 64, so we can do RoPE first
-                        // QK RoPE
-                        plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase);
-                        ku::tcgen05_after_thread_sync();
-                        Tensor tQ_rope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
-                            partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_ROPE/2>>{})
-                        );
-                        tQ_rope.data().get() = tmem_cols::Q_Tail;
-                        Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope.data()), SmemLayoutKTiles_DualGemm_SW64<2/2>{});
-                        ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
-
                         // QK NoPE
                         plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
                         ku::tcgen05_after_thread_sync();
-                        Tensor tQ_nope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
+                        Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_NOPE/2>>{})
                         );
                         tQ_nope.data().get() = tmem_cols::Q;
@@ -850,12 +782,12 @@ KernelTemplate<MODEL_TYPE>
 
 template<typename Kernel, typename TmaParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1)
-flash_fwd_splitkv_mla_mxfp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const TmaParams tma_params) {
+flash_fwd_splitkv_mla_mxfp8_sparse_kernel(__grid_constant__ const SparseAttnMxfp8DecodeParams params, __grid_constant__ const TmaParams tma_params) {
     Kernel::flash_fwd_splitkv_mla_mxfp8_sparse_kernel_devfunc(params, tma_params);
 }
 
 template<ModelType MODEL_TYPE>
-void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
+void KernelTemplate<MODEL_TYPE>::run(const SparseAttnMxfp8DecodeParams &params) {
     KU_ASSERT(params.topk % B_TOPK == 0, "topk (%d) mod B_TOPK (%d) must be 0", params.topk, B_TOPK);
     KU_ASSERT(params.extra_topk % B_TOPK == 0, "extra_topk (%d) mod B_TOPK (%d) must be 0", params.extra_topk, B_TOPK);
     KU_ASSERT(params.h_q == B_H);
@@ -863,7 +795,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-        constexpr int BYTES_PER_TOKEN = D_NOPE + 2*D_ROPE + 8;
+        constexpr int BYTES_PER_TOKEN = D_Q + 8;
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
     }
 
@@ -893,48 +825,26 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
         SmemLayoutOBuf_TMA{}
     );
 
-    CUtensorMap tensor_map_q_sw64{};
-    if constexpr (D_Q_SW64 > 0) {
-        tensor_map_q_sw64 = ku::make_tensor_map(
-            {D_Q_SW64, (uint64_t)params.h_q, D_Q_SW64/32, (uint64_t)params.s_q, (uint64_t)params.b},
-            ku::make_stride_helper(std::vector<int64_t>{params.stride_q_h_q, (int64_t)32, params.stride_q_s_q, params.stride_q_b}, sizeof(bf16)),
-            {32, B_H, D_Q_SW64/32, 1, 1},
-            (bf16*)params.q + D_Q_SW128,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        );
-    }
-
     auto get_nope_rope_tensormap = [&](bool is_extra, void* k_ptr, int num_blocks, int64_t k_batch_stride) -> std::pair<CUtensorMap, CUtensorMap> {
-        static_assert(D_NOPE%8 == 0);
+        static_assert(D_K%8 == 0);
         KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
         KU_ASSERT(k_batch_stride % TMA_K_STRIDE == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", k_batch_stride, TMA_K_STRIDE);
-        CUtensorMap tensor_map_kv_nope = ku::make_tensor_map(
-            {D_NOPE/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+        CUtensorMap tensor_map_kv = ku::make_tensor_map(
+            {D_K/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
-            {D_NOPE/8, 1},
+            {D_K/8, 1},
             k_ptr,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );  // NOTE We combine 8 float8 into 1 int64 since boxdim cannot > 256
-        CUtensorMap tensor_map_kv_rope = ku::make_tensor_map(
-            {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
-            {TMA_K_STRIDE},
-            {K_ROPE_SW/2, 1},
-            (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? (D_NOPE+16) : D_NOPE),
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        );
-        return {tensor_map_kv_nope, tensor_map_kv_rope};
+        return tensor_map_kv;
     };
 
-    auto [tensor_map_kv_nope, tensor_map_kv_rope] = get_nope_rope_tensormap(false, params.kv, params.num_blocks, params.stride_kv_block);
-    CUtensorMap tensor_map_extra_kv_nope{}, tensor_map_extra_kv_rope{};
+    auto tensor_map_kv = get_nope_rope_tensormap(false, params.kv, params.num_blocks, params.stride_kv_block);
+    CUtensorMap tensor_map_extra_kv{};
     if (params.extra_topk > 0) {
-        std::tie(tensor_map_extra_kv_nope, tensor_map_extra_kv_rope) = get_nope_rope_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
+        tensor_map_extra_kv = get_nope_rope_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
     }
 
     TmaParams<
@@ -943,13 +853,10 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     > tma_params = {
         shape_Q_SW128, tma_Q_SW128,
         shape_O, tma_O,
-        tensor_map_q_sw64,
-        tensor_map_kv_nope,
-        tensor_map_kv_rope,
-        tensor_map_extra_kv_nope,
-        tensor_map_extra_kv_rope
+        tensor_map_kv,
+        tensor_map_extra_kv
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_mxfp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     static_assert(smem_size < 227*1024);
@@ -961,7 +868,7 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
 }
 
 template<ModelType MODEL_TYPE>
-void run_flash_splitkv_mla_mxfp8_sparse_kernel(const SparseAttnDecodeParams &params) {
+void run_flash_splitkv_mla_mxfp8_sparse_kernel(const SparseAttnMxfp8DecodeParams &params) {
     KernelTemplate<MODEL_TYPE>::run(params);
 }
 

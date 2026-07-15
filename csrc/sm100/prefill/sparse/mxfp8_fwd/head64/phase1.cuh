@@ -15,6 +15,10 @@
 #include "sm100/prefill/sparse/common_subroutine.h"
 #include "config.h"
 
+#ifndef MXFP8_PREFILL_LOAD_KV
+#define MXFP8_PREFILL_LOAD_KV 0
+#endif
+
 namespace sm100::mxfp8_fwd::head64 {
 
 using namespace cute;
@@ -325,6 +329,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         }
                     }
                 }
+#if !MXFP8_PREFILL_LOAD_KV
+                for (int i = producer_warp_idx; i < B_TOPK*D_K; i += NUM_KV_PRODUCER_WARPS) {
+                    plan.kvo.kv.kv[cur_buf].data()[i] = e4m3{};
+                }
+#endif
                 plan.kv_warp_has_valid[cur_buf][producer_warp_idx] = has_valid_index;
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
@@ -335,9 +344,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     for (int producer = 0; producer < NUM_KV_PRODUCER_WARPS; ++producer) {
                         all_invalid &= !plan.kv_warp_has_valid[cur_buf][producer];
                     }
-                    plan.kv_skip_tma[cur_buf] = all_invalid;
+                    plan.kv_skip_tma[cur_buf] = all_invalid || !MXFP8_PREFILL_LOAD_KV;
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
-                    if (all_invalid) {
+                    if (plan.kv_skip_tma[cur_buf]) {
                         plan.bar_kv_ready[cur_buf].complete_transaction(B_TOPK*D_K*sizeof(e4m3));
                     }
                 }
@@ -345,7 +354,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
 
                 Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
-                Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutKScale{});
+                Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutPScaleAAtom{});
                 e4m3* sK_base = &sK(producer_warp_idx*4, _0{});
 
                 CUTE_UNROLL
@@ -398,15 +407,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_prologue_q.wait(0);
 
             plan.bar_prologue_q_scale.wait(0);
-
             Tensor sQ_scale = make_tensor(
                 make_smem_ptr(plan.s_q_scale.q_scale.data()),
-                SmemLayoutQScale{}
+                SmemLayoutPScaleBAtom{}
             );
-
+            cute::print("hello in warpgroup 2 after tma copy\n");
+            cute::print("hello in warpgroup 2 after make smem tensor\n");
             auto sQ_compact = make_tensor(sQ_scale.data(), filter_zeros(sQ_scale.layout()));
             auto tQ_compact = make_tensor(tQ_scale.data(), filter_zeros(tQ_scale.layout()));
-
+            cute::print("hello in warpgroup 2 before make utccp copy desc\n");
             auto copy_Q_scale = make_utccp_copy(SM100_UTCCP_4x32dp128bit_1cta{}, tQ_compact);
 
             auto thr_Q = copy_Q_scale.get_slice(0);
@@ -415,7 +424,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 thr_Q.partition_S(sQ_compact)
             );
             auto dst_Q = thr_Q.partition_D(tQ_compact);
-
+            cute::print("hello in warpgroup 2 before utccp copy\n");
             cute::copy(copy_Q_scale, src_Q, dst_Q);
 
             CUTE_NO_UNROLL
@@ -431,7 +440,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     Tensor sK_scale = make_tensor(
                         make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
-                        SmemLayoutKScale{}
+                        SmemLayoutPScaleAAtom{}
                     );
                     auto sK_compact = make_tensor(sK_scale.data(), filter_zeros(sK_scale.layout()));
                     auto tK_compact = make_tensor(tK_scale.data(), filter_zeros(tK_scale.layout()));

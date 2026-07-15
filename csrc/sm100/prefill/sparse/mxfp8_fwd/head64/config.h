@@ -73,20 +73,11 @@ using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
-using SmemLayoutQScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFB(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_Q>>{}
-));
 
 using SmemLayoutQScaleTMA = Layout<
     Shape<Int<B_H>, Int<Q_SCALE_BYTES>>,
     Stride<Int<Q_SCALE_BYTES>, _1>
 >;
-
-using SmemLayoutKScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFA(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
-));
-
-using SmemLayoutSscale = SmemLayoutQScale;
 
 template<int NUM_TILES>
 using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(

@@ -424,6 +424,8 @@ KernelTemplate<MODEL_TYPE>
                 }
 
                 // ===== Prologue: Q TMA (e4m3) =====
+                plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
+                plan.bar_q_scale_tma.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
                 {
                     Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, args.batch_idx);
                     Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
@@ -447,8 +449,6 @@ KernelTemplate<MODEL_TYPE>
                         TMA::CacheHintSm90::EVICT_FIRST
                     );
                 }
-                plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
-                plan.bar_q_scale_tma.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
                 plan.bar_q_tma.wait(args.bar_phase_batch_rel);
                 plan.bar_q_scale_tma.wait(args.bar_phase_batch_rel);
                 ku::tcgen05_after_thread_sync();
@@ -588,6 +588,7 @@ KernelTemplate<MODEL_TYPE>
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+                    plan.bar_kv_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                     int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
                     int4 nxt_cur_indices;
                     CUTE_UNROLL
@@ -604,12 +605,11 @@ KernelTemplate<MODEL_TYPE>
                         );
                         cur_indices = nxt_cur_indices;
                     }
-                    plan.bar_kv_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
                 }
             });
-        } else if (warp_idx == 6 && elect_one_sync()) {
+        } else if (warp_idx == 6) {
             // ===== K scale layout producer warp =====
             // Reads 8 raw e8m0 scales per token and duplicates each one into
             // `plan.u.kv.kv_scale[buf]` for tcgen05's 32-element scale vectors.
@@ -650,8 +650,11 @@ KernelTemplate<MODEL_TYPE>
                         }
                     }
                     fence_view_async_shared();
-                    plan.bar_kv_scale_ready[cur_buf].arrive();
-                    plan.bar_valid_coord_scale_free[ib].arrive();
+                    __syncwarp();
+                    if (elect_one_sync()) {
+                        plan.bar_kv_scale_ready[cur_buf].arrive();
+                        plan.bar_valid_coord_scale_free[ib].arrive();
+                    }
                     rs.update();
                 }
             });

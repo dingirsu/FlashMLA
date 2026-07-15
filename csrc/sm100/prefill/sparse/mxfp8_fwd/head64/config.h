@@ -62,7 +62,7 @@ namespace tmem_cols {
     // 400 ~ 464: P
     constexpr int O = 0;
     constexpr int Q_Scale = 320;
-    constexpr int K_Scale = 338;
+    constexpr int K_Scale = 340;
     constexpr int S_Scale = 356;
     constexpr int P = 400;
 }

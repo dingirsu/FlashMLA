@@ -412,11 +412,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 make_smem_ptr(plan.s_q_scale.q_scale.data()),
                 SmemLayoutPScaleBAtom{}
             );
-            cute::print("hello in warpgroup 2 after tma copy\n");
-            cute::print("hello in warpgroup 2 after make smem tensor\n");
             auto sQ_compact = make_tensor(sQ_scale.data(), filter_zeros(sQ_scale.layout()));
             auto tQ_compact = make_tensor(tQ_scale.data(), filter_zeros(tQ_scale.layout()));
-            cute::print("hello in warpgroup 2 before make utccp copy desc\n");
             auto copy_Q_scale = make_utccp_copy(SM100_UTCCP_4x32dp128bit_1cta{}, tQ_compact);
 
             auto thr_Q = copy_Q_scale.get_slice(0);
@@ -425,9 +422,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 thr_Q.partition_S(sQ_compact)
             );
             auto dst_Q = thr_Q.partition_D(tQ_compact);
-            cute::print("hello in warpgroup 2 before utccp copy\n");
-            cute::copy(copy_Q_scale, src_Q, dst_Q);
 
+            cute::copy(copy_Q_scale, src_Q, dst_Q);
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks+1; ++k) {
                 if (k < num_k_blocks) {

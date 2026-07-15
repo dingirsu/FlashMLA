@@ -56,7 +56,7 @@ KernelTemplate<MODEL_TYPE>
             }
             for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
                 plan.bar_valid_coord_scale_ready[i].init(32);
-                plan.bar_valid_coord_scale_free[i].init(128+128+1+1);
+                plan.bar_valid_coord_scale_free[i].init(128+1+1);
             }
             cutlass::arch::fence_barrier_init();
         }
@@ -659,10 +659,12 @@ KernelTemplate<MODEL_TYPE>
             // ===== Indices / K scale / valid-mask producer =====
             // The e8m0 K scales live at the END of each KV page (offset
             // `page_block_size * D_K` from the page start), 8 bytes per token.
-            // Two rows are loaded with one manual `__ldg` 16-byte load and packed into
-            // `plan.scales[ib][row]`, alongside the TMA coordinates and the
-            // validity mask.
+            // Each lane handles four rows, covering all 128 rows in one warp.
+            // The raw scales are packed into `plan.scales[ib][row]` alongside
+            // the TMA coordinates and validity mask.
             static_assert(B_TOPK == 128);
+            constexpr int TOKENS_PER_LANE = B_TOPK / 32;
+            static_assert(TOKENS_PER_LANE == 4);
             int tma_coords_step_per_token = D_K / TMA_K_STRIDE;  // = 1
             int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE;
             int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE;
@@ -684,42 +686,42 @@ KernelTemplate<MODEL_TYPE>
                     int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
                     int64_t page_scale_offset = (int64_t)cur_block_size * D_K;  // offset to scale region from page start
 
-                    int abs_pos, my_indices[2];
+                    int abs_pos;
+                    int4 my_indices_vec;
                     if (!IS_EXTRA_BLOCK) {
-                        abs_pos = block_idx*B_TOPK + lane_idx*2;
-                        *(int2*)my_indices = __ldg((int2*)(indices + abs_pos));
+                        abs_pos = block_idx*B_TOPK + lane_idx*TOKENS_PER_LANE;
+                        my_indices_vec = __ldg(reinterpret_cast<int4*>(indices + abs_pos));
                     } else {
-                        abs_pos = (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2;
-                        *(int2*)my_indices = __ldg((int2*)(extra_indices + abs_pos));
+                        abs_pos = (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*TOKENS_PER_LANE;
+                        my_indices_vec = __ldg(reinterpret_cast<int4*>(extra_indices + abs_pos));
                     }
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
 
-                    int tma_coords[2];
-                    e8m0 scales[2*K_SCALE_BYTES];
-                    char valid_mask = 0;
+                    int* my_indices = reinterpret_cast<int*>(&my_indices_vec);
+                    int4 tma_coords_vec;
+                    int* tma_coords = reinterpret_cast<int*>(&tma_coords_vec);
+                    uint32_t valid_mask = 0;
                     CUTE_UNROLL
-                    for (int i = 0; i < 2; ++i) {
-                        int block_idx, idx_in_block;
-                        block_idx = (unsigned int)my_indices[i] / cur_block_size;
+                    for (int i = 0; i < TOKENS_PER_LANE; ++i) {
+                        int page_idx, idx_in_block;
+                        page_idx = (unsigned int)my_indices[i] / cur_block_size;
                         idx_in_block = (unsigned int)my_indices[i] % cur_block_size;
                         bool is_token_valid = my_indices[i] >= 0
                             && my_indices[i] < cur_num_blocks * cur_block_size
                             && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
                         valid_mask |= is_token_valid << i;
-                        tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1;
+                        tma_coords[i] = is_token_valid ? page_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1;
                         // K scales at the end of the page
-                        int64_t scale_offset = block_idx*cur_k_block_stride + page_scale_offset + idx_in_block*K_SCALE_BYTES;
-                        *reinterpret_cast<uint64_t*>(scales + i*K_SCALE_BYTES) = is_token_valid
+                        int64_t scale_offset = page_idx*cur_k_block_stride + page_scale_offset + idx_in_block*K_SCALE_BYTES;
+                        *reinterpret_cast<uint64_t*>(plan.scales[rs.index_buf_idx][lane_idx*TOKENS_PER_LANE + i]) = is_token_valid
                             ? __ldg(reinterpret_cast<const uint64_t*>(cur_k_scales_ptr + scale_offset))
                             : uint64_t(0);
                     }
-                    valid_mask <<= lane_idx%4*2;
+                    valid_mask <<= (lane_idx%2)*TOKENS_PER_LANE;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
-                    valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    *reinterpret_cast<int4*>(plan.scales[rs.index_buf_idx] + lane_idx*2) = *reinterpret_cast<int4*>(scales);
-                    *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
-                    if (lane_idx%4 == 0)
-                        plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
+                    *reinterpret_cast<int4*>(plan.tma_coord[rs.index_buf_idx] + lane_idx*TOKENS_PER_LANE) = tma_coords_vec;
+                    if (lane_idx%2 == 0)
+                        plan.is_token_valid[rs.index_buf_idx][lane_idx/2] = static_cast<char>(valid_mask);
 
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].arrive();
                     rs.update();
@@ -751,7 +753,7 @@ KernelTemplate<MODEL_TYPE>
     }
 #else
     if (cute::thread0()) {
-        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm100 ~ sm119");
+        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm100");
     }
 #endif
 }

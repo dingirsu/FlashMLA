@@ -82,7 +82,7 @@ struct tmem_cols {
     // 400 ~ 464: P (fp32, (B_TOPK, B_H) = 128x64)  (P: 64 cols)
     static constexpr int O = 0;
     static constexpr int QScale = 320;
-    static constexpr int KScale = 338;
+    static constexpr int KScale = 340;
     static constexpr int SScale = 356;
     static constexpr int P = 400;
 };

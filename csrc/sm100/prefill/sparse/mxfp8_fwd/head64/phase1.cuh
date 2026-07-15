@@ -356,7 +356,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 int cur_buf = k%NUM_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
                 Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutPScaleAAtom{});
-                e4m3* sK_base = &sK(producer_warp_idx*4, _0{});
+                uint8_t* sK_base = reinterpret_cast<uint8_t*>(plan.kvo.kv.kv[cur_buf].data());
 
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -366,8 +366,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                             ku::tma_gather4(
                                 &(tma_params.tensor_map_kv),
                                 plan.bar_kv_ready[cur_buf],
-                                sK_base + local_row*(4*NUM_KV_PRODUCER_WARPS)*TMA_K_CHUNK_BYTES
-                                    + local_col*(B_TOPK*TMA_K_CHUNK_BYTES),
+                                sK_base + local_col * B_TOPK * TMA_K_CHUNK_BYTES
+                                        + (
+                                            local_row * NUM_KV_PRODUCER_WARPS
+                                            + producer_warp_idx
+                                        ) * 4 * TMA_K_CHUNK_BYTES,
                                 local_col*TMA_K_CHUNK_ELEMS,
                                 indices[local_row],
                                 (int64_t)TMA::CacheHintSm90::EVICT_LAST
@@ -379,7 +382,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     for (int i = 0; i < 4; ++i) {
                         int src_idx = reinterpret_cast<int*>(&indices[local_row])[i];
                         int row = local_row*(4*NUM_KV_PRODUCER_WARPS) + producer_warp_idx*4 + i;
-                        e8m0 scale[K_SCALE_BYTES];
+                        alignas(8) e8m0 scale[K_SCALE_BYTES];
                         if (src_idx >= 0) {
                             const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
                                 + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;

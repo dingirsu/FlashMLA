@@ -50,7 +50,7 @@ public:
         return {
             std::max(arch.num_sms / s_q, 1),
             5,
-            64
+            128
         };
     }
 
@@ -76,7 +76,7 @@ public:
         return {
             std::max(arch.num_sms / s_q, 1),
             5,
-            64
+            128
         };
     }
 

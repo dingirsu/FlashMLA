@@ -299,20 +299,20 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         // Producer warp for KV
         int producer_warp_idx = cutlass::canonical_warp_idx_sync() - 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_KV_PRODUCER_WARPS;
-        if (elect_one_sync()) {
-            // KV is one packed page: all e4m3 rows first, followed by all
-            // per-token UE8M0 scales at the end of the page.
-            const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
-                + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
+        // KV is one packed page: all e4m3 rows first, followed by all
+        // per-token UE8M0 scales at the end of the page.
+        const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
+            + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
 
-            CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks; ++k) {
+        CUTE_NO_UNROLL
+        for (int k = 0; k < num_k_blocks; ++k) {
+            int4 indices[NUM_LOCAL_ROWS_PER_WARP];
+            if (elect_one_sync()) {
                 // Copy NoPE data with gather4. Scale factors are scattered into the
                 // SM100 block-scale SFA shared layout expected by tcgen05 block_scale MMA.
                 int cur_buf = k%NUM_BUFS;
                 plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
 
-                int4 indices[NUM_LOCAL_ROWS_PER_WARP];
                 bool has_valid_index = false;
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
@@ -329,15 +329,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         }
                     }
                 }
-#if !MXFP8_PREFILL_LOAD_KV
-                for (int i = producer_warp_idx; i < B_TOPK*D_K; i += NUM_KV_PRODUCER_WARPS) {
-                    plan.kvo.kv.kv[cur_buf].data()[i] = e4m3{};
-                }
-#endif
                 plan.kv_warp_has_valid[cur_buf][producer_warp_idx] = has_valid_index;
-                fence_view_async_shared();
-                NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
+            }
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
 
+            if (elect_one_sync()) {
+                int cur_buf = k%NUM_BUFS;
                 if (producer_warp_idx == 0) {
                     bool all_invalid = true;
                     CUTE_UNROLL
@@ -350,9 +348,12 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         plan.bar_kv_ready[cur_buf].complete_transaction(B_TOPK*D_K*sizeof(e4m3));
                     }
                 }
-                fence_view_async_shared();
-                NamedBarrier::arrive_and_wait(NUM_KV_PRODUCER_WARPS, NamedBarriers::wg1_tma_sync);
+            }
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
 
+            if (elect_one_sync()) {
+                int cur_buf = k%NUM_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
                 Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutPScaleAAtom{});
                 e4m3* sK_base = &sK(producer_warp_idx*4, _0{});

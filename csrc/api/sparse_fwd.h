@@ -7,12 +7,15 @@
 #include "sm90/prefill/sparse/phase1.h"
 #include "sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "sm100/prefill/sparse/fwd/head64/phase1.h"
+#include "sm100/prefill/sparse/fwd/head_small/phase1.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
 enum class FwdFeatures : int {
     HEAD_64,
     HEAD_128,
+    HEAD_SMALL,
 
+    HEAD_DIM_128,
     HEAD_DIM_576,
     HEAD_DIM_512,
 
@@ -83,6 +86,33 @@ protected:
     }
 };
 
+class Fwd_Sm100_HeadSmall_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        FwdFeatures::HEAD_SMALL,
+        FwdFeatures::HEAD_DIM_128,
+        FwdFeatures::ATTN_SINK,
+        FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        auto run_with_h = [&]<int H_Q>() {
+            TORCH_CHECK(params.d_qk == 128, "Small-head d_qk must be 128, got ", params.d_qk);
+            sm100::fwd::head_small::run_fwd_phase1_kernel<128, H_Q>(params);
+        };
+        if (params.h_q == 8) {
+            run_with_h.template operator()<8>();
+        } else if (params.h_q == 16) {
+            run_with_h.template operator()<16>();
+        } else if (params.h_q == 32) {
+            run_with_h.template operator()<32>();
+        } else {
+            TORCH_CHECK(false, "Unsupported small-head h_q: ", params.h_q);
+        }
+    }
+};
+
 class Fwd_Sm100_Head128_Small_TopK_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_128,
@@ -128,8 +158,12 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
 
-    TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
-    TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    TORCH_CHECK(d_qk == 576 || d_qk == 512 || d_qk == 128, "Invalid d_qk: ", d_qk);
+    TORCH_CHECK(
+        ((h_q == 8 || h_q == 16 || h_q == 32) && d_v == 128) ||
+        ((h_q == 64 || h_q == 128) && d_v == 512),
+        "Invalid h_q/d_v combination: h_q=", h_q, ", d_v=", d_v
+    );
     
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -193,6 +227,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         required_features.push_back(FwdFeatures::HEAD_64);
     } else if (h_q == 128) {
         required_features.push_back(FwdFeatures::HEAD_128);
+    } else if (h_q == 8 || h_q == 16 || h_q == 32) {
+        required_features.push_back(FwdFeatures::HEAD_SMALL);
     } else {
         TORCH_CHECK(false, "Unsupported h_q: ", h_q);
     }
@@ -200,6 +236,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         required_features.push_back(FwdFeatures::HEAD_DIM_576);
     } else if (d_qk == 512) {
         required_features.push_back(FwdFeatures::HEAD_DIM_512);
+    } else if (d_qk == 128) {
+        required_features.push_back(FwdFeatures::HEAD_DIM_128);
     } else {
         TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
     }
@@ -214,7 +252,11 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         Fwd_Sm90_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else if (is_sm100f) {
-        if (h_q == 64) {
+        if (h_q == 8 || h_q == 16 || h_q == 32) {
+            TORCH_CHECK(d_v == 128, "Small-head SM100 sparse forward requires d_v == 128, got ", d_v);
+            Fwd_Sm100_HeadSmall_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
+        } else if (h_q == 64) {
             Fwd_Sm100_Head64_Impl fwd_impl;
             fwd_impl.run(params, required_features);
         } else if (h_q == 128) {

@@ -10,7 +10,6 @@
 enum class BwdFeatures : int {
     HEAD_SMALL,
 
-    HEAD_DIM_192,
     HEAD_DIM_128,
 
     ATTN_SINK,
@@ -26,7 +25,6 @@ class Bwd_Sm100_HeadSmall_Impl : public BwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         BwdFeatures::HEAD_SMALL,
         BwdFeatures::HEAD_DIM_128,
-        BwdFeatures::HEAD_DIM_192,
         BwdFeatures::ATTN_SINK,
         BwdFeatures::TOPK_LENGTH
     )
@@ -36,22 +34,18 @@ protected:
         auto run_with_h = [&]<int H_Q>() {
             if (params.d_qk == 128) {
                 sm100::bwd::head_small::run_bwd_phase1_kernel<128, H_Q>(params);
-            } else if (params.d_qk == 192) {
-                sm100::bwd::head_small::run_bwd_phase1_kernel<192, H_Q>(params);
             } else {
-                TORCH_CHECK(false, "Unsupported small-head d_qk for sparse backward: ", params.d_qk);
+                TORCH_CHECK(false, "SM100 sparse backward currently only supports d_qk=128, got ", params.d_qk);
             }
         };
         if (params.h_q == 8) {
             run_with_h.template operator()<8>();
         } else if (params.h_q == 16) {
             run_with_h.template operator()<16>();
-        } else if (params.h_q == 24) {
-            run_with_h.template operator()<24>();
         } else if (params.h_q == 32) {
             run_with_h.template operator()<32>();
         } else {
-            TORCH_CHECK(false, "Unsupported small-head h_q for sparse backward: ", params.h_q);
+            TORCH_CHECK(false, "SM100 sparse backward currently only supports h_q in {8,16,32}, got ", params.h_q);
         }
     }
 };
@@ -90,8 +84,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_bwd_interface(
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
 
-    TORCH_CHECK(d_qk == 128 || d_qk == 192, "Sparse backward head-small only supports d_qk 128 or 192, got ", d_qk);
-    TORCH_CHECK(h_q == 8 || h_q == 16 || h_q == 24 || h_q == 32, "Sparse backward head-small only supports h_q in {8,16,24,32}, got ", h_q);
+    TORCH_CHECK(d_qk == 128, "Sparse backward head-small currently only supports d_qk=128, got ", d_qk);
+    TORCH_CHECK(h_q == 8 || h_q == 16 || h_q == 32, "Sparse backward head-small currently only supports h_q in {8,16,32}, got ", h_q);
     TORCH_CHECK(h_kv == 1, "Sparse backward head-small requires h_kv == 1, got ", h_kv);
     TORCH_CHECK(d_v == 128, "Sparse backward head-small requires d_v == 128, got ", d_v);
     TORCH_CHECK(topk % 64 == 0, "Sparse backward head-small requires topk % 64 == 0, got ", topk);
@@ -184,11 +178,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_bwd_interface(
 
     std::vector<BwdFeatures> required_features;
     required_features.push_back(BwdFeatures::HEAD_SMALL);
-    if (d_qk == 192) {
-        required_features.push_back(BwdFeatures::HEAD_DIM_192);
-    } else {
-        required_features.push_back(BwdFeatures::HEAD_DIM_128);
-    }
+    required_features.push_back(BwdFeatures::HEAD_DIM_128);
     required_features.push_back(BwdFeatures::ATTN_SINK);
     if (have_topk_length) {
         required_features.push_back(BwdFeatures::TOPK_LENGTH);
@@ -200,4 +190,3 @@ static std::vector<at::Tensor> sparse_attn_prefill_bwd_interface(
 
     return {d_q, d_k, d_v_tensor, d_attn_sink};
 }
-

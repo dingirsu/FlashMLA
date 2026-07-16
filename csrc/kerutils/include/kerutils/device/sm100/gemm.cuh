@@ -529,10 +529,8 @@ template <class a_type, class b_type, class c_type,
 struct SM100_MMA_F16BF16_SS_NOELECT
 {
   static_assert(M == 64 || M == 128, "SM100_MMA_F16BF16_SS_NOELECT M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
-  static_assert((M == 64  && (N % 8 == 0)  && (8 <= N)  && (N <= 256)) ||
-                (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
-                "SM100_MMA_F16BF16_SS_NOELECT N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
-                 or a multiple of 16 between 16 and 256 for M=128.");
+  static_assert((N % 8 == 0) && (8 <= N) && (N <= 256),
+                "SM100_MMA_F16BF16_SS_NOELECT N-mode size should be a multiple of 8 between 8 and 256.");
 
   using DRegisters = void;
   using ARegisters = uint64_t[1];

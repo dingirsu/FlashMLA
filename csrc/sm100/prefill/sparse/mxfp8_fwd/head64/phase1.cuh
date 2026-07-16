@@ -15,9 +15,6 @@
 #include "sm100/prefill/sparse/common_subroutine.h"
 #include "config.h"
 
-#ifndef MXFP8_PREFILL_LOAD_KV
-#define MXFP8_PREFILL_LOAD_KV 0
-#endif
 
 namespace sm100::mxfp8_fwd::head64 {
 

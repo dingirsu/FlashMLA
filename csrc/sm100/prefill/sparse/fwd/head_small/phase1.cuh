@@ -169,7 +169,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
     if (warpgroup_idx == 0) {
         // Scale & Exp warps for transposed P/S: P_t and S_t are [topk, head].
-        static_assert(Kernel::B_TOPK == 64);
+        static_assert(Kernel::B_TOPK == 128);
         if (idx_in_warpgroup < Kernel::B_H) {
             plan.head_mi[idx_in_warpgroup] = Kernel::MAX_INIT_VAL;
             plan.head_li[idx_in_warpgroup] = 0.0f;
@@ -183,11 +183,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             plan.bar_k_valid_ready[k%Kernel::NUM_BUFS].wait((k/Kernel::NUM_BUFS)&1);
             ku::tcgen05_after_thread_sync();
 
-            if (warp_idx < 2) {
+            if (warp_idx < 4) {
                 float p_head[Kernel::B_H_TMEM];
                 ku::tmem_ld_32dp32bNx<Kernel::B_H_TMEM>(Kernel::tmem_cols::P, p_head);
                 cutlass::arch::fence_view_async_tmem_load();
-                int k_row = (warp_idx&1)*32 + lane_idx;
+                int k_row = warp_idx*32 + lane_idx;
                 CUTE_UNROLL
                 for (int h = 0; h < Kernel::B_H; ++h) {
                     plan.p_t[k_row*Kernel::B_H + h] = p_head[h];
@@ -467,7 +467,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 template<int D_QK, int H_Q>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     using Kernel = KernelTemplate<D_QK, H_Q>;
-    static_assert(D_QK == 128 || D_QK == 192);
+    static_assert(D_QK == 128);
 
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % Kernel::B_TOPK == 0);   // To save some boundry checkings
@@ -551,7 +551,7 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
         shape_O, tma_O,
         tensor_map_kv_nope
     };
-    auto kernel = &sparse_attn_fwd_kernel<D_QK, H_Q, D_QK == 192, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<D_QK, H_Q, false, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(typename Kernel::SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

@@ -27,8 +27,8 @@ struct float2x2 {
 
 template<int D_QK, int H_Q>
 struct KernelTemplate {
-static_assert(D_QK == 128 || D_QK == 192);
-static_assert(H_Q == 8 || H_Q == 16 || H_Q == 24 || H_Q == 32);
+static_assert(D_QK == 128);
+static_assert(H_Q == 8 || H_Q == 16 || H_Q == 32);
 
 static constexpr int D_Q = D_QK;
 static constexpr int D_K = D_QK;
@@ -37,7 +37,7 @@ static constexpr int D_ROPE = D_QK - D_V;
 static constexpr float MAX_INIT_VAL = -1e30;
 
 static constexpr int B_H = H_Q;
-static constexpr int B_H_TMEM = H_Q == 24 ? 32 : H_Q;
+static constexpr int B_H_TMEM = H_Q;
 static constexpr int B_TOPK = 128;
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_THREADS = 128 + 128 + 128;
@@ -45,7 +45,6 @@ static constexpr int NUM_THREADS = 128 + 128 + 128;
 struct tmem_cols {
     // Output is transposed as two [64, B_H] tiles.
     // 256 ~ 320: Q NoPE
-    // 320 ~ 352: Q RoPE, only for D_QK=192
     // 400 ~ 464: P, transposed as [B_TOPK, B_H]
     static constexpr int O = 0;
     static constexpr int P = 400;

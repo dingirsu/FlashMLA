@@ -11,17 +11,22 @@ namespace sm100::mxfp8_fwd::head64 {
 
 using namespace cute;
 
+#ifndef MXFP8_PREFILL_DEBUG_VALUES
+#define MXFP8_PREFILL_DEBUG_VALUES 1
+#endif
+
 using e4m3 = cutlass::float_e4m3_t;
 using e8m0 = cutlass::float_ue8m0_t;
 
 template<
     typename Shape_O, typename TMA_O,
+    typename Shape_Q, typename TMA_Q,
     typename Shape_Q_Scale, typename TMA_Q_Scale
 >
 struct TmaParams {
     Shape_O shape_O; TMA_O tma_O;
+    Shape_Q shape_Q; TMA_Q tma_Q;
     Shape_Q_Scale shape_Q_scale; TMA_Q_Scale tma_Q_scale;
-    CUtensorMap tensor_map_q;
     CUtensorMap tensor_map_kv;
 };
 
@@ -30,6 +35,7 @@ constexpr int D_Q = D;
 constexpr int D_K = D;
 constexpr int D_V = D;
 constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+constexpr int SCALE_GROUPS_PER_TMEM_BLOCK = 4;
 constexpr int Q_QUANT_GROUP_SIZE = 32;
 constexpr int K_QUANT_GROUP_SIZE = 64;
 constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
@@ -37,7 +43,7 @@ constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
 constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
 constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
 constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
-constexpr int TMA_K_CHUNK_BYTES = 64;
+constexpr int TMA_K_CHUNK_BYTES = 128;
 constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 
 constexpr int B_H = 64;
@@ -149,7 +155,10 @@ struct SharedMemoryPlan {
     } kvo;
     union {
         e4m3 s[B_H*B_TOPK];
-        array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
+        struct {
+            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> compact;
+            array_aligned<e8m0, cosize_v<SmemLayoutPScaleBAtom>> mma;
+        } q_scale;
     } s_q_scale;
     array_aligned<e8m0, cosize_v<SmemLayoutOScaleBAtom>> s_scale;
     float head_scale[B_H], head_mi[B_H], head_li[B_H], head_real_mi[B_H];

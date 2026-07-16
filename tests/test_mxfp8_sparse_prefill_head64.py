@@ -363,7 +363,6 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
         d_v=D_HEAD,
         topk_length=topk_length,
     )
-    print(out)
     _assert_kernel_stage(
         "Q/K gather, block scales, QK MMA, or validity mask",
         max_logits,

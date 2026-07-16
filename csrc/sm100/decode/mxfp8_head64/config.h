@@ -143,16 +143,6 @@ using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
-// Q scale smem layout (Q is the B operand of the KQ GEMM, so its scales are SFB)
-using SmemLayoutQScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFB(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_Q>>{}
-));
-
-// K scale smem layout (K is the A operand of the KQ GEMM, so its scales are SFA)
-using SmemLayoutKScale = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::tile_atom_to_shape_SFA(
-    Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
-));
-
 // Atom layouts derived from the MMA tiles — needed for the UTCCP src layout
 // of the S scales and V scales (tV_scale uses the O atom's SFA even though the
 // data is physically written by the KQ MMA's SFA UTCCP).
@@ -179,25 +169,23 @@ using SmemLayoutQScaleTMA = Layout<
 >;
 
 struct SharedMemoryPlan {
+    array_aligned<e4m3, cosize_v<SmemLayoutQ_SW128>> q;
     union {
-        struct {
-            array_aligned<e4m3, cosize_v<SmemLayoutQ_SW128>> q;
-            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
-            union {
-                array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
-                array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
-            } o;
-        } qo;
         struct {
             array_aligned<e8m0, K_SCALE_SMEM_ELEMS> kv_scale[NUM_BUFS];
             array_aligned<e4m3, cosize_v<SmemLayoutKTiles_SW128<D_K/64>>> kv[NUM_BUFS];  // Raw (quantized) K data
         } kv;
-    } u;
+        union {
+            array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
+            array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
+        } o;
+    } kvo;
     union {
-        float4 p_exchange_buf[4][16 * B_TOPK / 4]; // why this layout?
+        float p_t[B_TOPK * B_H];
         array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
-    } s_p;
-    array_aligned<e8m0, cosize_v<SmemLayoutSscale>> s_scale;
+        array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
+        array_aligned<e8m0, cosize_v<SmemLayoutSscale>> s_scale;
+    } s_p_scale;
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];

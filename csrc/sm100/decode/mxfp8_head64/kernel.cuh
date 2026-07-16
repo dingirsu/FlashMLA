@@ -137,14 +137,14 @@ KernelTemplate<MODEL_TYPE>
         cutlass::arch::warpgroup_reg_alloc<224>();
 
         constexpr int B_EPI = 64;   // Must be equal to the size of the swizzle atom
-        Tensor sO = make_tensor(make_smem_ptr(plan.u.qo.o.o_buf.data()), SmemLayoutOBuf{});
+        Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.o_buf.data()), SmemLayoutOBuf{});
         bf16* sO_bases[B_EPI/8];   // 64 is the size of the swizzle atom (in number of elements) while 8 is the width of each write
         CUTE_UNROLL
         for (int i = 0; i < B_EPI/8; ++i)
             sO_bases[i] = &sO(idx_in_warpgroup%64, (idx_in_warpgroup/64)*128 + i*8);
 
-        Tensor sS = make_tensor(make_smem_ptr(plan.s_p.s.data()), SmemLayoutS{});
-        Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutSscale{});
+        Tensor sS = make_tensor(make_smem_ptr(plan.s_p_scale.s.data()), SmemLayoutS{});
+        Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_p_scale.s_scale.data()), SmemLayoutSscale{});
 
         float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%64)) * CUDART_L2E_F;
 
@@ -163,40 +163,29 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase);
                 ku::tcgen05_after_thread_sync();
 
-                // Load P (KQ^T output) from tmem, shape (B_TOPK, B_H) in tmem.
-                // We load the right half and the left half into p and p_peer.
-                float p[B_TOPK/2], p_peer[B_TOPK/2];
-                if (warp_idx < 2) {
-                    ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::P, p);
-                    ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::P+32, p_peer);
-                } else {
-                    ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::P, p_peer);
-                    ku::tmem_ld_32dp32bNx<B_TOPK/2>(tmem_cols::P+32, p);
-                }
+                // Each warp loads 32 P rows; each lane owns one token and all 64 heads.
+                static_assert(B_H == B_TOPK / 2);
+                float p[B_H];
+                ku::tmem_ld_32dp32bNx<B_H>(
+                    tmem_cols::P + warp_idx * (B_H / 4), p
+                );
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
 
-                // Reduce within shared mem (transpose of P)
-                {
-                    // Store
-                    CUTE_UNROLL
-                    for (int i = 0; i < (B_TOPK/2)/4; ++i)
-                        plan.s_p.p_exchange_buf[warp_idx^2][i*32 + lane_idx] = *(float4*)(p_peer + i*4);
-                    NamedBarrier::arrive_and_wait(64, NamedBarriers::wg0_warp02_sync+(warp_idx&1));
-                    // Load
-                    CUTE_UNROLL
-                    for (int i = 0; i < (B_TOPK/2)/4; ++i) {
-                        float2 t[2];
-                        *(float4*)t = plan.s_p.p_exchange_buf[warp_idx][i*32 + lane_idx];
-                        float2* cur_p = (float2*)(p + i*4);
-                        cur_p[0] = ku::float2_add(cur_p[0], t[0]);
-                        cur_p[1] = ku::float2_add(cur_p[1], t[1]);
-                    }
+                int p_token = warp_idx * 32 + lane_idx;
+                CUTE_UNROLL
+                for (int head = 0; head < B_H; ++head) {
+                    plan.s_p_scale.p_t[p_token * B_H + head] = p[head];
                 }
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
-                // After exchange, p[i] holds the i-th column of the (B_TOPK, B_H) P matrix.
-                // In register layout, this corresponds to S[h, t] = P[t, h], which is what
-                // the VS MMA will consume (S in K-major (B_H, B_TOPK) layout).
+                // Transpose P so each thread owns one head and one 64-token half.
+                int p_head = idx_in_warpgroup % B_H;
+                int p_token_base = (idx_in_warpgroup / B_H) * (B_TOPK / 2);
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 2; ++i) {
+                    p[i] = plan.s_p_scale.p_t[(p_token_base + i) * B_H + p_head];
+                }
 
                 // Mask
                 uint32_t valid_mask = *((uint32_t*)plan.is_token_valid[rs.index_buf_idx] + (idx_in_warpgroup>=64?1:0));
@@ -376,7 +365,7 @@ KernelTemplate<MODEL_TYPE>
                 float2 o_scale_float2 = {o_scale, o_scale};
                 constexpr int B_EPI = 64;
                 float2 o[B_EPI/2];
-                Tensor sO = make_tensor(make_smem_ptr(plan.u.qo.o.o_accum_buf.data()), SmemLayoutOAccumBuf{});
+                Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.o_accum_buf.data()), SmemLayoutOAccumBuf{});
                 CUTE_UNROLL
                 for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
                     ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + i*B_EPI, o);
@@ -428,7 +417,7 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_q_scale_tma.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
                 {
                     Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, args.batch_idx);
-                    Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
+                    Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ_SW128{});
                     ku::launch_tma_copy(
                         tma_params.tma_Q,
                         gQ,
@@ -440,7 +429,7 @@ KernelTemplate<MODEL_TYPE>
                 // ===== Prologue: Q-scale TMA (e8m0) =====
                 {
                     Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx, args.batch_idx);
-                    Tensor sQ_scale = make_tensor(make_smem_ptr(plan.u.qo.q_scale.data()), SmemLayoutQScaleTMA{});
+                    Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_p_scale.q_scale.data()), SmemLayoutQScaleTMA{});
                     ku::launch_tma_copy(
                         tma_params.tma_Q_scale,
                         gQ_scale,
@@ -456,8 +445,8 @@ KernelTemplate<MODEL_TYPE>
                 // ===== Prologue: Q-scale UTCCP smem -> tmem =====
                 {
                     Tensor sQ_scale = make_tensor(
-                        make_smem_ptr(plan.u.qo.q_scale.data()),
-                        SmemLayoutQScale{}
+                        make_smem_ptr(plan.s_p_scale.q_scale.data()),
+                        SmemLayoutPScaleBAtom{}
                     );
                     auto sQ_compact = make_tensor(sQ_scale.data(), filter_zeros(sQ_scale.layout()));
                     Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
@@ -496,8 +485,8 @@ KernelTemplate<MODEL_TYPE>
                     // UTCCP K scale smem -> tmem
                     {
                         Tensor sK_scale = make_tensor(
-                            make_smem_ptr(plan.u.kv.kv_scale[rs.buf_idx].data()),
-                            SmemLayoutKScale{}
+                            make_smem_ptr(plan.kvo.kv.kv_scale[rs.buf_idx].data()),
+                            SmemLayoutPScaleAAtom{}
                         );
                         auto sK_compact = make_tensor(sK_scale.data(), filter_zeros(sK_scale.layout()));
                         Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
@@ -520,8 +509,8 @@ KernelTemplate<MODEL_TYPE>
                     Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
                     tK_scale.data().get() = tmem_cols::KScale;
 
-                    Tensor sK = make_tensor(make_smem_ptr(plan.u.kv.kv[rs.buf_idx].data()), SmemLayoutKTiles_SW128<D_K/64>{});
-                    Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
+                    Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[rs.buf_idx].data()), SmemLayoutKTiles_SW128<D_K/64>{});
+                    Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ_SW128{});
                     ku::utcmma_blockscaled_ss(
                         tiled_mma_P, sK, sQ, tK_scale, tQ_scale,
                         tP, true
@@ -535,7 +524,7 @@ KernelTemplate<MODEL_TYPE>
                     // UTCCP S scale smem -> tmem
                     {
                         Tensor sS_scale = make_tensor(
-                            make_smem_ptr(plan.s_scale.data()),
+                            make_smem_ptr(plan.s_p_scale.s_scale.data()),
                             SmemLayoutSscale{}
                         );
                         auto sS_compact = make_tensor(sS_scale.data(), filter_zeros(sS_scale.layout()));
@@ -563,8 +552,8 @@ KernelTemplate<MODEL_TYPE>
                     Tensor tS_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutSscale{}));
                     tS_scale.data().get() = tmem_cols::SScale;
 
-                    Tensor sS = make_tensor(make_smem_ptr(plan.s_p.s.data()), SmemLayoutS{});
-                    Tensor sV = make_tensor(make_smem_ptr(plan.u.kv.kv[rs.buf_idx].data()), SmemLayoutKTilesTransposed_SW128<D_V/64>{});
+                    Tensor sS = make_tensor(make_smem_ptr(plan.s_p_scale.s.data()), SmemLayoutS{});
+                    Tensor sV = make_tensor(make_smem_ptr(plan.kvo.kv.kv[rs.buf_idx].data()), SmemLayoutKTilesTransposed_SW128<D_V/64>{});
 
                     CUTE_UNROLL
                     for (int dv_block = 0; dv_block < D_V/B_TOPK; ++dv_block) {
@@ -588,6 +577,7 @@ KernelTemplate<MODEL_TYPE>
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+                    plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
                     plan.bar_kv_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                     int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
                     int4 nxt_cur_indices;
@@ -598,7 +588,7 @@ KernelTemplate<MODEL_TYPE>
                         ku::tma_gather4(
                             block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv : &tma_params.tensor_map_kv,
                             plan.bar_kv_ready[rs.buf_idx],
-                            plan.u.kv.kv[rs.buf_idx].data() + D_K*row,
+                            plan.kvo.kv.kv[rs.buf_idx].data() + D_K*row,
                             0,
                             cur_indices,
                             (int64_t)TMA::CacheHintSm90::EVICT_LAST
@@ -612,7 +602,7 @@ KernelTemplate<MODEL_TYPE>
         } else if (warp_idx == 6) {
             // ===== K scale layout producer warp =====
             // Reads 8 raw e8m0 scales per token and duplicates each one into
-            // `plan.u.kv.kv_scale[buf]` for tcgen05's 32-element scale vectors.
+            // `plan.kvo.kv.kv_scale[buf]` for tcgen05's 32-element scale vectors.
             // The smem layout is 3D (B_TOPK, D_K, 1)
             // and the scales occupy positions row, g*32 in the (row, K) plane.
             run_main_loop([&](const MainLoopArgs &args) {
@@ -624,12 +614,13 @@ KernelTemplate<MODEL_TYPE>
                     int cur_buf = rs.buf_idx;
                     int ib = rs.index_buf_idx;
                     plan.bar_valid_coord_scale_ready[ib].wait(rs.index_bar_phase);
+                    plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
                     // The K data TMA (warp 5) and the K scale layout producer (this warp) are
                     // independent — we just need the K scales from `plan.scales[ib]` to land
                     // (which warp 7's `bar_valid_coord_scale_ready` ensures).
                     Tensor sK_scale = make_tensor(
-                        make_smem_ptr(plan.u.kv.kv_scale[cur_buf].data()),
-                        SmemLayoutKScale{}
+                        make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
+                        SmemLayoutPScaleAAtom{}
                     );
                     e8m0 (*scales_base)[K_SCALE_BYTES] = plan.scales[ib];
 

@@ -188,7 +188,8 @@ KernelTemplate<MODEL_TYPE>
                 }
 
                 // Mask
-                uint32_t valid_mask = *((uint32_t*)plan.is_token_valid[rs.index_buf_idx] + (idx_in_warpgroup>=64?1:0));
+                uint64_t valid_mask = *(reinterpret_cast<uint64_t*>(plan.is_token_valid[rs.index_buf_idx])
+                    + (idx_in_warpgroup >= B_H ? 1 : 0));
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK/2; i += 1) {
                     if (!(valid_mask>>i&1))

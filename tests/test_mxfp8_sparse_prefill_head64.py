@@ -9,6 +9,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+import lib
+from lib import TestParam
 from run_mxfp8_prefill import mxfp8_sparse_prefill
 from mxfp8_test_utils import (
     D_HEAD,
@@ -16,7 +18,6 @@ from mxfp8_test_utils import (
     KV_GROUP_SIZE,
     Q_GROUP_SIZE,
     assert_close,
-    attention_reference,
     pack_prefill_kv_rank1,
     pack_q,
     require_sm100_family,
@@ -318,57 +319,58 @@ def _assert_kernel_stage(
         ) from None
 
 
-def _make_tiled_indices(
-    s_q: int,
-    topk: int,
-    s_kv: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    indices = torch.randint(
-        s_kv, (s_q, topk), dtype=torch.int32, device=device
+def _make_correctness_cases() -> list[TestParam]:
+    # These are the head64/d512 subset of test_flash_mla_sparse_prefill.py.
+    shape_cases = [
+        (1, 128, 128),
+        (1, 1840, 256),
+        (1, 1592, 384),
+        (1, 1521, 512),
+        (1, 95, 128),
+        (1, 153, 256),
+        (1, 114, 384),
+    ]
+    cases = [
+        TestParam(
+            s_q,
+            s_kv,
+            topk,
+            h_q=64,
+            d_qk=512,
+            seed=20260715 + case_idx,
+            num_runs=0,
+        )
+        for case_idx, (s_q, s_kv, topk) in enumerate(shape_cases)
+    ]
+    cases.append(
+        TestParam(
+            62,
+            592,
+            128,
+            h_q=64,
+            d_qk=512,
+            seed=20260722,
+            num_runs=0,
+            have_attn_sink=True,
+            have_topk_length=True,
+        )
     )
-    topk_length = torch.full(
-        (s_q,), topk, dtype=torch.int32, device=device
-    )
-
-    if s_q > 1:
-        invalid_positions = [7, 129, 258]
-        invalid_values = [-1, s_kv + 11, -1]
-        for position, value in zip(invalid_positions, invalid_values):
-            if position < topk:
-                indices[1, position] = value
-        topk_length[1] = min(topk, 301)
-    if s_q > 2:
-        indices[2] = -1
-    if s_q > 3:
-        topk_length[3] = 0
-    return indices, topk_length
+    return cases
 
 
-@torch.inference_mode()
-def test_mxfp8_sparse_prefill_head64_precision() -> None:
-    require_sm100_family()
-    torch.manual_seed(20260715)
-    device = torch.device("cuda")
-    s_q = 1
-    s_kv = 640
-    h_q = 64
-    topk = 128
-    sm_scale = D_HEAD**-0.5
+def _run_precision_case(p: TestParam) -> None:
+    torch.cuda.empty_cache()
+    with torch.device("cuda"):
+        testcase = lib.generate_testcase(p)
 
-    q_gain = torch.linspace(0.6, 1.4, h_q, device=device).view(1, h_q, 1)
-    kv_gain = torch.linspace(0.5, 1.5, s_kv, device=device).view(s_kv, 1, 1)
-    q = torch.randn((s_q, h_q, D_HEAD), device=device) * (0.35 * q_gain)
-    kv = torch.randn((s_kv, 1, D_HEAD), device=device) * (0.35 * kv_gain)
-
-    packed_q, packed_q_reference = pack_q(q)
+    packed_q, packed_q_reference = pack_q(testcase.q)
     (
         packed_kv,
         packed_kv_reference,
         kv_scale_w,
         packed_u_reference,
         packed_v_fp8_reference,
-    ) = pack_prefill_kv_rank1(kv)
+    ) = pack_prefill_kv_rank1(testcase.kv)
     tiled_q = _unpack_q(packed_q)
     tiled_kv, tiled_v_fp8, tiled_u_scale, tiled_w_scale = (
         _unpack_page_tail_kv_rank1(packed_kv, kv_scale_w)
@@ -378,7 +380,12 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
     torch.testing.assert_close(tiled_v_fp8, packed_v_fp8_reference, atol=0, rtol=0)
     torch.testing.assert_close(tiled_u_scale, packed_u_reference, atol=0, rtol=0)
 
-    indices, topk_length = _make_tiled_indices(s_q, topk, s_kv, device)
+    indices = testcase.indices[:, 0, :]
+    reference_topk_length = testcase.topk_length
+    if reference_topk_length is None:
+        reference_topk_length = torch.full(
+            (p.s_q,), p.topk, dtype=torch.int32, device=indices.device
+        )
     ref_out, ref_max_logits, ref_lse, traces = phase1_tiled_reference(
         tiled_q,
         tiled_kv,
@@ -386,8 +393,9 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
         tiled_u_scale,
         tiled_w_scale,
         indices,
-        topk_length,
-        sm_scale,
+        reference_topk_length,
+        testcase.sm_scale,
+        testcase.attn_sink,
     )
 
     if os.getenv("MXFP8_PRINT_TILE_TRACE") == "1":
@@ -397,14 +405,15 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
         packed_q,
         packed_kv,
         kv_scale_w,
-        indices.unsqueeze(1),
-        sm_scale,
-        d_qk=D_HEAD,
-        d_v=D_HEAD,
-        topk_length=topk_length,
+        testcase.indices,
+        testcase.sm_scale,
+        d_qk=p.d_qk,
+        d_v=p.d_v,
+        attn_sink=testcase.attn_sink,
+        topk_length=testcase.topk_length,
     )
     _assert_kernel_stage(
-        "Q/K gather, block scales, QK MMA, or validity mask",
+        f"{p}: Q/K gather, block scales, QK MMA, or validity mask",
         max_logits,
         ref_max_logits,
         traces,
@@ -412,7 +421,7 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
         rtol=2.0e-2,
     )
     _assert_kernel_stage(
-        "online softmax mi/li update",
+        f"{p}: online softmax mi/li update",
         lse,
         ref_lse,
         traces,
@@ -420,17 +429,33 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
         rtol=5.0e-3,
     )
     _assert_kernel_stage(
-        "S MXFP8 quantization, old-O rescale, V scales, or SV MMA",
+        f"{p}: S MXFP8 quantization, old-O rescale, V scales, or SV MMA",
         out,
         ref_out,
         traces,
         atol=3.0e-2,
         rtol=1.2e-1,
     )
-    if s_q > 2:
-        assert torch.count_nonzero(out[2]) == 0
-    if s_q > 3:
-        assert torch.count_nonzero(out[3]) == 0
+
+    positions = torch.arange(p.topk, device=indices.device).unsqueeze(0)
+    valid = (indices >= 0) & (indices < p.s_kv)
+    valid &= positions < reference_topk_length.unsqueeze(1)
+    all_invalid = ~valid.any(dim=1)
+    if all_invalid.any():
+        assert torch.count_nonzero(out[all_invalid]) == 0
+
+
+@torch.inference_mode()
+def test_mxfp8_sparse_prefill_head64_precision() -> None:
+    require_sm100_family()
+    old_matmul_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        for case in _make_correctness_cases():
+            print(f"Running MXFP8 sparse prefill precision case: {case}")
+            _run_precision_case(case)
+    finally:
+        torch.set_float32_matmul_precision(old_matmul_precision)
 
 
 if __name__ == "__main__":

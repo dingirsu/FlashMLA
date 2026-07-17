@@ -178,7 +178,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             for (int h = 0; h < B_H; ++h) {
                 plan.p_t[h + B_H * k_row] = p[h]; // How to improve the transpose efficiency here?
             }
-            plan.bar_k_valid_free[k%NUM_BUFS].arrive();
 
             if (idx_in_warpgroup < B_H) {
             int h = idx_in_warpgroup;
@@ -246,6 +245,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
             }
             }
+            // The producer may refill this ping-pong slot only after every
+            // consumer has finished reading its validity mask.
+            plan.bar_k_valid_free[k%NUM_BUFS].arrive();
             fence_view_async_shared();
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
@@ -395,19 +397,34 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     }
                     plan.kv_skip_tma[cur_buf] = all_invalid || !MXFP8_PREFILL_LOAD_KV;
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
-                    if (plan.kv_skip_tma[cur_buf]) {
-                        plan.bar_kv_ready[cur_buf].complete_transaction(B_TOPK*D_K*sizeof(e4m3));
-                    }
                 }
             }
             fence_view_async_shared();
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
 
+            int cur_buf = k%NUM_BUFS;
+            uint8_t* sK_base = reinterpret_cast<uint8_t*>(plan.kvo.kv.kv[cur_buf].data());
+            if (plan.kv_skip_tma[cur_buf]) {
+                // A zero S fragment can still propagate NaN from uninitialized
+                // E4M3 V data. Materialize a zero tile before manually
+                // completing the skipped TMA transaction.
+                uint4* sK_vec = reinterpret_cast<uint4*>(sK_base);
+                constexpr int NUM_KV_VECS = B_TOPK*D_K/sizeof(uint4);
+                for (int vec = idx_in_warpgroup; vec < NUM_KV_VECS; vec += 128) {
+                    sK_vec[vec] = make_uint4(0, 0, 0, 0);
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
+                if (producer_warp_idx == 0 && elect_one_sync()) {
+                    plan.bar_kv_ready[cur_buf].complete_transaction(
+                        B_TOPK*D_K*sizeof(e4m3)
+                    );
+                }
+            }
+
             if (elect_one_sync()) {
-                int cur_buf = k%NUM_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
                 Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutPScaleAAtom{});
-                uint8_t* sK_base = reinterpret_cast<uint8_t*>(plan.kvo.kv.kv[cur_buf].data());
 
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {

@@ -6,7 +6,6 @@ import random
 
 import torch
 import kernelkit as kk
-import flash_mla
 
 import quant
 
@@ -308,6 +307,8 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
 
 
 def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
+    import flash_mla
+
     assert not return_p_sum
     return flash_mla.flash_mla_sparse_fwd(
         t.q, t.kv, t.indices,
@@ -317,6 +318,8 @@ def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
     )
 
 def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
+    import flash_mla
+
     assert p.decode is not None
     return flash_mla.flash_mla_with_kvcache(
         t.q,

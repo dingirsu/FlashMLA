@@ -12,7 +12,7 @@ namespace sm100::mxfp8_fwd::head64 {
 using namespace cute;
 
 #ifndef MXFP8_PREFILL_DEBUG_VALUES
-#define MXFP8_PREFILL_DEBUG_VALUES 1
+#define MXFP8_PREFILL_DEBUG_VALUES 0
 #endif
 
 using e4m3 = cutlass::float_e4m3_t;

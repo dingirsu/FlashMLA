@@ -475,6 +475,7 @@ def flash_attn_varlen_kvpacked_func(
 def flash_mla_mxfp8_sparse_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
+    kv_scale_w: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
     d_qk: int,
@@ -493,6 +494,8 @@ def flash_mla_mxfp8_sparse_prefill(
         q: [s_q, h_q, 528], uint8 or float8_e4m3fn.
         kv: [s_kv, h_kv, 520], uint8 or float8_e4m3fn storage envelope.
             Its underlying bytes must be [all 512-byte rows][all 8-byte scales].
+        kv_scale_w: [8], float8_e8m0fnu or uint8. Rank-1 W(g) factors;
+            group 0 is the fixed anchor.
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or >= s_kv.
         sm_scale: float. Softmax scale factor.
         d_qk: int. The logical head dimension for Q/K (512 or 576).
@@ -507,7 +510,7 @@ def flash_mla_mxfp8_sparse_prefill(
         - lse: [s_q, h_q], float32
     """
     results = flash_mla_cuda.mxfp8_sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_qk, d_v, attn_sink, topk_length
+        q, kv, kv_scale_w, indices, sm_scale, d_qk, d_v, attn_sink, topk_length
     )
     return results
 

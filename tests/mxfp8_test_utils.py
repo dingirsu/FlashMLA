@@ -62,6 +62,60 @@ def pack_prefill_kv(kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return storage.view(*kv.shape[:-1], KV_BYTES_PER_TOKEN), dequantized
 
 
+def pack_prefill_kv_rank1(
+    kv: torch.Tensor,
+    w_exponents: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize KV with VSF(token, group) = U(token) * W(group)."""
+    assert kv.ndim == 3 and kv.shape[-1] == D_HEAD
+    num_groups = D_HEAD // KV_GROUP_SIZE
+    grouped = kv.float().reshape(*kv.shape[:-1], num_groups, KV_GROUP_SIZE)
+
+    if w_exponents is None:
+        w_exponents = torch.tensor(
+            [2, 1, 3, 0, 4, 2, 1, 3],
+            dtype=torch.int32,
+            device=kv.device,
+        )
+    else:
+        w_exponents = w_exponents.to(device=kv.device, dtype=torch.int32)
+    assert tuple(w_exponents.shape) == (num_groups,)
+
+    raw_scale = grouped.abs().amax(dim=-1) / FP8_MAX
+    required_exp = torch.ceil(
+        torch.log2(raw_scale.clamp_min(2.0**-126))
+    ).to(torch.int32)
+    u_exponents = (required_exp - w_exponents).amax(dim=-1, keepdim=True)
+    product_exponents = u_exponents + w_exponents
+    if product_exponents.amin().item() < -126 or product_exponents.amax().item() > 127:
+        raise ValueError("rank-1 product scale is outside the UE8M0 test range")
+
+    product_scale = torch.exp2(product_exponents.float()).to(torch.float8_e8m0fnu)
+    product_scale_f32 = product_scale.float()
+    quantized = (
+        grouped / product_scale_f32.unsqueeze(-1)
+    ).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    dequantized = (
+        quantized.float() * product_scale_f32.unsqueeze(-1)
+    ).reshape_as(kv.float())
+
+    w_scale = torch.exp2(w_exponents.float()).to(torch.float8_e8m0fnu)
+    u_scale = torch.exp2(u_exponents.squeeze(-1).float())
+    num_tokens = kv.shape[0] * kv.shape[1]
+    storage = torch.empty(
+        num_tokens * KV_BYTES_PER_TOKEN, dtype=torch.uint8, device=kv.device
+    )
+    storage[: num_tokens * D_HEAD] = quantized.reshape_as(kv).view(torch.uint8).reshape(-1)
+    storage[num_tokens * D_HEAD :] = product_scale.view(torch.uint8).reshape(-1)
+    return (
+        storage.view(*kv.shape[:-1], KV_BYTES_PER_TOKEN),
+        dequantized,
+        w_scale,
+        u_scale,
+        quantized.reshape_as(kv).float(),
+    )
+
+
 def pack_decode_kv_pages(kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pack every decode cache page as [all data rows][all scale rows]."""
     assert kv.ndim == 4 and kv.shape[2] == 1

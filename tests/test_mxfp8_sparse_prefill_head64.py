@@ -17,7 +17,7 @@ from mxfp8_test_utils import (
     Q_GROUP_SIZE,
     assert_close,
     attention_reference,
-    pack_prefill_kv,
+    pack_prefill_kv_rank1,
     pack_q,
     require_sm100_family,
 )
@@ -64,7 +64,10 @@ def _unpack_q(packed_q: torch.Tensor) -> torch.Tensor:
     return q_fp8 * q_scale
 
 
-def _unpack_page_tail_kv(packed_kv: torch.Tensor) -> torch.Tensor:
+def _unpack_page_tail_kv_rank1(
+    packed_kv: torch.Tensor,
+    kv_scale_w: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = packed_kv.shape[0] * packed_kv.shape[1]
     flat = packed_kv.reshape(-1)
     data_end = num_tokens * D_HEAD
@@ -75,15 +78,22 @@ def _unpack_page_tail_kv(packed_kv: torch.Tensor) -> torch.Tensor:
         .float()
         .reshape(*packed_kv.shape[:-1], D_HEAD)
     )
-    kv_scale = (
+    product_scale = (
         flat[data_end:]
         .contiguous()
         .view(torch.float8_e8m0fnu)
         .float()
         .reshape(*packed_kv.shape[:-1], D_HEAD // KV_GROUP_SIZE)
-        .repeat_interleave(KV_GROUP_SIZE, dim=-1)
     )
-    return kv_fp8 * kv_scale
+    w_scale = kv_scale_w.contiguous().view(torch.float8_e8m0fnu).float()
+    u_scale = product_scale[..., 0] / w_scale[0]
+    torch.testing.assert_close(
+        product_scale, u_scale.unsqueeze(-1) * w_scale, atol=0, rtol=0
+    )
+    dequantized = kv_fp8 * product_scale.repeat_interleave(
+        KV_GROUP_SIZE, dim=-1
+    )
+    return dequantized, kv_fp8, u_scale, w_scale
 
 
 def _round_up_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -127,6 +137,9 @@ def _minmax(x: torch.Tensor) -> Tuple[float, float]:
 def phase1_tiled_reference(
     q: torch.Tensor,
     kv: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_u_scale: torch.Tensor,
+    kv_w_scale: torch.Tensor,
     indices: torch.Tensor,
     topk_length: torch.Tensor,
     sm_scale: float,
@@ -137,6 +150,9 @@ def phase1_tiled_reference(
 
     q = q.float()
     kv = kv.float().reshape(-1, D_HEAD)
+    kv_fp8 = kv_fp8.float().reshape(-1, D_HEAD)
+    kv_u_scale = kv_u_scale.float().reshape(-1)
+    kv_w_scale = kv_w_scale.float().reshape(D_HEAD // KV_GROUP_SIZE)
     indices = indices.reshape(q.shape[0], -1)
     topk_length = topk_length.reshape(-1)
     topk = indices.shape[1]
@@ -170,6 +186,8 @@ def phase1_tiled_reference(
             )
             safe_indices = tile_indices.clamp(0, kv.shape[0] - 1).long()
             gathered_kv = kv.index_select(0, safe_indices)
+            gathered_v_fp8 = kv_fp8.index_select(0, safe_indices)
+            gathered_u_scale = kv_u_scale.index_select(0, safe_indices)
 
             p = _qk_mma_tiles(q[q_idx], gathered_kv)
             p.mul_(sm_scale * LOG2_E)
@@ -190,7 +208,11 @@ def phase1_tiled_reference(
             real_mi = torch.maximum(real_mi, cur_pi_max)
 
             s = torch.exp2(p - new_mi.unsqueeze(-1))
-            group_s_max = torch.exp2(group_max - new_mi.unsqueeze(-1))
+            s_for_sv = s * gathered_u_scale.unsqueeze(0)
+            grouped_s_for_sv = s_for_sv.reshape(
+                h_q, B_TOPK // MMA_K, MMA_K
+            )
+            group_s_max = grouped_s_for_sv.amax(dim=-1)
             raw_s_scale = torch.where(
                 group_s_max > 0,
                 group_s_max / FP8_MAX,
@@ -198,17 +220,16 @@ def phase1_tiled_reference(
             )
             s_scale = _round_up_ue8m0(raw_s_scale)
             s_fp8 = (
-                s.reshape(h_q, B_TOPK // MMA_K, MMA_K)
-                / s_scale.unsqueeze(-1)
+                grouped_s_for_sv / s_scale.unsqueeze(-1)
             ).to(torch.float8_e4m3fn)
-            dequant_s = (
+            dequant_s_for_sv = (
                 s_fp8.float() * s_scale.unsqueeze(-1)
             ).reshape(h_q, B_TOPK)
 
             li = torch.add(li * old_o_scale, s.sum(dim=-1))
             if tile_idx > 0:
                 o.mul_(old_o_scale.unsqueeze(-1))
-            _sv_mma_tiles(o, dequant_s, gathered_kv)
+            _sv_mma_tiles(o, dequant_s_for_sv, gathered_v_fp8)
             mi = new_mi
 
             tile_max_min, tile_max_max = _minmax(cur_pi_max)
@@ -251,7 +272,8 @@ def phase1_tiled_reference(
             li == 0, torch.zeros_like(li), denominator.reciprocal()
         )
 
-        out_rows.append(o * output_scale.unsqueeze(-1))
+        w_per_d = kv_w_scale.repeat_interleave(KV_GROUP_SIZE)
+        out_rows.append(o * output_scale.unsqueeze(-1) * w_per_d.unsqueeze(0))
         max_rows.append(max_logits)
         lse_rows.append(lse)
 
@@ -340,15 +362,32 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
     kv = torch.randn((s_kv, 1, D_HEAD), device=device) * (0.35 * kv_gain)
 
     packed_q, packed_q_reference = pack_q(q)
-    packed_kv, packed_kv_reference = pack_prefill_kv(kv)
+    (
+        packed_kv,
+        packed_kv_reference,
+        kv_scale_w,
+        packed_u_reference,
+        packed_v_fp8_reference,
+    ) = pack_prefill_kv_rank1(kv)
     tiled_q = _unpack_q(packed_q)
-    tiled_kv = _unpack_page_tail_kv(packed_kv)
+    tiled_kv, tiled_v_fp8, tiled_u_scale, tiled_w_scale = (
+        _unpack_page_tail_kv_rank1(packed_kv, kv_scale_w)
+    )
     torch.testing.assert_close(tiled_q, packed_q_reference, atol=0, rtol=0)
     torch.testing.assert_close(tiled_kv, packed_kv_reference, atol=0, rtol=0)
+    torch.testing.assert_close(tiled_v_fp8, packed_v_fp8_reference, atol=0, rtol=0)
+    torch.testing.assert_close(tiled_u_scale, packed_u_reference, atol=0, rtol=0)
 
     indices, topk_length = _make_tiled_indices(s_q, topk, s_kv, device)
     ref_out, ref_max_logits, ref_lse, traces = phase1_tiled_reference(
-        tiled_q, tiled_kv, indices, topk_length, sm_scale
+        tiled_q,
+        tiled_kv,
+        tiled_v_fp8,
+        tiled_u_scale,
+        tiled_w_scale,
+        indices,
+        topk_length,
+        sm_scale,
     )
 
     if os.getenv("MXFP8_PRINT_TILE_TRACE") == "1":
@@ -357,6 +396,7 @@ def test_mxfp8_sparse_prefill_head64_precision() -> None:
     out, max_logits, lse = mxfp8_sparse_prefill(
         packed_q,
         packed_kv,
+        kv_scale_w,
         indices.unsqueeze(1),
         sm_scale,
         d_qk=D_HEAD,

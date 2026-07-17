@@ -41,6 +41,8 @@ constexpr int K_QUANT_GROUP_SIZE = 64;
 constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
 constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
 constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
+constexpr int KV_SCALE_ANCHOR = 0;
+constexpr uint8_t UE8M0_ONE_BITS = 0x7f;
 constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
 constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
 constexpr int TMA_K_CHUNK_BYTES = 128;
@@ -71,6 +73,7 @@ namespace tmem_cols {
     constexpr int K_Scale = 340;
     constexpr int S_Scale = 356;
     constexpr int P = 400;
+    constexpr int V_Scale = 464;
 }
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
@@ -144,6 +147,8 @@ using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
     Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
 ));
 
+static_assert(cosize_v<SmemLayoutOScaleAAtom> <= cosize_v<SmemLayoutOScaleBAtom>);
+
 struct SharedMemoryPlan {
     array_aligned<e4m3, B_H*D_Q> q;
     union {
@@ -165,6 +170,7 @@ struct SharedMemoryPlan {
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     char kv_warp_has_valid[NUM_BUFS][NUM_KV_PRODUCER_WARPS];
     char kv_skip_tma[NUM_BUFS];
+    float kv_u_scale[NUM_BUFS][B_TOPK];
     float p_t[B_TOPK*B_H];
     transac_bar_t bar_prologue_q, bar_prologue_q_scale;
     transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
@@ -177,6 +183,7 @@ struct SharedMemoryPlan {
     float rowwise_max_buf[128], rowwise_li_buf[128];
 };
 
+static_assert(tmem_cols::V_Scale < 512);
 static_assert(sizeof(SharedMemoryPlan) < 227 * 1024, "MXFP8 prefill shared memory exceeds the SM100 limit");
 
 enum NamedBarriers : int {

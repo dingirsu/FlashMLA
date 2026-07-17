@@ -44,10 +44,12 @@ protected:
  * Layout for d_qk=512:
  *   - Q: 512 e4m3 bytes + 16 UE8M0 scales per token (32-value groups)
  *   - KV page: s_kv*512 e4m3 bytes, then s_kv*8 UE8M0 scales (64-value groups)
+ *   - kv_scale_w: 8 UE8M0 rank-1 group factors, with anchor group 0
  */
 static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
     const at::Tensor &q,        // [s_q, h_q, bytes_per_token_q]
     const at::Tensor &kv,       // [s_kv, h_kv, bytes_per_token_kv]
+    const at::Tensor &kv_scale_w, // [8], UE8M0 or its uint8 bit representation
     const at::Tensor &indices,  // [s_q, h_kv, topk]
     float sm_scale,
     int d_qk,
@@ -62,6 +64,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
+    KU_CHECK_NDIM(kv_scale_w, 1);
     KU_CHECK_NDIM(indices, 3);
     KU_CHECK_NDIM(attn_sink, 1);
     KU_CHECK_NDIM(topk_length, 1);
@@ -85,6 +88,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
+    KU_CHECK_DEVICE(kv_scale_w);
     KU_CHECK_DEVICE(indices);
     KU_CHECK_DEVICE(attn_sink);
     KU_CHECK_DEVICE(topk_length);
@@ -93,17 +97,21 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
         "q must have dtype fp8_e4m3fn or uint8 for MXFP8 mode");
     TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kUInt8,
         "kv must have dtype fp8_e4m3fn or uint8 for MXFP8 mode");
+    TORCH_CHECK(kv_scale_w.dtype() == at::kFloat8_e8m0fnu || kv_scale_w.dtype() == torch::kUInt8,
+        "kv_scale_w must have dtype float8_e8m0fnu or uint8");
     KU_CHECK_DTYPE(indices, torch::kInt32);
     KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
     KU_CHECK_DTYPE(topk_length, torch::kInt32);
 
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
     KU_CHECK_CONTIGUOUS(kv);
+    KU_CHECK_CONTIGUOUS(kv_scale_w);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
 
     KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
+    KU_CHECK_SHAPE(kv_scale_w, 8);
     KU_CHECK_SHAPE(attn_sink, h_q);
     KU_CHECK_SHAPE(topk_length, s_q);
 
@@ -120,6 +128,7 @@ static std::vector<at::Tensor> mxfp8_sparse_attn_prefill_interface(
 
         q.data_ptr(),
         kv.data_ptr(),
+        (uint8_t*)kv_scale_w.data_ptr(),
         (int*)indices.data_ptr(),
         ku::get_optional_tensor_ptr<float>(attn_sink),
         ku::get_optional_tensor_ptr<int>(topk_length),

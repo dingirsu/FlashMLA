@@ -257,6 +257,7 @@ struct MxFp8SparseAttnFwdParams {
     // and stores the scale plane after all e4m3 rows in the packed page.
     void* __restrict__ q;          // [s_q, h_q, 512 e4m3 + 16 UE8M0]
     void* __restrict__ kv;         // packed [s_kv*h_kv*512 data][s_kv*h_kv*8 scales]
+    uint8_t* __restrict__ kv_scale_w; // [8] UE8M0 W(g), anchor group is 0
     int* __restrict__ indices;     // [s_q, h_kv, topk]
     float* __restrict__ attn_sink; // [h_q], may be nullptr
     int* __restrict__ topk_length; // [s_q], may be nullptr

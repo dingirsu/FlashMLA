@@ -20,6 +20,29 @@ namespace sm100::mxfp8_fwd::head64 {
 
 using namespace cute;
 
+CUTE_DEVICE
+float ue8m0_bits_to_float(uint8_t bits) {
+    TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
+    if (bits == 0) {
+        return __uint_as_float(0x00400000u); // UE8M0 0x00 is 2^-127.
+    }
+    return __uint_as_float(static_cast<uint32_t>(bits) << 23);
+}
+
+CUTE_DEVICE
+float ue8m0_ratio_to_float(uint8_t numerator_bits, uint8_t denominator_bits) {
+    TRAP_ONLY_DEVICE_ASSERT(numerator_bits != 0xff && denominator_bits != 0xff);
+    int exponent = static_cast<int>(numerator_bits) - static_cast<int>(denominator_bits);
+    TRAP_ONLY_DEVICE_ASSERT(exponent >= -149 && exponent <= 127);
+    if (exponent >= -126 && exponent <= 127) {
+        return __uint_as_float(static_cast<uint32_t>(exponent + 127) << 23);
+    }
+    if (exponent >= -149 && exponent <= -127) {
+        return __uint_as_float(1u << (exponent + 149));
+    }
+    return exponent < -149 ? 0.0f : CUDART_INF_F;
+}
+
 template<int B_H, int B_H_TMEM, int TMEM_COL_START, int D_V>
 CUTE_DEVICE
 void rescale_O_t(float scale[B_H]) {
@@ -78,7 +101,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     tP.data().get() = tmem_cols::P;
     tQ_scale.data().get() = tmem_cols::Q_Scale;
     tK_scale.data().get() = tmem_cols::K_Scale;
-    tV_scale.data().get() = tmem_cols::K_Scale;
+    tV_scale.data().get() = tmem_cols::V_Scale;
     tS_scale.data().get() = tmem_cols::S_Scale;
 
     if (warp_idx == 0) {
@@ -125,6 +148,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     __syncthreads();
 
     if (warpgroup_idx == 0) {
+        const uint64_t w_scale_bits = __ldg(
+            reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+        );
         // math instructions 
         if (idx_in_warpgroup < B_H) {
             plan.head_mi[idx_in_warpgroup] = MAX_INIT_VAL;
@@ -178,10 +204,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             float old_mi = plan.head_mi[h];
             bool should_scale_o = cur_pi_max - old_mi > 6.0f;
             float new_max = should_scale_o ? max(cur_pi_max, old_mi) : old_mi;
-            CUTE_UNROLL
-            for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
-                absmax_p[g] = exp2f(absmax_p[g] - new_max);
-            }
             float scale_for_old = should_scale_o ? exp2f(old_mi - new_max) : 1.0f;
             plan.head_scale[h] = scale_for_old;
             plan.head_mi[h] = new_max;
@@ -190,20 +212,34 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             float cur_sum = 0.0f;
             CUTE_UNROLL
             for (int g = 0; g < NUM_QUANT_GROUPS; ++g) {
-                float scale_f = absmax_p[g] > 0.0f ? absmax_p[g] / FP8_MAX : 1.0f;
+                float scaled_s_absmax = 0.0f;
+                CUTE_UNROLL
+                for (int i = 0; i < 32; ++i) {
+                    int kk = i + g * 32;
+                    float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max);
+                    cur_sum += s_val;
+
+                    // Absorb the token-dependent U(t) before choosing the S
+                    // quantization scale. li intentionally uses the unscaled S.
+                    float scaled_s = s_val * plan.kv_u_scale[k%NUM_BUFS][kk];
+                    plan.p_t[kk*B_H + h] = scaled_s;
+                    scaled_s_absmax = max(scaled_s_absmax, scaled_s);
+                }
+
+                float scale_f = scaled_s_absmax > 0.0f
+                    ? scaled_s_absmax / FP8_MAX
+                    : 1.0f;
                 e8m0 scale_g = e8m0(scale_f); //TODO: change here to vectorized type conversion
                 sS_scale(
                     h,
                     _0{},
                     make_coord(g % SCALE_GROUPS_PER_TMEM_BLOCK, _0{})
                 ) = scale_g;
+                CUTE_UNROLL
                 for (int i = 0; i < 32; ++i) {
                     int kk = i + g * 32;
-                    float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max); //TODO: change here to vectorzied load from shmem
-                    cur_sum += s_val;
-                    sS_out(h, kk) = e4m3(s_val / float(scale_g)); //TODO: change here to vectorized store and type conversion
+                    sS_out(h, kk) = e4m3(plan.p_t[kk*B_H + h] / float(scale_g));
                 }
-
             }
             plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
             if (k > 0) {
@@ -263,9 +299,12 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 int dv = tile*B_TOPK + idx_in_warpgroup;
                 ku::tmem_ld_32dp32bNx<B_H_TMEM>(tmem_cols::O + tile*B_H_TMEM, o_head);
                 cutlass::arch::fence_view_async_tmem_load();
+                int w_group = dv / K_QUANT_GROUP_SIZE;
+                uint8_t w_bits = static_cast<uint8_t>(w_scale_bits >> (w_group * 8));
+                float w_scale = ue8m0_bits_to_float(w_bits);
                 CUTE_UNROLL
                 for (int h = 0; h < B_H; ++h) {
-                    sO(h, dv) = bf16(o_head[h] * plan.head_scale[h]);
+                    sO(h, dv) = bf16(o_head[h] * plan.head_scale[h] * w_scale);
                 }
             }
         }
@@ -306,6 +345,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         // per-token UE8M0 scales at the end of the page.
         const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
             + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
+        uint8_t w_anchor_bits = 0;
+        if (elect_one_sync()) {
+            uint64_t w_scale_bits = __ldg(
+                reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+            );
+            w_anchor_bits = static_cast<uint8_t>(
+                w_scale_bits >> (KV_SCALE_ANCHOR * 8)
+            );
+        }
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
@@ -390,8 +438,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                             const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
                                 + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;
                             *reinterpret_cast<uint64_t*>(scale) = __ldg(reinterpret_cast<const uint64_t*>(src_scale));
+                            uint8_t anchor_bits = reinterpret_cast<uint8_t*>(scale)[KV_SCALE_ANCHOR];
+                            plan.kv_u_scale[cur_buf][row] = ue8m0_ratio_to_float(
+                                anchor_bits, w_anchor_bits
+                            );
                         } else {
                             *reinterpret_cast<uint64_t*>(scale) = 0;
+                            plan.kv_u_scale[cur_buf][row] = 1.0f;
                         }
                         CUTE_UNROLL
                         for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
@@ -474,6 +527,30 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             auto dst_Q = thr_Q.partition_D(tQ_compact);
 
             cute::copy(copy_Q_scale, src_Q, dst_Q);
+
+            // V's token-dependent U(t) is folded into S before S is
+            // quantized. The remaining W(g) is applied in the epilogue, so
+            // every logical V scale consumed by the SV MMA is one.
+            Tensor sV_scale_one = make_tensor(
+                make_smem_ptr(plan.s_scale.data()),
+                SmemLayoutOScaleAAtom{}
+            );
+            uint8_t* sV_scale_storage = reinterpret_cast<uint8_t*>(plan.s_scale.data());
+            CUTE_NO_UNROLL
+            for (int i = 0; i < cosize_v<SmemLayoutOScaleAAtom>; ++i) {
+                sV_scale_storage[i] = UE8M0_ONE_BITS;
+            }
+            fence_view_async_shared();
+            auto sV_compact = make_tensor(sV_scale_one.data(), filter_zeros(sV_scale_one.layout()));
+            auto tV_compact = make_tensor(tV_scale.data(), filter_zeros(tV_scale.layout()));
+            auto copy_V_scale = make_utccp_copy(SM100_UTCCP_4x32dp128bit_1cta{}, tV_compact);
+            auto thr_V = copy_V_scale.get_slice(0);
+            auto src_V = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_1cta>(
+                thr_V.partition_S(sV_compact)
+            );
+            auto dst_V = thr_V.partition_D(tV_compact);
+            cute::copy(copy_V_scale, src_V, dst_V);
+
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks+1; ++k) {
                 if (k < num_k_blocks) {
@@ -617,6 +694,8 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
         "packed KV storage must be contiguous across tokens");
     KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0, "q must be 16-byte aligned");
     KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0, "kv must be 16-byte aligned");
+    KU_ASSERT(params.kv_scale_w != nullptr);
+    KU_ASSERT(reinterpret_cast<int64_t>(params.kv_scale_w) % 8 == 0, "kv_scale_w must be 8-byte aligned");
     static_assert(D_QK == D_Q);
 
     auto shape_O = make_shape(B_H, D_V, params.s_q);

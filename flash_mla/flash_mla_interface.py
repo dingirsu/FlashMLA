@@ -518,6 +518,7 @@ def flash_mla_mxfp8_sparse_prefill(
 def flash_mla_mxfp8_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
+    kv_scale_w: torch.Tensor,
     indices: torch.Tensor,
     d_qk: int,
     head_dim_v: int,
@@ -542,6 +543,8 @@ def flash_mla_mxfp8_with_kvcache(
         k_cache: (num_blocks, page_block_size, 1, 520), uint8 or float8_e4m3fn.
             The final dimension is a storage envelope; each page's scale bytes
             are physically stored after all page data rows, not per token.
+        kv_scale_w: (8,), float8_e8m0fnu or uint8. Rank-1 W(g) factors;
+            group 0 is the fixed anchor. Extra KV cache uses the same factors.
         indices: (batch_size, seq_len_q, topk), int32.
         d_qk: int. Logical head dimension. Must be 512.
         head_dim_v: int. Must be 512.
@@ -584,7 +587,7 @@ def flash_mla_mxfp8_with_kvcache(
         )
 
     out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.mxfp8_sparse_decode_fwd(
-        q, k_cache, indices, topk_length, attn_sink,
+        q, k_cache, kv_scale_w, indices, topk_length, attn_sink,
         sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
         extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
         d_qk, head_dim_v, softmax_scale

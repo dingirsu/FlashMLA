@@ -16,6 +16,50 @@
 
 namespace sm100::decode::mxfp8_head64 {
 
+CUTE_DEVICE
+float ue8m0_bits_to_float(uint8_t bits) {
+    KU_TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
+    if (bits == 0) {
+        return __uint_as_float(0x00400000u); // UE8M0 0x00 is 2^-127.
+    }
+    return __uint_as_float(static_cast<uint32_t>(bits) << 23);
+}
+
+CUTE_DEVICE
+float ue8m0_ratio_to_float(uint8_t numerator_bits, uint8_t denominator_bits) {
+    KU_TRAP_ONLY_DEVICE_ASSERT(numerator_bits != 0xff && denominator_bits != 0xff);
+    int exponent = static_cast<int>(numerator_bits) - static_cast<int>(denominator_bits);
+    KU_TRAP_ONLY_DEVICE_ASSERT(exponent >= -149 && exponent <= 127);
+    if (exponent >= -126) {
+        return __uint_as_float(static_cast<uint32_t>(exponent + 127) << 23);
+    }
+    if (exponent >= -149) {
+        return __uint_as_float(1u << (exponent + 149));
+    }
+    return 0.0f;
+}
+
+template<int B_H_, int B_TOPK_, int TMEM_COL_START, int D_V_>
+CUTE_DEVICE
+void rescale_o_tmem(const float scale[B_H_]) {
+    float o_head[B_H_];
+    CUTE_UNROLL
+    for (int tile = 0; tile < D_V_/B_TOPK_; ++tile) {
+        ku::tmem_ld_32dp32bNx<B_H_>(
+            TMEM_COL_START + tile*B_H_, o_head
+        );
+        cutlass::arch::fence_view_async_tmem_load();
+        CUTE_UNROLL
+        for (int h = 0; h < B_H_; ++h) {
+            o_head[h] *= scale[h];
+        }
+        ku::tmem_st_32dp32bNx<B_H_>(
+            TMEM_COL_START + tile*B_H_, o_head
+        );
+        cutlass::arch::fence_view_async_tmem_store();
+    }
+}
+
 template<ModelType MODEL_TYPE>
 template<typename TmaParam>
 __device__ void
@@ -135,16 +179,15 @@ KernelTemplate<MODEL_TYPE>
         // WG0: Scale & Exp + mxfp8 quantize of S
         // ============================================================
         cutlass::arch::warpgroup_reg_alloc<224>();
+        const uint64_t w_scale_bits = __ldg(
+            reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+        );
 
         constexpr int B_EPI = 64;   // Must be equal to the size of the swizzle atom
         Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.o_buf.data()), SmemLayoutOBuf{});
-        bf16* sO_bases[B_EPI/8];   // 64 is the size of the swizzle atom (in number of elements) while 8 is the width of each write
-        CUTE_UNROLL
-        for (int i = 0; i < B_EPI/8; ++i)
-            sO_bases[i] = &sO(idx_in_warpgroup%64, (idx_in_warpgroup/64)*128 + i*8);
 
         Tensor sS = make_tensor(make_smem_ptr(plan.s_p_scale.s.data()), SmemLayoutS{});
-        Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_p_scale.s_scale.data()), SmemLayoutSscale{});
+        Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutSscale{});
 
         float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%64)) * CUDART_L2E_F;
 
@@ -163,11 +206,24 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase);
                 ku::tcgen05_after_thread_sync();
 
+#if MXFP8_DECODE_DEBUG_VALUES
+                uint32_t v_scale_raw = 0;
+                ku::tmem_ld_32dp32bNx<1>(tmem_cols::VScale, &v_scale_raw);
+                cutlass::arch::fence_view_async_tmem_load();
+                if (s_q_idx == 0 && partition_idx == 0 && args.batch_idx == 0
+                    && block_idx == args.start_block_idx && idx_in_warpgroup == 0) {
+                    printf("decode WG0 U[0]=%e U[31]=%e U[64]=%e Vscale=%08x\n",
+                           plan.kv_u_scale[rs.buf_idx][0],
+                           plan.kv_u_scale[rs.buf_idx][31],
+                           plan.kv_u_scale[rs.buf_idx][64], v_scale_raw);
+                }
+#endif
+
                 // Each warp loads 32 P rows; each lane owns one token and all 64 heads.
                 static_assert(B_H == B_TOPK / 2);
                 float p[B_H];
                 ku::tmem_ld_32dp32bNx<B_H>(
-                    tmem_cols::P + warp_idx * (B_H / 4), p
+                    tmem_cols::P, p
                 );
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
@@ -186,6 +242,14 @@ KernelTemplate<MODEL_TYPE>
                 for (int i = 0; i < B_TOPK / 2; ++i) {
                     p[i] = plan.s_p_scale.p_t[(p_token_base + i) * B_H + p_head];
                 }
+
+#if MXFP8_DECODE_DEBUG_VALUES
+                if (s_q_idx == 0 && partition_idx == 0 && args.batch_idx == 0
+                    && block_idx == args.start_block_idx && idx_in_warpgroup == 0) {
+                    printf("decode P h0 t0..7=%e,%e,%e,%e,%e,%e,%e,%e\n",
+                           p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                }
+#endif
 
                 // Mask
                 uint64_t valid_mask = *(reinterpret_cast<uint64_t*>(plan.is_token_valid[rs.index_buf_idx])
@@ -221,6 +285,9 @@ KernelTemplate<MODEL_TYPE>
                     scale_for_old = exp2f(mi - new_max);
                 }
                 mi = new_max;
+                if (idx_in_warpgroup < B_H) {
+                    plan.head_scale[idx_in_warpgroup] = scale_for_old;
+                }
 
                 // Threads h and h+64 own the two 64-token halves of one head.
                 constexpr int NUM_LOCAL_GROUPS = (B_TOPK / 2) / MXFP8_SCALE_VEC_SIZE;
@@ -229,53 +296,66 @@ KernelTemplate<MODEL_TYPE>
                 float cur_sum = 0.0f;
                 CUTE_UNROLL
                 for (int g = 0; g < NUM_LOCAL_GROUPS; ++g) {
-                    float group_max_logit = -CUDART_INF_F;
+                    float scaled_s_absmax = 0.0f;
                     CUTE_UNROLL
                     for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
                         int local_token = g * MXFP8_SCALE_VEC_SIZE + i;
-                        group_max_logit = max(group_max_logit, p[local_token] * params.sm_scale_div_log2);
-                    }
-
-                    float group_max_s = exp2f(group_max_logit - new_max);
-                    e8m0 scale_g = e8m0(group_max_s > 0.0f ? group_max_s / FP8_MAX : 1.0f);
-                    float inv_scale = 1.0f / float(scale_g);
-                    int group_token = token_base + g * MXFP8_SCALE_VEC_SIZE;
-                    sS_scale(h, group_token, _0{}) = scale_g;
-
-                    CUTE_UNROLL
-                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
-                        int local_token = g * MXFP8_SCALE_VEC_SIZE + i;
+                        int token = token_base + local_token;
                         float s_val = exp2f(p[local_token] * params.sm_scale_div_log2 - new_max);
                         cur_sum += s_val;
-                        sS(h, group_token + i) = e4m3(s_val * inv_scale);
+
+                        // scale(t, g) = U(t) * W(g): absorb U(t) before
+                        // quantizing S; W(g) is applied in the epilogue.
+                        float scaled_s = s_val * plan.kv_u_scale[rs.buf_idx][token];
+                        p[local_token] = scaled_s;
+                        scaled_s_absmax = max(scaled_s_absmax, scaled_s);
+                    }
+
+                    e8m0 scale_g = e8m0(
+                        scaled_s_absmax > 0.0f ? scaled_s_absmax / FP8_MAX : 1.0f
+                    );
+                    float inv_scale = 1.0f / float(scale_g);
+                    int group_token = token_base + g * MXFP8_SCALE_VEC_SIZE;
+                    int global_group = group_token / MXFP8_SCALE_VEC_SIZE;
+                    sS_scale(
+                        h,
+                        _0{},
+                        make_coord(global_group % SCALE_GROUPS_PER_TMEM_BLOCK, _0{})
+                    ) = scale_g;
+
+#if MXFP8_DECODE_DEBUG_VALUES
+                    if (s_q_idx == 0 && partition_idx == 0 && args.batch_idx == 0
+                        && block_idx == args.start_block_idx && idx_in_warpgroup == 0 && g == 0) {
+                        printf("decode WG0 scaled_s0=%e absmax=%e S_scale_bits=%02x\n",
+                               p[0], scaled_s_absmax,
+                               reinterpret_cast<uint8_t*>(&scale_g)[0]);
+                    }
+#endif
+
+                    CUTE_UNROLL
+                    for (int i = 0; i < MXFP8_SCALE_VEC_SIZE; ++i) {
+                        int local_token = g * MXFP8_SCALE_VEC_SIZE + i;
+                        sS(h, group_token + i) = e4m3(p[local_token] * inv_scale);
                     }
                 }
                 li = fma(li, scale_for_old, cur_sum);
 
-                // Scale O in tmem (only when should_scale_o and not first block)
-                if (block_idx != args.start_block_idx && should_scale_o) {
-                    float2 scale_for_old_float2 = float2 {scale_for_old, scale_for_old};
-                    ku::tcgen05_after_thread_sync();
-
-                    static constexpr int CHUNK_SIZE = 64;
-                    float2 o[CHUNK_SIZE/2];
-                    CUTE_UNROLL
-                    for (int chunk_idx = 0; chunk_idx < (D_V/2)/CHUNK_SIZE; ++chunk_idx) {
-                        ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(tmem_cols::O + chunk_idx*CHUNK_SIZE, o);
-                        cutlass::arch::fence_view_async_tmem_load();
-
-                        CUTE_UNROLL
-                        for (int i = 0; i < CHUNK_SIZE/2; ++i) {
-                            o[i] = ku::float2_mul(o[i], scale_for_old_float2);
-                        }
-
-                        ku::tmem_st_32dp32bNx<CHUNK_SIZE>(tmem_cols::O + chunk_idx*CHUNK_SIZE, o);
-                        cutlass::arch::fence_view_async_tmem_store();
-                    }
-                    ku::tcgen05_before_thread_sync();
+                if (block_idx != args.start_block_idx) {
+                    int prev_buf = (rs.buf_idx + NUM_BUFS - 1) % NUM_BUFS;
+                    bool prev_phase = rs.bar_phase ^ (rs.buf_idx == 0);
+                    plan.bar_sv_done[prev_buf].wait(prev_phase);
                 }
 
                 fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                if (block_idx != args.start_block_idx) {
+                    ku::tcgen05_after_thread_sync();
+                    rescale_o_tmem<B_H, B_TOPK, tmem_cols::O, D_V>(
+                        plan.head_scale
+                    );
+                    ku::tcgen05_before_thread_sync();
+                    NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                }
                 plan.bar_so_ready[rs.buf_idx].arrive();
 
                 if (block_idx != args.end_block_idx-1) {
@@ -315,69 +395,80 @@ KernelTemplate<MODEL_TYPE>
                 cudaTriggerProgrammaticLaunchCompletion();
             }
 
+            if (idx_in_warpgroup < B_H) {
+                float denominator = args.is_no_split
+                    ? li + exp2f(attn_sink - mi)
+                    : li; // The combine kernel handles attention sink for split output.
+                plan.rowwise_max_buf[idx_in_warpgroup] = li == 0.0f
+                    ? 0.0f
+                    : __fdividef(1.0f, denominator);
+            }
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+
+            float o_head[B_H];
             if (args.is_no_split) {
+                CUTE_UNROLL
+                for (int tile = 0; tile < D_V/B_TOPK; ++tile) {
+                    int dv = tile*B_TOPK + idx_in_warpgroup;
+                    ku::tmem_ld_32dp32bNx<B_H>(
+                        tmem_cols::O + tile*B_H, o_head
+                    );
+                    cutlass::arch::fence_view_async_tmem_load();
+                    int w_group = dv / K_QUANT_GROUP_SIZE;
+                    float w_scale = ue8m0_bits_to_float(
+                        static_cast<uint8_t>(w_scale_bits >> (w_group * 8))
+                    );
+                    CUTE_UNROLL
+                    for (int h = 0; h < B_H; ++h) {
+                        sO(h, dv) = bf16(
+                            o_head[h] * plan.rowwise_max_buf[h] * w_scale
+                        );
+                    }
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+
                 Tensor tma_gO = flat_divide(
                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, args.batch_idx),
-                    Shape<Int<B_H>, Int<64>>{}
+                    Shape<Int<B_H>, Int<B_EPI>>{}
                 )(_, _, _0{}, _);
-                auto thr_tma = tma_params.tma_O.get_slice(_0{});
                 Tensor tma_sO = flat_divide(
                     sO,
-                    Shape<Int<B_H>, Int<64>>{}
+                    Shape<Int<B_H>, Int<B_EPI>>{}
                 )(_, _, _0{}, _);
-
-                float o_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li + exp2f(attn_sink - mi));
-                float2 o_scale_float2 = {o_scale, o_scale};
-                float2 o[B_EPI/2];
-                __nv_bfloat162 o_bf16[B_EPI/2];
+                auto thr_tma = tma_params.tma_O.get_slice(_0{});
                 CUTE_UNROLL
-                for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
-                    ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + i*B_EPI, o);
-                    cutlass::arch::fence_view_async_tmem_load();
-                    CUTE_UNROLL
-                    for (int j = 0; j < B_EPI/2; ++j) {
-                        o[j] = ku::float2_mul(o[j], o_scale_float2);
-                        o_bf16[j] = __float22bfloat162_rn(o[j]);
-                    }
-                    int col_base = (i*B_EPI>=D_V/4 ? D_V/2 : 0) + (i*B_EPI%(D_V/4));
-                    CUTE_UNROLL
-                    for (int j = 0; j < B_EPI / 8; ++j)
-                        *(__int128_t*)(sO_bases[j] + col_base*B_H) = *(__int128_t*)(&o_bf16[j*4]);
-                    fence_view_async_shared();
-                    NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                for (int tile = 0; tile < D_V/B_EPI; ++tile) {
                     if (warp_idx == 0 && elect_one_sync()) {
                         cute::copy(
                             tma_params.tma_O,
-                            thr_tma.partition_S(tma_sO(_, _, col_base/64)),
-                            thr_tma.partition_D(tma_gO(_, _, col_base/64))
-                        );
-                    }
-                    if (warp_idx == 1 && elect_one_sync()) {
-                        cute::copy(
-                            tma_params.tma_O,
-                            thr_tma.partition_S(tma_sO(_, _, col_base/64 + (D_V/4)/64)),
-                            thr_tma.partition_D(tma_gO(_, _, col_base/64 + (D_V/4)/64))
+                            thr_tma.partition_S(tma_sO(_, _, tile)),
+                            thr_tma.partition_D(tma_gO(_, _, tile))
                         );
                     }
                 }
                 cute::tma_store_arrive();
             } else {
-                float o_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li);   // leave attn_sink to the combine kernel
-                float2 o_scale_float2 = {o_scale, o_scale};
-                constexpr int B_EPI = 64;
-                float2 o[B_EPI/2];
-                Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.o_accum_buf.data()), SmemLayoutOAccumBuf{});
+                Tensor sO_accum = make_tensor(
+                    make_smem_ptr(plan.kvo.o.o_accum_buf.data()),
+                    SmemLayoutOAccumBuf{}
+                );
                 CUTE_UNROLL
-                for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
-                    ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + i*B_EPI, o);
+                for (int tile = 0; tile < D_V/B_TOPK; ++tile) {
+                    int dv = tile*B_TOPK + idx_in_warpgroup;
+                    ku::tmem_ld_32dp32bNx<B_H>(
+                        tmem_cols::O + tile*B_H, o_head
+                    );
                     cutlass::arch::fence_view_async_tmem_load();
+                    int w_group = dv / K_QUANT_GROUP_SIZE;
+                    float w_scale = ue8m0_bits_to_float(
+                        static_cast<uint8_t>(w_scale_bits >> (w_group * 8))
+                    );
                     CUTE_UNROLL
-                    for (int j = 0; j < B_EPI/2; ++j)
-                        o[j] = ku::float2_mul(o[j], o_scale_float2);
-                    int col_base = (idx_in_warpgroup/64)*128 + (i*B_EPI >= D_V/4 ? D_V/2 : 0) + (i*B_EPI%(D_V/4));
-                    CUTE_UNROLL
-                    for (int j = 0; j < B_EPI / 4; ++j)
-                        *(__int128_t*)&sO(idx_in_warpgroup%64, col_base + j*4) = *(__int128_t*)(&o[j*2]);
+                    for (int h = 0; h < B_H; ++h) {
+                        sO_accum(h, dv) =
+                            o_head[h] * plan.rowwise_max_buf[h] * w_scale;
+                    }
                 }
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -386,7 +477,7 @@ KernelTemplate<MODEL_TYPE>
                     for (int local_row = 0; local_row < B_H/4; ++local_row) {
                         int smem_row = local_row*4 + warp_idx;
                         SM90_BULK_COPY_S2G::copy(
-                            &sO(smem_row, _0{}),
+                            &sO_accum(smem_row, _0{}),
                             (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + smem_row*params.stride_o_accum_h_q,
                             D_V*sizeof(float)
                         );
@@ -430,7 +521,10 @@ KernelTemplate<MODEL_TYPE>
                 // ===== Prologue: Q-scale TMA (e8m0) =====
                 {
                     Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx, args.batch_idx);
-                    Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_p_scale.q_scale.data()), SmemLayoutQScaleTMA{});
+                    Tensor sQ_scale = make_tensor(
+                        make_smem_ptr(plan.s_p_scale.q_scale.compact.data()),
+                        SmemLayoutQScaleTMA{}
+                    );
                     ku::launch_tma_copy(
                         tma_params.tma_Q_scale,
                         gQ_scale,
@@ -445,10 +539,29 @@ KernelTemplate<MODEL_TYPE>
 
                 // ===== Prologue: Q-scale UTCCP smem -> tmem =====
                 {
+                    Tensor sQ_scale_tma = make_tensor(
+                        make_smem_ptr(plan.s_p_scale.q_scale.compact.data()),
+                        SmemLayoutQScaleTMA{}
+                    );
                     Tensor sQ_scale = make_tensor(
-                        make_smem_ptr(plan.s_p_scale.q_scale.data()),
+                        make_smem_ptr(plan.s_p_scale.q_scale.mma.data()),
                         SmemLayoutPScaleBAtom{}
                     );
+                    CUTE_UNROLL
+                    for (int h = 0; h < B_H; ++h) {
+                        CUTE_UNROLL
+                        for (int g = 0; g < Q_SCALE_BYTES; ++g) {
+                            sQ_scale(
+                                h,
+                                _0{},
+                                make_coord(
+                                    g % SCALE_GROUPS_PER_TMEM_BLOCK,
+                                    g / SCALE_GROUPS_PER_TMEM_BLOCK
+                                )
+                            ) = sQ_scale_tma(h, g);
+                        }
+                    }
+                    fence_view_async_shared();
                     auto sQ_compact = make_tensor(sQ_scale.data(), filter_zeros(sQ_scale.layout()));
                     Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
                     tQ_scale.data().get() = tmem_cols::QScale;
@@ -461,6 +574,43 @@ KernelTemplate<MODEL_TYPE>
                     );
                     auto dst_Q = thr_Q.partition_D(tQ_compact);
                     cute::copy(copy_Q_scale, src_Q, dst_Q);
+                }
+
+                // U(t) is folded into S and W(g) is applied after the SV
+                // GEMM, so the V scale consumed by every MMA is exactly one.
+                {
+                    Tensor sV_scale_one = make_tensor(
+                        make_smem_ptr(plan.v_scale_one.data()),
+                        SmemLayoutOScaleAAtom{}
+                    );
+                    uint8_t* storage = reinterpret_cast<uint8_t*>(
+                        plan.v_scale_one.data()
+                    );
+                    CUTE_NO_UNROLL
+                    for (int i = 0; i < cosize_v<SmemLayoutOScaleAAtom>; ++i) {
+                        storage[i] = UE8M0_ONE_BITS;
+                    }
+                    fence_view_async_shared();
+
+                    Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFA>(
+                        shape(SmemLayoutOScaleAAtom{})
+                    );
+                    tV_scale.data().get() = tmem_cols::VScale;
+                    auto sV_compact = make_tensor(
+                        sV_scale_one.data(), filter_zeros(sV_scale_one.layout())
+                    );
+                    auto tV_compact = make_tensor(
+                        tV_scale.data(), filter_zeros(tV_scale.layout())
+                    );
+                    auto copy_V_scale = make_utccp_copy(
+                        SM100_UTCCP_4x32dp128bit_1cta{}, tV_compact
+                    );
+                    auto thr_V = copy_V_scale.get_slice(0);
+                    auto src_V = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_1cta>(
+                        thr_V.partition_S(sV_compact)
+                    );
+                    auto dst_V = thr_V.partition_D(tV_compact);
+                    cute::copy(copy_V_scale, src_V, dst_V);
                 }
                 ku::umma_arrive_noelect(plan.bar_q_utccp);
                 plan.bar_q_scale_utccp.arrive();
@@ -525,7 +675,7 @@ KernelTemplate<MODEL_TYPE>
                     // UTCCP S scale smem -> tmem
                     {
                         Tensor sS_scale = make_tensor(
-                            make_smem_ptr(plan.s_p_scale.s_scale.data()),
+                            make_smem_ptr(plan.s_scale.data()),
                             SmemLayoutSscale{}
                         );
                         auto sS_compact = make_tensor(sS_scale.data(), filter_zeros(sS_scale.layout()));
@@ -544,12 +694,9 @@ KernelTemplate<MODEL_TYPE>
                     ku::tcgen05_after_thread_sync();
 
                     // VS MMA: O_T = V @ S^T (V in MN-major (D_V, B_TOPK) via composition, S in K-major (B_TOPK, B_H))
-                    // V scale reuses tmem_cols::KScale (same data, since K and V share buffer in MLA).
-                    // tV_scale uses the O atom's SFA layout (different from K's SFA layout, since the
-                    // K-dim of the O MMA is B_TOPK=128, not D_K=512), so we must construct tV_scale
-                    // with `shape(SmemLayoutOScaleAAtom{})` for correct address calculation.
+                    // V uses the unit scale initialized once in the prologue.
                     Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFA>(shape(SmemLayoutOScaleAAtom{}));
-                    tV_scale.data().get() = tmem_cols::KScale;
+                    tV_scale.data().get() = tmem_cols::VScale;
                     Tensor tS_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutSscale{}));
                     tS_scale.data().get() = tmem_cols::SScale;
 
@@ -586,14 +733,19 @@ KernelTemplate<MODEL_TYPE>
                     for (int row = 0; row < B_TOPK; row += 4) {
                         if (row+4 < B_TOPK)
                             nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
-                        ku::tma_gather4(
-                            block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv : &tma_params.tensor_map_kv,
-                            plan.bar_kv_ready[rs.buf_idx],
-                            plan.kvo.kv.kv[rs.buf_idx].data() + D_K*row,
-                            0,
-                            cur_indices,
-                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                        );
+                        CUTE_UNROLL
+                        for (int col = 0; col < D_K/TMA_K_CHUNK_BYTES; ++col) {
+                            ku::tma_gather4(
+                                block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv : &tma_params.tensor_map_kv,
+                                plan.bar_kv_ready[rs.buf_idx],
+                                plan.kvo.kv.kv[rs.buf_idx].data()
+                                    + col*B_TOPK*TMA_K_CHUNK_BYTES
+                                    + row*TMA_K_CHUNK_BYTES,
+                                col*TMA_K_CHUNK_ELEMS,
+                                cur_indices,
+                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                            );
+                        }
                         cur_indices = nxt_cur_indices;
                     }
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
@@ -606,6 +758,12 @@ KernelTemplate<MODEL_TYPE>
             // `plan.kvo.kv.kv_scale[buf]` for tcgen05's 32-element scale vectors.
             // The smem layout is 3D (B_TOPK, D_K, 1)
             // and the scales occupy positions row, g*32 in the (row, K) plane.
+            const uint64_t w_scale_bits = __ldg(
+                reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+            );
+            const uint8_t w_anchor_bits = static_cast<uint8_t>(
+                w_scale_bits >> (KV_SCALE_ANCHOR * 8)
+            );
             run_main_loop([&](const MainLoopArgs &args) {
                 plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
@@ -632,12 +790,35 @@ KernelTemplate<MODEL_TYPE>
                     for (int lr = 0; lr < rows_per_thread; ++lr) {
                         int row = row_base + lr;
                         e8m0* src = scales_base[row];
+                        bool is_token_valid = (
+                            static_cast<uint8_t>(plan.is_token_valid[ib][row / 8])
+                            >> (row % 8)
+                        ) & 1;
+                        uint8_t anchor_bits = reinterpret_cast<uint8_t*>(src)[KV_SCALE_ANCHOR];
+                        plan.kv_u_scale[cur_buf][row] = is_token_valid
+                            ? ue8m0_ratio_to_float(anchor_bits, w_anchor_bits)
+                            : 1.0f;
+#if MXFP8_DECODE_DEBUG_VALUES
+                        if (s_q_idx == 0 && partition_idx == 0 && args.batch_idx == 0
+                            && block_idx == args.start_block_idx && lane_idx == 0 && lr == 0) {
+                            printf("decode WG6 valid=%d anchor=%02x W_anchor=%02x U=%e\n",
+                                   int(is_token_valid), anchor_bits, w_anchor_bits,
+                                   plan.kv_u_scale[cur_buf][row]);
+                        }
+#endif
                         CUTE_UNROLL
                         for (int g = 0; g < K_SCALE_BYTES; ++g) {
                             CUTE_UNROLL
                             for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
                                 int dst_group = g * K_SCALE_DUP + dup;
-                                sK_scale(row, dst_group * MXFP8_SCALE_VEC_SIZE, _0{}) = src[g];
+                                sK_scale(
+                                    row,
+                                    _0{},
+                                    make_coord(
+                                        dst_group % SCALE_GROUPS_PER_TMEM_BLOCK,
+                                        dst_group / SCALE_GROUPS_PER_TMEM_BLOCK
+                                    )
+                                ) = src[g];
                             }
                         }
                     }
@@ -767,6 +948,9 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnMxfp8DecodeParams &params) 
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
+    KU_ASSERT(params.kv_scale_w != nullptr);
+    KU_ASSERT(reinterpret_cast<int64_t>(params.kv_scale_w) % 8 == 0,
+        "kv_scale_w must be 8-byte aligned");
     // Each Q token is D_Q e4m3 + D_Q/32 e8m0 = 512 + 16 = 528 bytes
     constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
     KU_ASSERT(params.stride_q_h_q == Q_BYTES_PER_TOKEN,
@@ -822,12 +1006,12 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnMxfp8DecodeParams &params) 
         return ku::make_tensor_map(
             {D_K/8, (uint64_t)num_blocks * (k_block_stride/TMA_K_STRIDE)},
             {TMA_K_STRIDE},
-            {D_K/8, 1},
+            {TMA_K_CHUNK_ELEMS, 1},
             k_ptr,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        );  // pack 8 e4m3 into 1 INT64 (TMA box dim < 256)
+        );  // Four 128-byte chunks form one SW128 K row.
     };
 
     CUtensorMap tensor_map_kv = get_kv_tensormap(params.kv, params.num_blocks, params.stride_kv_block);

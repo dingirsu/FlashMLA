@@ -15,6 +15,10 @@
 
 namespace sm100::decode::mxfp8_head64 {
 
+#ifndef MXFP8_DECODE_DEBUG_VALUES
+#define MXFP8_DECODE_DEBUG_VALUES 0
+#endif
+
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
 using e8m0 = cutlass::float_ue8m0_t;
@@ -42,12 +46,17 @@ static constexpr int D_Q = 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
 static constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+static constexpr int SCALE_GROUPS_PER_TMEM_BLOCK = 4;
 static constexpr int Q_QUANT_GROUP_SIZE = 32;
 static constexpr int K_QUANT_GROUP_SIZE = 64;
 static constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;  // 16
 static constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;  // 8
 static constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;  // 2
+static constexpr int KV_SCALE_ANCHOR = 0;
+static constexpr uint8_t UE8M0_ONE_BITS = 0x7f;
 static constexpr int TMA_K_STRIDE = D_K;  // 512 — pure e4m3, no per-token scales interleaved
+static constexpr int TMA_K_CHUNK_BYTES = 128;
+static constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 128;
 static constexpr int K_SCALE_SMEM_ELEMS = B_TOPK * K_SCALE_BYTES * K_SCALE_DUP;  // 128 * 16 = 2048
@@ -76,15 +85,17 @@ struct TmaParams {
 struct tmem_cols {
     //   0 ~ 256: O (D_V / 2 cols of 32-bit FP32 per row, fp32 acc)
     // 256 ~ 320: unused
-    // 320 ~ 338: Q scale (e8m0)        (Q_Scale: 16 cols)
-    // 338 ~ 356: K/V scale (e8m0)      (K_Scale: 16 cols, reused for V after QK^T)
+    // 320 ~ 340: Q scale (e8m0)        (16 cols + padding)
+    // 340 ~ 356: K scale (e8m0)        (16 cols)
     // 356 ~ 376: S scale (e8m0)        (S_Scale: 16 cols + 4 cols padding)
     // 400 ~ 464: P (fp32, (B_TOPK, B_H) = 128x64)  (P: 64 cols)
+    // 464 ~ 480: unit V scale (e8m0)
     static constexpr int O = 0;
     static constexpr int QScale = 320;
     static constexpr int KScale = 340;
     static constexpr int SScale = 356;
     static constexpr int P = 400;
+    static constexpr int VScale = 464;
 };
 
 template<int NUM_TILES>
@@ -143,9 +154,7 @@ using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
-// Atom layouts derived from the MMA tiles — needed for the UTCCP src layout
-// of the S scales and V scales (tV_scale uses the O atom's SFA even though the
-// data is physically written by the KQ MMA's SFA UTCCP).
+// Atom layouts derived from the MMA tiles for the UTCCP scale copies.
 using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
     TiledMMA_P{}, Shape<Int<B_TOPK>, Int<B_H>, Int<D_K>>{}
 ));
@@ -161,6 +170,8 @@ using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
 
 // S scale smem layout (S is the B operand of the VS GEMM, so its scales are SFB)
 using SmemLayoutSscale = SmemLayoutOScaleBAtom;
+
+static_assert(cosize_v<SmemLayoutOScaleAAtom> <= cosize_v<SmemLayoutSscale>);
 
 // Q scale smem layout for TMA (a simple (B_H, Q_SCALE_BYTES) layout)
 using SmemLayoutQScaleTMA = Layout<
@@ -183,13 +194,19 @@ struct SharedMemoryPlan {
     union {
         float p_t[B_TOPK * B_H];
         array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
-        array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> q_scale;
-        array_aligned<e8m0, cosize_v<SmemLayoutSscale>> s_scale;
+        struct {
+            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> compact;
+            array_aligned<e8m0, cosize_v<SmemLayoutPScaleBAtom>> mma;
+        } q_scale;
     } s_p_scale;
+    array_aligned<e8m0, cosize_v<SmemLayoutSscale>> s_scale;
+    array_aligned<e8m0, cosize_v<SmemLayoutOScaleAAtom>> v_scale_one;
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
+    float head_scale[B_H];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     e8m0 scales[NUM_INDEX_BUFS][B_TOPK][K_SCALE_BYTES];
+    float kv_u_scale[NUM_BUFS][B_TOPK];
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;
@@ -199,6 +216,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
 };
+
+static_assert(tmem_cols::VScale < 512);
+static_assert(sizeof(SharedMemoryPlan) < 227 * 1024, "MXFP8 decode shared memory exceeds the SM100 limit");
 
 template<typename TmaParam>
 static __device__ void

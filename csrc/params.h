@@ -112,6 +112,7 @@ struct SparseAttnMxfp8DecodeParams {
 
     void* __restrict__ q;   // [b, s_q, h_q, d_qk]
     void* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]
+    uint8_t* __restrict__ kv_scale_w;  // [8] UE8M0 W(g), anchor group is 0
     int* __restrict__ indices;   // [b, s_q, topk]
     int* __restrict__ topk_length;  // [b], may be nullptr
     float* __restrict__ attn_sink;  // [h_q], may be nullptr

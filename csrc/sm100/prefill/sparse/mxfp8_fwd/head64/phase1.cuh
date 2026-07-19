@@ -395,7 +395,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     for (int producer = 0; producer < NUM_KV_PRODUCER_WARPS; ++producer) {
                         all_invalid &= !plan.kv_warp_has_valid[cur_buf][producer];
                     }
-                    plan.kv_skip_tma[cur_buf] = all_invalid || !MXFP8_PREFILL_LOAD_KV;
+                    plan.kv_skip_tma[cur_buf] = all_invalid;
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
                 }
             }

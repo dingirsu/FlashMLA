@@ -46,31 +46,31 @@ NVCC_FLAGS=(
     --compiler-options=-fPIC
 )
 
-# "$CXX" \
-#     "${INCLUDES[@]}" \
-#     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \
-#     -D_GLIBCXX_USE_CXX11_ABI=1 \
-#     -DTORCH_EXTENSION_NAME=mxfp8_test_ext \
-#     -fPIC -c \
-#     "$ROOT/tests/mxfp8_test_ext.cpp" \
-#     -o /tmp/mxfp8_api_pic.o
+"$CXX" \
+    "${INCLUDES[@]}" \
+    -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \
+    -D_GLIBCXX_USE_CXX11_ABI=1 \
+    -DTORCH_EXTENSION_NAME=mxfp8_test_ext \
+    -fPIC -c \
+    "$ROOT/tests/mxfp8_test_ext.cpp" \
+    -o /tmp/mxfp8_api_pic.o
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/decode/mxfp8_head64/instantiations/model1.cu" \
     -o /tmp/mxfp8_decode_pic.o
 
-# "$NVCC" "${NVCC_FLAGS[@]}" \
-#     -DMXFP8_PREFILL_LOAD_KV=1 \
-#     "$ROOT/csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu" \
-#     -o /tmp/mxfp8_prefill_pic.o
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    -DMXFP8_PREFILL_LOAD_KV=1 \
+    "$ROOT/csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu" \
+    -o /tmp/mxfp8_prefill_pic.o
 
-# "$NVCC" "${NVCC_FLAGS[@]}" \
-#     "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
-#     -o /tmp/mxfp8_sched_pic.o
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
+    -o /tmp/mxfp8_sched_pic.o
 
-# "$NVCC" "${NVCC_FLAGS[@]}" \
-#     "$ROOT/csrc/smxx/decode/combine/combine.cu" \
-#     -o /tmp/mxfp8_combine_pic.o
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/smxx/decode/combine/combine.cu" \
+    -o /tmp/mxfp8_combine_pic.o
 
 "$CXX" -shared \
     /tmp/mxfp8_api_pic.o \

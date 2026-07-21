@@ -131,7 +131,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_qk_done[i].init(1);
             plan.bar_sv_done[i].init(1);
             plan.bar_kv_ready[i].init(1);
-            plan.bar_kv_scale_ready[i].init(NUM_KV_PRODUCER_WARPS);
+            plan.bar_kv_scale_ready[i].init(2);
             plan.bar_k_valid_ready[i].init(B_TOPK/8);
             plan.bar_k_valid_free[i].init(128);
         }
@@ -176,7 +176,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_p_free.arrive();
             int k_row = warp_idx * 32 + lane_idx;
             for (int h = 0; h < B_H; ++h) {
-                plan.p_t[h + B_H * k_row] = p[h]; // How to improve the transpose efficiency here?
+                plan.p_t[h + P_T_STRIDE * k_row] = p[h]; // How to improve the transpose efficiency here?
             }
 
             if (idx_in_warpgroup < B_H) {
@@ -192,11 +192,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 for (int i = 0; i < 32; ++i) {
                     int kk = i + 32 * g;
                     bool is_valid = ((plan.is_k_valid[k%NUM_BUFS][kk/8] >> (kk&7)) & 1) != 0;
-                    float p_val = is_valid ? plan.p_t[kk*B_H + h] : -CUDART_INF_F;
+                    float p_val = is_valid ? plan.p_t[kk*P_T_STRIDE + h] : -CUDART_INF_F;
                     p_val *= params.sm_scale_div_log2;
                     absmax_p[g] = max(absmax_p[g], p_val);
                     cur_pi_max = max(cur_pi_max, p_val);
-                    plan.p_t[kk*B_H + h] = p_val;
+                    plan.p_t[kk*P_T_STRIDE + h] = p_val;
                 }
             }
             
@@ -215,13 +215,13 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 CUTE_UNROLL
                 for (int i = 0; i < 32; ++i) {
                     int kk = i + g * 32;
-                    float s_val = exp2f(plan.p_t[kk*B_H + h] - new_max);
+                    float s_val = exp2f(plan.p_t[kk*P_T_STRIDE + h] - new_max);
                     cur_sum += s_val;
 
                     // Absorb the token-dependent U(t) before choosing the S
                     // quantization scale. li intentionally uses the unscaled S.
                     float scaled_s = s_val * plan.kv_u_scale[k%NUM_BUFS][kk];
-                    plan.p_t[kk*B_H + h] = scaled_s;
+                    plan.p_t[kk*P_T_STRIDE + h] = scaled_s;
                     scaled_s_absmax = max(scaled_s_absmax, scaled_s);
                 }
 
@@ -237,7 +237,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 CUTE_UNROLL
                 for (int i = 0; i < 32; ++i) {
                     int kk = i + g * 32;
-                    sS_out(h, kk) = e4m3(plan.p_t[kk*B_H + h] / float(scale_g));
+                    sS_out(h, kk) = e4m3(plan.p_t[kk*P_T_STRIDE + h] / float(scale_g));
                 }
             }
             plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
@@ -343,26 +343,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         // Producer warp for KV
         int producer_warp_idx = cutlass::canonical_warp_idx_sync() - 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_KV_PRODUCER_WARPS;
-        // KV is one packed page: all e4m3 rows first, followed by all
-        // per-token UE8M0 scales at the end of the page.
-        const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
-            + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
-        uint8_t w_anchor_bits = 0;
-        if (elect_one_sync()) {
-            uint64_t w_scale_bits = __ldg(
-                reinterpret_cast<const uint64_t*>(params.kv_scale_w)
-            );
-            w_anchor_bits = static_cast<uint8_t>(
-                w_scale_bits >> (KV_SCALE_ANCHOR * 8)
-            );
-        }
-
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
             int4 indices[NUM_LOCAL_ROWS_PER_WARP];
             if (elect_one_sync()) {
-                // Copy NoPE data with gather4. Scale factors are scattered into the
-                // SM100 block-scale SFA shared layout expected by tcgen05 block_scale MMA.
+                // Copy NoPE data with gather4.
                 int cur_buf = k%NUM_BUFS;
                 plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
 
@@ -423,9 +408,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             }
 
             if (elect_one_sync()) {
-                Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK{});
-                Tensor sK_scale = make_tensor(make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()), SmemLayoutPScaleAAtom{});
-
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                     if (!plan.kv_skip_tma[cur_buf]) {
@@ -446,42 +428,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         }
                     }
 
-                    CUTE_UNROLL
-                    for (int i = 0; i < 4; ++i) {
-                        int src_idx = reinterpret_cast<int*>(&indices[local_row])[i];
-                        int row = local_row*(4*NUM_KV_PRODUCER_WARPS) + producer_warp_idx*4 + i;
-                        alignas(8) e8m0 scale[K_SCALE_BYTES];
-                        if (src_idx >= 0) {
-                            const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
-                                + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;
-                            *reinterpret_cast<uint64_t*>(scale) = __ldg(reinterpret_cast<const uint64_t*>(src_scale));
-                            uint8_t anchor_bits = reinterpret_cast<uint8_t*>(scale)[KV_SCALE_ANCHOR];
-                            plan.kv_u_scale[cur_buf][row] = ue8m0_ratio_to_float(
-                                anchor_bits, w_anchor_bits
-                            );
-                        } else {
-                            *reinterpret_cast<uint64_t*>(scale) = 0;
-                            plan.kv_u_scale[cur_buf][row] = 1.0f;
-                        }
-                        CUTE_UNROLL
-                        for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
-                            CUTE_UNROLL
-                            for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
-                                int dst_sf_idx = src_sf_idx*K_SCALE_DUP + dup;
-                                sK_scale(
-                                    row,
-                                    _0{},
-                                    make_coord(
-                                        dst_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
-                                        dst_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
-                                    )
-                                ) = scale[src_sf_idx];
-                            }
-                        }
-                    }
                 }
-                fence_view_async_shared();
-                plan.bar_kv_scale_ready[cur_buf].arrive();
             }
         }
     } else {
@@ -683,6 +630,81 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 }
             }
         } else if (warp_idx == 10 || warp_idx == 11) {
+            // Two warps cooperatively gather the page-tail KV scales and
+            // scatter them into the block-scaled MMA layout.
+            constexpr int NUM_SCALE_PRODUCER_WARPS = 2;
+            constexpr int NUM_ROWS_PER_SCALE_WARP = B_TOPK / NUM_SCALE_PRODUCER_WARPS;
+            constexpr int NUM_ROWS_PER_SCALE_LANE = NUM_ROWS_PER_SCALE_WARP / 32;
+            const int scale_warp_idx = warp_idx - 10;
+            const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
+                + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
+
+            int w_anchor_bits = 0;
+            if (lane_idx == 0) {
+                uint64_t w_scale_bits = __ldg(
+                    reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+                );
+                w_anchor_bits = static_cast<uint8_t>(
+                    w_scale_bits >> (KV_SCALE_ANCHOR * 8)
+                );
+            }
+            w_anchor_bits = __shfl_sync(0xffffffff, w_anchor_bits, 0);
+
+            CUTE_NO_UNROLL
+            for (int k = 0; k < num_k_blocks; ++k) {
+                int cur_buf = k % NUM_BUFS;
+                plan.bar_sv_done[cur_buf].wait((k / NUM_BUFS) & 1 ^ 1);
+                Tensor sK_scale = make_tensor(
+                    make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
+                    SmemLayoutPScaleAAtom{}
+                );
+
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < NUM_ROWS_PER_SCALE_LANE; ++local_row) {
+                    int row = scale_warp_idx * NUM_ROWS_PER_SCALE_WARP
+                        + local_row * 32 + lane_idx;
+                    int src_idx = __ldg(gIndices + k * B_TOPK + row);
+                    if (src_idx < 0 || src_idx >= params.s_kv || k * B_TOPK + row >= topk_length) {
+                        src_idx = -1;
+                    }
+
+                    alignas(8) e8m0 scale[K_SCALE_BYTES];
+                    if (src_idx >= 0) {
+                        const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
+                            + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;
+                        *reinterpret_cast<uint64_t*>(scale) = __ldg(
+                            reinterpret_cast<const uint64_t*>(src_scale)
+                        );
+                        uint8_t anchor_bits = reinterpret_cast<uint8_t*>(scale)[KV_SCALE_ANCHOR];
+                        plan.kv_u_scale[cur_buf][row] = ue8m0_ratio_to_float(
+                            anchor_bits, static_cast<uint8_t>(w_anchor_bits)
+                        );
+                    } else {
+                        *reinterpret_cast<uint64_t*>(scale) = 0;
+                        plan.kv_u_scale[cur_buf][row] = 1.0f;
+                    }
+
+                    CUTE_UNROLL
+                    for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
+                        CUTE_UNROLL
+                        for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
+                            int dst_sf_idx = src_sf_idx * K_SCALE_DUP + dup;
+                            sK_scale(
+                                row,
+                                _0{},
+                                make_coord(
+                                    dst_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
+                                    dst_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
+                                )
+                            ) = scale[src_sf_idx];
+                        }
+                    }
+                }
+                fence_view_async_shared();
+                if (elect_one_sync()) {
+                    plan.bar_kv_scale_ready[cur_buf].arrive();
+                }
+            }
         }
     }
 

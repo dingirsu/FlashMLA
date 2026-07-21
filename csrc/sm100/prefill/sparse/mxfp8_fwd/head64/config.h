@@ -50,6 +50,7 @@ constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 128;
+constexpr int P_T_STRIDE = B_H + 1;
 constexpr int NUM_BUFS = 2;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
@@ -171,7 +172,7 @@ struct SharedMemoryPlan {
     char kv_warp_has_valid[NUM_BUFS][NUM_KV_PRODUCER_WARPS];
     char kv_skip_tma[NUM_BUFS];
     float kv_u_scale[NUM_BUFS][B_TOPK];
-    float p_t[B_TOPK*B_H];
+    float p_t[B_TOPK*P_T_STRIDE];
     transac_bar_t bar_prologue_q, bar_prologue_q_scale;
     transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)

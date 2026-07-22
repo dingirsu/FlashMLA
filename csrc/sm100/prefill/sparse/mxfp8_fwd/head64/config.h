@@ -70,11 +70,11 @@ namespace tmem_cols {
     //   0 ~ 256: output
     // 400 ~ 464: P
     constexpr int O = 0;
-    constexpr int Q_Scale = 320;
-    constexpr int K_Scale = 340;
-    constexpr int S_Scale = 356;
-    constexpr int P = 400;
-    constexpr int V_Scale = 464;
+    constexpr int Q_Scale = 256;
+    constexpr int K_Scale = 260;
+    constexpr int S_Scale = 264;
+    constexpr int P = 268;
+    constexpr int V_Scale = 332;
 }
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
@@ -128,7 +128,7 @@ using TiledMMA_P = decltype(make_tiled_mma( // make the type name shorter
 ));
 
 using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, B_TOPK, B_H, UMMA::Major::MN, UMMA::Major::K>{}
+    SM100_MMA_MXF8F6F4_SS_NOELECT<e4m3, e4m3, float, e8m0, Int<128>{}, B_H, UMMA::Major::MN, UMMA::Major::K>{}
 ));
 
 using SmemLayoutPScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
@@ -141,11 +141,11 @@ using SmemLayoutPScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
 ));
 using SmemLayoutOScaleBAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFB(
     TiledMMA_O{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+    Shape<Int<128>, Int<B_H>, Int<B_TOPK>>{}
 ));
 using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>::deduce_smem_layoutSFA(
     TiledMMA_O{},
-    Shape<Int<B_TOPK>, Int<B_H>, Int<B_TOPK>>{}
+    Shape<Int<128>, Int<B_H>, Int<B_TOPK>>{}
 ));
 
 static_assert(cosize_v<SmemLayoutOScaleAAtom> <= cosize_v<SmemLayoutOScaleBAtom>);

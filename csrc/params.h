@@ -280,12 +280,11 @@ struct Head64Fp8SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
 
-    // Q uses 32-value groups with per-token scales. KV uses 64-value groups
-    // and stores the scale plane after all e4m3 rows in the packed page.
-    void* __restrict__ q;          // [s_q, h_q, 512 e4m3]
-    void* __restrict__ kv;         // packed [s_kv*h_kv*512 data][s_kv scales]
+    // Each Q token stores [64 * 512 e4m3][64 UE8M0 head scales].
+    // Each KV token stores [512 e4m3][1 UE8M0 token scale].
+    void* __restrict__ q;
+    void* __restrict__ kv;
     uint8_t* __restrict__ kv_scale_w; // [8] UE8M0 W(g), anchor group is 0
-    float* __restrict__ q_head_scale; // [s_q, h_q] float q per token per head float scale
     int* __restrict__ indices;     // [s_q, h_kv, topk]
     float* __restrict__ attn_sink; // [h_q], may be nullptr
     int* __restrict__ topk_length; // [s_q], may be nullptr

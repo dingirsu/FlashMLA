@@ -109,22 +109,24 @@ def _round_up_ue8m0(x: torch.Tensor) -> torch.Tensor:
 
 
 def _qk_mma_tiles(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Mirror the two 128x256 by 256x64 dual-QK products."""
+    """Mirror CUDA's duplicated-Q 128x512 by 512x64 product."""
     h_q = q.shape[0]
-    partials = []
-    for q_view in range(2):
-        partial = torch.zeros(
-            (h_q, B_TOPK), dtype=torch.float32, device=q.device
+    q_dup = torch.cat((q, q), dim=0)
+    p_dup = torch.zeros(
+        (2 * h_q, B_TOPK), dtype=torch.float32, device=q.device
+    )
+    for d_start in range(0, D_HEAD, MMA_K):
+        d_end = d_start + MMA_K
+        p_dup.add_(
+            q_dup[:, d_start:d_end]
+            @ k[:, d_start:d_end].transpose(0, 1)
         )
-        for block_start in range(q_view * 128, D_HEAD, 256):
-            for d_start in range(block_start, block_start + 128, MMA_K):
-                d_end = d_start + MMA_K
-                partial.add_(
-                    q[:, d_start:d_end]
-                    @ k[:, d_start:d_end].transpose(0, 1)
-                )
-        partials.append(partial)
-    return partials[0] + partials[1]
+
+    # CUDA rows [0, 64) consume tokens [0, 32), while duplicated rows
+    # [64, 128) consume tokens [32, 64).
+    return torch.cat(
+        (p_dup[:h_q, : MMA_K], p_dup[h_q:, MMA_K:]), dim=1
+    )
 
 
 def _sv_mma_tiles(

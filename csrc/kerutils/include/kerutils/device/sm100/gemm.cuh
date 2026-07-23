@@ -904,16 +904,14 @@ struct SM100_MMA_F8F6F4_WS_TS_NOELECT
   {
 #if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
   
-      uint32_t mask[4] = {0, 0, 0, 0};
       asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.ws.cta_group::1.kind::f8f6f4 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p; \n\t"
+        "tcgen05.mma.ws.cta_group::1.kind::f8f6f4 [%0], [%1], %2, %3, p, 0; \n\t"
         "}\n"
         :
-        : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
-          "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+        : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC));
 #else
     CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F8F6F4_WS_TS_NOELECT without CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
 #endif

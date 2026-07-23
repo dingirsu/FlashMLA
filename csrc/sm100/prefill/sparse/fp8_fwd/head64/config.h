@@ -16,7 +16,7 @@ using e8m0 = cutlass::float_ue8m0_t;
 
 template<
     typename Shape_O, typename TMA_O,
-    typename Shape_Q, typename TMA_Q,
+    typename Shape_Q, typename TMA_Q
 >
 struct TmaParams {
     Shape_O shape_O; TMA_O tma_O;
@@ -28,6 +28,7 @@ constexpr int D = 512;
 constexpr int D_Q = D;
 constexpr int D_K = D;
 constexpr int D_V = 512;
+constexpr int KV_SCALE_GROUPS = D_V / 64;
 
 constexpr int KV_SCALE_ANCHOR = 0;
 constexpr int TMA_K_CHUNK_BYTES = 128;
@@ -79,7 +80,7 @@ using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
 using SmemLayoutK = SmemLayoutKTiles<8>;
 
 using SmemLayoutK_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<bf16>{},
+    UMMA::Layout_K_SW128_Atom<e4m3>{},
     Shape<Int<B_TOPK*2>, Int<D_V/2>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
@@ -109,11 +110,14 @@ struct SharedMemoryPlan {
     float p_exchange_buf[4][32 * (B_TOPK/2)];
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
     float kv_dim_scale[NUM_BUFS][B_TOPK];
+    float q_head_scale[B_H];
+    float kv_w_scale[KV_SCALE_GROUPS];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
-    transac_bar_t bar_prologue, bar_prologue_utccp;
+    transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
     transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
     transac_bar_t bar_kv_ready[NUM_BUFS][2];
+    transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
     transac_bar_t bar_so_ready;   // S and O are ready
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];

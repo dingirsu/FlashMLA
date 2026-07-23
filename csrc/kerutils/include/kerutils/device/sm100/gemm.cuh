@@ -1026,12 +1026,10 @@ struct SM100_MMA_F8F6F4_WS_SS_NOELECT
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
           UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
-struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT, a_type, b_type, c_type,
-                  cute::C<M>, cute::C<N>,
-                  cute::integral_constant<UMMA::Major, a_major>,
-                  cute::integral_constant<UMMA::Major, b_major>,
-                  cute::integral_constant<UMMA::ScaleIn, a_neg>,
-                  cute::integral_constant<UMMA::ScaleIn, b_neg>>
+struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
+                  M, N,
+                  a_major, b_major,
+                  a_neg, b_neg>>
 {
   using ValTypeD = c_type;
   using ValTypeA = a_type;
@@ -1089,7 +1087,10 @@ struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT, a_type, b_type, c_type,
     uint32_t tmem_c = raw_pointer_cast(D.data());
     uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
 
-    SM100_MMA_F8F6F4_WS_SS_NOELECT::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+    SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
+                  M, N,
+                  a_major, b_major,
+                  a_neg, b_neg>::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
   }
 };
 

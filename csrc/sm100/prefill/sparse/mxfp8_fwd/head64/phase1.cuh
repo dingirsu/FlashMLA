@@ -92,18 +92,16 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     TiledMMA tiled_mma_P = TiledMMA_P{};
     TiledMMA tiled_mma_O = TiledMMA_O{};
 
-    Tensor tP0 = partition_fragment_C(tiled_mma_P, Shape<Int<QK_M>, Int<B_H>>{});
-    Tensor tP1 = partition_fragment_C(tiled_mma_P, Shape<Int<QK_M>, Int<B_H>>{});
-    Tensor tQ_scale0 = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
-    Tensor tQ_scale1 = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
-    Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
+    Tensor tP0 = partition_fragment_C(tiled_mma_P, Shape<Int<QK_M>, Int<QK_N>>{});
+    Tensor tP1 = partition_fragment_C(tiled_mma_P, Shape<Int<QK_M>, Int<QK_N>>{});
+    Tensor tQ_scale = make_tensor<typename TiledMMA_P::FrgTypeSFA>(shape(SmemLayoutPScaleAAtom{}));
+    Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleBAtom{}));
     Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFA>(shape(SmemLayoutOScaleAAtom{}));
     Tensor tS_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutOScaleBAtom{}));
 
-    tP0.data().get() = tmem_cols::P;
-    tP1.data().get() = tmem_cols::P_Part1;
-    tQ_scale0.data().get() = tmem_cols::Q_Scale0;
-    tQ_scale1.data().get() = tmem_cols::Q_Scale1;
+    tP0.data().get() = tmem_cols::P0;
+    tP1.data().get() = tmem_cols::P1;
+    tQ_scale.data().get() = tmem_cols::Q_Scale;
     tK_scale.data().get() = tmem_cols::K_Scale;
     tV_scale.data().get() = tmem_cols::V_Scale;
     tS_scale.data().get() = tmem_cols::S_Scale;
@@ -115,31 +113,48 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             fence_barrier_init();
 
             // Q is stored as e4m3 data followed by e8m0 block scales.
-            plan.bar_prologue_q.arrive_and_expect_tx(B_H*D_Q*sizeof(e4m3));
-            Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx);
-            Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
-            ku::launch_tma_copy(
-                tma_params.tma_Q,
-                gQ,
-                sQ,
-                plan.bar_prologue_q,
-                TMA::CacheHintSm90::EVICT_FIRST
+            plan.bar_prologue_q.arrive_and_expect_tx(QK_M*D_Q*sizeof(e4m3));
+            Tensor gQ = flat_divide(
+                tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx),
+                Tile<Int<B_H>, Int<Q_TMA_K>>{}
             );
+            Tensor sQ = flat_divide(
+                make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQDuplicated{}),
+                Tile<Int<B_H>, Int<Q_TMA_K>>{}
+            );
+            // The canonical 128-row UMMA layout interleaves the two Q views
+            // at K=128 granularity, so populate its exact 64x128 subtiles.
+            CUTE_UNROLL
+            for (int d_block = 0; d_block < D_Q / Q_TMA_K; ++d_block) {
+                CUTE_UNROLL
+                for (int q_view = 0; q_view < QK_M / B_H; ++q_view) {
+                    ku::launch_tma_copy(
+                        tma_params.tma_Q,
+                        gQ(_, _, _0{}, d_block),
+                        sQ(_, _, q_view, d_block),
+                        plan.bar_prologue_q,
+                        TMA::CacheHintSm90::EVICT_FIRST
+                    );
+                }
+            }
             Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx);
             Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_q_scale.q_scale.compact.data()), SmemLayoutQScaleTMA{});
             plan.bar_prologue_q_scale.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
             ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale, plan.bar_prologue_q_scale, TMA::CacheHintSm90::EVICT_FIRST);
 
         CUTE_UNROLL
-        for (int i = 0; i < NUM_BUFS; ++i) {
+        for (int i = 0; i < NUM_P_BUFS; ++i) {
             plan.bar_qk_done[i].init(1);
+            plan.bar_p_free[i].init(128);
+        }
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_BUFS; ++i) {
             plan.bar_sv_done[i].init(1);
             plan.bar_kv_ready[i].init(1);
             plan.bar_kv_scale_ready[i].init(2);
             plan.bar_k_valid_ready[i].init(B_TOPK/8);
             plan.bar_k_valid_free[i].init(128);
         }
-        plan.bar_p_free.init(128);
         plan.bar_so_ready.init(1);
         fence_barrier_init();
         }
@@ -163,113 +178,97 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         }
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
-        static constexpr int NUM_ELEMS_PER_THREAD = B_H;
+        static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
-            plan.bar_qk_done[k%NUM_BUFS].wait((k/NUM_BUFS)&1);
-            plan.bar_k_valid_ready[k%NUM_BUFS].wait((k/NUM_BUFS)&1);    // Put the barrier wait here for more code reordering space
+            int cur_buf = k % NUM_BUFS;
+            int p_stage = k % NUM_P_BUFS;
+            plan.bar_qk_done[p_stage].wait((k / NUM_P_BUFS) & 1);
+            plan.bar_k_valid_ready[cur_buf].wait((k / NUM_BUFS) & 1);
             ku::tcgen05_after_thread_sync();
 
-            // P0's first 64 rows and P1's last 64 rows are the two
-            // matching halves of the dual QK GEMM.
             float p[NUM_ELEMS_PER_THREAD];
-            bool use_second_q_view = idx_in_warpgroup >= B_TOPK;
-            int p_tmem_col = use_second_q_view ? tmem_cols::P_Part1 : tmem_cols::P;
+            int h = idx_in_warpgroup % B_H;
+            int token_group = idx_in_warpgroup / B_H;
+            int token_base = token_group * NUM_ELEMS_PER_THREAD;
+            int p_tmem_col = (p_stage == 0 ? tmem_cols::P0 : tmem_cols::P1)
+                + token_base;
             ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(p_tmem_col, p);
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
-            plan.bar_p_free.arrive();
+            plan.bar_p_free[p_stage].arrive();
 
-            int k_row = idx_in_warpgroup % B_TOPK;
-            if (use_second_q_view) {
-                CUTE_UNROLL
-                for (int h = 0; h < B_H; ++h) {
-                    plan.p_t[h + P_T_STRIDE * k_row] = p[h];
-                }
-            }
-            fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
-
-            if (!use_second_q_view) {
-                CUTE_UNROLL
-                for (int h = 0; h < B_H; ++h) {
-                    plan.p_t[h + P_T_STRIDE * k_row] += p[h];
-                }
-            }
-            fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
-
-            if (idx_in_warpgroup < B_H) {
-            int h = idx_in_warpgroup;
             Tensor sS_out = make_tensor(make_smem_ptr(plan.s_q_scale.s), SmemLayoutS{});
             Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutOScaleBAtom{});
-            float cur_pi_max = -CUDART_INF_F;
-            constexpr int NUM_QUANT_GROUPS = B_TOPK/MXFP8_SCALE_VEC_SIZE;
-            float absmax_p[NUM_QUANT_GROUPS];
+            float local_pi_max = -CUDART_INF_F;
             CUTE_UNROLL
-            for (int g = 0; g < NUM_QUANT_GROUPS; g++) {
-                absmax_p[g] = -CUDART_INF_F;
-                for (int i = 0; i < 32; ++i) {
-                    int kk = i + 32 * g;
-                    bool is_valid = ((plan.is_k_valid[k%NUM_BUFS][kk/8] >> (kk&7)) & 1) != 0;
-                    float p_val = is_valid ? plan.p_t[kk*P_T_STRIDE + h] : -CUDART_INF_F;
-                    p_val *= params.sm_scale_div_log2;
-                    absmax_p[g] = max(absmax_p[g], p_val);
-                    cur_pi_max = max(cur_pi_max, p_val);
-                    plan.p_t[kk*P_T_STRIDE + h] = p_val;
-                }
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                int kk = token_base + i;
+                bool is_valid = ((plan.is_k_valid[cur_buf][kk / 8] >> (kk & 7)) & 1) != 0;
+                float p_val = is_valid ? p[i] * params.sm_scale_div_log2 : -CUDART_INF_F;
+                p[i] = p_val;
+                local_pi_max = max(local_pi_max, p_val);
             }
-            
+
+            plan.rowwise_max_buf[idx_in_warpgroup] = local_pi_max;
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+
+            float cur_pi_max = max(
+                local_pi_max,
+                plan.rowwise_max_buf[idx_in_warpgroup ^ B_H]
+            );
             float old_mi = plan.head_mi[h];
             bool should_scale_o = cur_pi_max - old_mi > 6.0f;
             float new_max = should_scale_o ? max(cur_pi_max, old_mi) : old_mi;
             float scale_for_old = should_scale_o ? exp2f(old_mi - new_max) : 1.0f;
-            plan.head_scale[h] = scale_for_old;
-            plan.head_mi[h] = new_max;
-            plan.head_real_mi[h] = max(plan.head_real_mi[h], cur_pi_max);
 
-            float cur_sum = 0.0f;
+            float local_sum = 0.0f;
+            float scaled_s_absmax = 0.0f;
             CUTE_UNROLL
-            for (int g = 0; g < NUM_QUANT_GROUPS; ++g) {
-                float scaled_s_absmax = 0.0f;
-                CUTE_UNROLL
-                for (int i = 0; i < 32; ++i) {
-                    int kk = i + g * 32;
-                    float s_val = exp2f(plan.p_t[kk*P_T_STRIDE + h] - new_max);
-                    cur_sum += s_val;
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                int kk = token_base + i;
+                float s_val = exp2f(p[i] - new_max);
+                local_sum += s_val;
 
-                    // Absorb the token-dependent U(t) before choosing the S
-                    // quantization scale. li intentionally uses the unscaled S.
-                    float scaled_s = s_val * plan.kv_u_scale[k%NUM_BUFS][kk];
-                    plan.p_t[kk*P_T_STRIDE + h] = scaled_s;
-                    scaled_s_absmax = max(scaled_s_absmax, scaled_s);
-                }
+                // Absorb U(t) before quantization; li uses the unscaled S.
+                float scaled_s = s_val * plan.kv_u_scale[cur_buf][kk];
+                p[i] = scaled_s;
+                scaled_s_absmax = max(scaled_s_absmax, scaled_s);
+            }
 
-                float scale_f = scaled_s_absmax > 0.0f
-                    ? scaled_s_absmax / FP8_MAX
-                    : 1.0f;
-                e8m0 scale_g = e8m0(scale_f); //TODO: change here to vectorized type conversion
-                sS_scale(
-                    h,
-                    _0{},
-                    make_coord(g % SCALE_GROUPS_PER_TMEM_BLOCK, _0{})
-                ) = scale_g;
-                CUTE_UNROLL
-                for (int i = 0; i < 32; ++i) {
-                    int kk = i + g * 32;
-                    sS_out(h, kk) = e4m3(plan.p_t[kk*P_T_STRIDE + h] / float(scale_g));
+            float scale_f = scaled_s_absmax > 0.0f
+                ? scaled_s_absmax / FP8_MAX
+                : 1.0f;
+            e8m0 scale_g = e8m0(scale_f);
+            sS_scale(
+                h,
+                _0{},
+                make_coord(token_group, _0{})
+            ) = scale_g;
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                sS_out(h, token_base + i) = e4m3(p[i] / float(scale_g));
+            }
+
+            plan.rowwise_li_buf[idx_in_warpgroup] = local_sum;
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+
+            if (token_group == 0) {
+                float cur_sum = local_sum + plan.rowwise_li_buf[idx_in_warpgroup + B_H];
+                plan.head_scale[h] = scale_for_old;
+                plan.head_mi[h] = new_max;
+                plan.head_real_mi[h] = max(plan.head_real_mi[h], cur_pi_max);
+                plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
+                if (k > 0) {
+                    plan.bar_sv_done[(k - 1) % NUM_BUFS].wait(((k - 1) / NUM_BUFS) & 1);
                 }
             }
-            plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
-            if (k > 0) {
-                plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
-            }
-            }
-            // The producer may refill this ping-pong slot only after every
-            // consumer has finished reading its validity mask.
-            plan.bar_k_valid_free[k%NUM_BUFS].arrive();
+
+            plan.bar_k_valid_free[cur_buf].arrive();
             fence_view_async_shared();
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
@@ -456,10 +455,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     } else {
         if (warp_idx == 8 && elect_one_sync()) {
 
-            Tensor sQ_dual = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQKDual{});
-            Tensor sQ_parts = flat_divide(
-                sQ_dual, Tile<Int<B_H>, Int<QK_K>>{}
-            )(_, _, _, _0{});
+            Tensor sQ_dup = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQDuplicated{});
             plan.bar_prologue_q.wait(0);
 
             plan.bar_prologue_q_scale.wait(0);
@@ -467,51 +463,38 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 make_smem_ptr(plan.s_q_scale.q_scale.compact.data()),
                 SmemLayoutQScaleTMA{}
             );
-            Tensor sQ_scale0 = make_tensor(
-                make_smem_ptr(plan.s_q_scale.q_scale.mma[0].data()),
-                SmemLayoutPScaleBAtom{}
-            );
-            Tensor sQ_scale1 = make_tensor(
-                make_smem_ptr(plan.s_q_scale.q_scale.mma[1].data()),
-                SmemLayoutPScaleBAtom{}
+            Tensor sQ_scale_mma = make_tensor(
+                make_smem_ptr(plan.s_q_scale.q_scale.mma.data()),
+                SmemLayoutPScaleAAtom{}
             );
             constexpr int QK_SCALE_GROUPS = QK_K / MXFP8_SCALE_VEC_SIZE;
-            constexpr int SCALE_GROUPS_PER_SWIZZLE_TILE = 128 / MXFP8_SCALE_VEC_SIZE;
             CUTE_UNROLL
-            for (int h = 0; h < B_H; ++h) {
+            for (int row = 0; row < QK_M; ++row) {
                 CUTE_UNROLL
                 for (int g = 0; g < QK_SCALE_GROUPS; ++g) {
-                    int src_group0 = (g / SCALE_GROUPS_PER_SWIZZLE_TILE)
-                            * (2 * SCALE_GROUPS_PER_SWIZZLE_TILE)
-                        + (g % SCALE_GROUPS_PER_SWIZZLE_TILE);
-                    int src_group1 = src_group0 + SCALE_GROUPS_PER_SWIZZLE_TILE;
                     auto dst_coord = make_coord(
                         g % SCALE_GROUPS_PER_TMEM_BLOCK,
                         g / SCALE_GROUPS_PER_TMEM_BLOCK
                     );
-                    sQ_scale0(
-                        h,
-                        _0{},
-                        dst_coord
-                    ) = sQ_scale_tma(h, src_group0);
-                    sQ_scale1(h, _0{}, dst_coord) = sQ_scale_tma(h, src_group1);
+                    sQ_scale_mma(row, _0{}, dst_coord) =
+                        sQ_scale_tma(row % B_H, g);
                 }
             }
             fence_view_async_shared();
-            auto copy_q_scale_to_tmem = [&](e8m0* scale_storage, int tmem_base) {
+            auto copy_q_scale_to_tmem = [&](e8m0* scale_storage) {
                 CUTE_UNROLL
                 for (int sf_block = 0; sf_block < QK_K / 128; ++sf_block) {
                     Tensor sQ_block = make_tensor(
                         make_smem_ptr(
                             scale_storage
-                            + sf_block * cosize_v<SmemLayoutPScaleBBlockAtom>
+                            + sf_block * cosize_v<SmemLayoutPScaleABlockAtom>
                         ),
-                        SmemLayoutPScaleBBlockAtom{}
+                        SmemLayoutPScaleABlockAtom{}
                     );
-                    Tensor tQ_block = make_tensor<typename TiledMMA_P::FrgTypeSFB>(
-                        shape(SmemLayoutPScaleBBlockAtom{})
+                    Tensor tQ_block = make_tensor<typename TiledMMA_P::FrgTypeSFA>(
+                        shape(SmemLayoutPScaleABlockAtom{})
                     );
-                    tQ_block.data().get() = tmem_base
+                    tQ_block.data().get() = tmem_cols::Q_Scale
                         + sf_block * TMEM_SCALE_K128_STRIDE;
                     auto sQ_compact = make_tensor(
                         sQ_block.data(), filter_zeros(sQ_block.layout())
@@ -530,12 +513,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     cute::copy(copy_Q_scale, src_Q, dst_Q);
                 }
             };
-            copy_q_scale_to_tmem(
-                plan.s_q_scale.q_scale.mma[0].data(), tmem_cols::Q_Scale0
-            );
-            copy_q_scale_to_tmem(
-                plan.s_q_scale.q_scale.mma[1].data(), tmem_cols::Q_Scale1
-            );
+            copy_q_scale_to_tmem(plan.s_q_scale.q_scale.mma.data());
 
             // V's token-dependent U(t) is folded into S before S is
             // quantized. The remaining W(g) is applied in the epilogue, so
@@ -564,10 +542,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             for (int k = 0; k < num_k_blocks+1; ++k) {
                 if (k < num_k_blocks) {
                     // Pi = QKi^T
-                    int cur_buf = k%NUM_BUFS;
-                    Tensor sK = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
+                    int cur_buf = k % NUM_BUFS;
+                    int p_stage = k % NUM_P_BUFS;
+                    Tensor sK = make_tensor(
+                        make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()),
+                        SmemLayoutK_TiledMMA{}
+                    );
 
-                    plan.bar_p_free.wait(k&1^1);
+                    plan.bar_p_free[p_stage].wait(((k / NUM_P_BUFS) & 1) ^ 1);
                     ku::tcgen05_after_thread_sync();
 
                     plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);
@@ -576,12 +558,12 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         Tensor sK_block = make_tensor(
                             make_smem_ptr(
                                 plan.kvo.kv.kv_scale[cur_buf].data()
-                                + sf_block * cosize_v<SmemLayoutPScaleABlockAtom>
+                                + sf_block * cosize_v<SmemLayoutPScaleBBlockAtom>
                             ),
-                            SmemLayoutPScaleABlockAtom{}
+                            SmemLayoutPScaleBBlockAtom{}
                         );
-                        Tensor tK_block = make_tensor<typename TiledMMA_P::FrgTypeSFA>(
-                            shape(SmemLayoutPScaleABlockAtom{})
+                        Tensor tK_block = make_tensor<typename TiledMMA_P::FrgTypeSFB>(
+                            shape(SmemLayoutPScaleBBlockAtom{})
                         );
                         tK_block.data().get() = tmem_cols::K_Scale
                             + sf_block * TMEM_SCALE_K128_STRIDE;
@@ -605,19 +587,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     plan.bar_kv_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     ku::tcgen05_after_thread_sync();
 
-                    // The two Q views produce independent 128x64 partials.
-                    // WG0 later keeps rows [0, 64) from P0 and rows [64, 128)
-                    // from P1, then adds the matching token rows.
                     ku::utcmma_blockscaled_ss(
-                        tiled_mma_P, sK, sQ_parts(_, _, _0{}),
-                        tK_scale, tQ_scale0, tP0, true
+                        tiled_mma_P,
+                        sQ_dup,
+                        sK,
+                        tQ_scale,
+                        tK_scale,
+                        p_stage == 0 ? tP0 : tP1,
+                        true
                     );
-                    ku::utcmma_blockscaled_ss(
-                        tiled_mma_P, sK, sQ_parts(_, _, _1{}),
-                        tK_scale, tQ_scale1, tP1, true
-                    );
-                    
-                    ku::umma_arrive_noelect(plan.bar_qk_done[cur_buf]);
+
+                    ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
                 }
 
                 if (k > 0) {
@@ -704,7 +684,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 plan.bar_sv_done[cur_buf].wait((k / NUM_BUFS) & 1 ^ 1);
                 Tensor sK_scale = make_tensor(
                     make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
-                    SmemLayoutPScaleAAtom{}
+                    SmemLayoutPScaleBAtom{}
                 );
 
                 CUTE_UNROLL
@@ -732,24 +712,18 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         plan.kv_u_scale[cur_buf][row] = 1.0f;
                     }
 
-                    constexpr int DUAL_K_SCALE_GROUPS = QK_K / MXFP8_SCALE_VEC_SIZE;
+                    constexpr int K_SCALE_GROUPS = QK_K / MXFP8_SCALE_VEC_SIZE;
                     CUTE_UNROLL
-                    for (int q_view = 0; q_view < 2; ++q_view) {
-                        int dual_row = row + q_view * B_TOPK;
-                        CUTE_UNROLL
-                        for (int dst_sf_idx = 0; dst_sf_idx < DUAL_K_SCALE_GROUPS; ++dst_sf_idx) {
-                            int src_sf_idx = (dst_sf_idx / 4) * 4
-                                + q_view * 2
-                                + (dst_sf_idx % 4) / K_SCALE_DUP;
-                            sK_scale(
-                                dual_row,
-                                _0{},
-                                make_coord(
-                                    dst_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
-                                    dst_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
-                                )
-                            ) = scale[src_sf_idx];
-                        }
+                    for (int dst_sf_idx = 0; dst_sf_idx < K_SCALE_GROUPS; ++dst_sf_idx) {
+                        int src_sf_idx = dst_sf_idx / K_SCALE_DUP;
+                        sK_scale(
+                            row,
+                            _0{},
+                            make_coord(
+                                dst_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
+                                dst_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
+                            )
+                        ) = scale[src_sf_idx];
                     }
                 }
                 fence_view_async_shared();
@@ -812,7 +786,7 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
                 make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
             )
         ),
-        SmemLayoutQ{}
+        SmemLayoutQBlock{}
     );
 
     auto shape_Q_scale = make_shape(B_H, Q_SCALE_BYTES, params.s_q);

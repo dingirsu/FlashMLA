@@ -19,6 +19,26 @@ namespace sm100::fp8_fwd::head64 {
 
 using namespace cute;
 
+#if defined(FP8_FWD_DEBUG_MARKERS)
+#define FP8_MARK_WARP(...)                                                      \
+    do {                                                                        \
+        if (s_q_idx == 0 && elect_one_sync()) {                                 \
+            cute::print(__VA_ARGS__);                                           \
+            cute::print("\n");                                                 \
+        }                                                                       \
+    } while (0)
+#define FP8_MARK_ONE(...)                                                       \
+    do {                                                                        \
+        if (s_q_idx == 0) {                                                     \
+            cute::print(__VA_ARGS__);                                           \
+            cute::print("\n");                                                 \
+        }                                                                       \
+    } while (0)
+#else
+#define FP8_MARK_WARP(...) do { } while (0)
+#define FP8_MARK_ONE(...) do { } while (0)
+#endif
+
 CUTE_DEVICE
 float ue8m0_bits_to_float(uint8_t bits) {
     TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
@@ -92,7 +112,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             plan.bar_qw_scale_ready.init(2);
             CUTE_UNROLL
             for (int i = 0; i < NUM_BUFS; ++i) {
-                plan.bar_qk_done[i].init(1);
                 plan.bar_sv_done[i].init(1);
                 plan.bar_kv_ready[i][0].init(1);
                 plan.bar_kv_ready[i][1].init(1);
@@ -101,6 +120,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.bar_k_valid_free[i].init(128);
             }
             for (int i = 0; i < NUM_P_BUFS; ++i) {
+                plan.bar_qk_done[i].init(1);
                 plan.bar_p_free[i].init(128); // warp group 0 touch this
             }
             plan.bar_so_ready.init(128);
@@ -114,9 +134,16 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     }
 
     __syncthreads();
+    FP8_MARK_WARP(
+        "FP8_MARK 00 post_init warp=%d wg=%d",
+        warp_idx,
+        warpgroup_idx
+    );
 
     if (warpgroup_idx == 0) {
+        FP8_MARK_WARP("FP8_MARK 10 wg0_qscale_wait_before warp=%d", warp_idx);
         plan.bar_qw_scale_ready.wait(0);
+        FP8_MARK_WARP("FP8_MARK 11 wg0_qscale_wait_after warp=%d", warp_idx);
 
         float mi = MAX_INIT_VAL;
         float li = 0.0f;
@@ -133,12 +160,40 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
             // Wait for P
+            FP8_MARK_WARP(
+                "FP8_MARK 12 wg0_pair_sync_before warp=%d tile=%d",
+                warp_idx,
+                k
+            );
             NamedBarrier::arrive_and_wait(64, NamedBarriers::wg0_warp02_sync+(warp_idx&1));
+            FP8_MARK_WARP(
+                "FP8_MARK 13 wg0_pair_sync_after warp=%d tile=%d",
+                warp_idx,
+                k
+            );
             const int cur_buf = k % NUM_BUFS;
             const int p_idx = k % NUM_P_BUFS;
             plan.bar_qk_done[p_idx].wait((k / NUM_P_BUFS) & 1);
+            FP8_MARK_WARP(
+                "FP8_MARK 14 wg0_qk_done_after warp=%d tile=%d pstage=%d",
+                warp_idx,
+                k,
+                p_idx
+            );
             plan.bar_k_valid_ready[cur_buf].wait((k / NUM_BUFS) & 1);
+            FP8_MARK_WARP(
+                "FP8_MARK 15 wg0_valid_after warp=%d tile=%d kvstage=%d",
+                warp_idx,
+                k,
+                cur_buf
+            );
             plan.bar_kv_scale_ready[cur_buf].wait((k / NUM_BUFS) & 1);
+            FP8_MARK_WARP(
+                "FP8_MARK 16 wg0_kv_scale_after warp=%d tile=%d kvstage=%d",
+                warp_idx,
+                k,
+                cur_buf
+            );
             ku::tcgen05_after_thread_sync();
 
             // One scale per lane stays in registers; shuffles expose the 32
@@ -184,6 +239,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 );
             }
             plan.bar_k_valid_free[cur_buf].arrive();
+            FP8_MARK_WARP(
+                "FP8_MARK 17 wg0_p_retrieved warp=%d tile=%d",
+                warp_idx,
+                k
+            );
 
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
@@ -246,7 +306,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
             // Wait for last SV gemm, write S
             if (k > 0) {
+                FP8_MARK_WARP(
+                    "FP8_MARK 18 wg0_prev_sv_wait_before warp=%d tile=%d",
+                    warp_idx,
+                    k
+                );
                 plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
+                FP8_MARK_WARP(
+                    "FP8_MARK 19 wg0_prev_sv_wait_after warp=%d tile=%d",
+                    warp_idx,
+                    k
+                );
             }
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
@@ -266,6 +336,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             
             fence_view_async_shared();
             plan.bar_so_ready.arrive();
+            FP8_MARK_WARP(
+                "FP8_MARK 1a wg0_s_ready warp=%d tile=%d",
+                warp_idx,
+                k
+            );
         }
 
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -292,7 +367,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         }
 
         // Wait for the last GEMM
+        FP8_MARK_WARP(
+            "FP8_MARK 1b wg0_final_sv_wait_before warp=%d",
+            warp_idx
+        );
         plan.bar_sv_done[(num_k_blocks-1)%NUM_BUFS].wait(((num_k_blocks-1)/NUM_BUFS)&1);
+        FP8_MARK_WARP(
+            "FP8_MARK 1c wg0_final_sv_wait_after warp=%d",
+            warp_idx
+        );
         ku::tcgen05_after_thread_sync();
 
         // Fetch dO if necessary
@@ -384,10 +467,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         if (warp_idx == 0) {
             cute::TMEM::Allocator1Sm().free(0, 512);
         }
+        FP8_MARK_WARP("FP8_MARK 1d wg0_epilogue_done warp=%d", warp_idx);
 } else if (warpgroup_idx == 1) {
 
     // Producer warp for KV
         int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
+        FP8_MARK_WARP("FP8_MARK 20 kv_producer_start local_warp=%d", warp_idx);
         constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_WARPS;
         if (elect_one_sync()) {
             CUTE_NO_UNROLL
@@ -409,19 +494,42 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
                 // Copy NoPE
                 int cur_buf = k%NUM_BUFS;
+                FP8_MARK_ONE(
+                    "FP8_MARK 21 kv_free_wait_before local_warp=%d tile=%d stage=%d",
+                    warp_idx,
+                    k,
+                    cur_buf
+                );
                 plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
-                e4m3* sK_base = plan.qkvo.kv[cur_buf].data() + warp_idx*4*64;
+                FP8_MARK_ONE(
+                    "FP8_MARK 22 kv_free_wait_after local_warp=%d tile=%d stage=%d",
+                    warp_idx,
+                    k,
+                    cur_buf
+                );
+                e4m3* sK_base = plan.qkvo.kv[cur_buf].data()
+                    + warp_idx * 4 * TMA_K_CHUNK_BYTES;
 
                 auto load_kv_part = [&](int part_idx) {
+                    constexpr int CHUNKS_PER_PART =
+                        (D_V / 2) / TMA_K_CHUNK_BYTES;
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                         CUTE_UNROLL
-                        for (int local_col = part_idx*(D_V/2/64); local_col < (part_idx+1)*(D_V/2/64); ++local_col) {
+                        for (
+                            int local_col = part_idx * CHUNKS_PER_PART;
+                            local_col < (part_idx + 1) * CHUNKS_PER_PART;
+                            ++local_col
+                        ) {
                             ku::tma_gather4(
                                 &(tma_params.tensor_map_kv),
                                 plan.bar_kv_ready[cur_buf][part_idx],
-                                sK_base + local_row*(4*NUM_WARPS)*64 + local_col*(B_TOPK*64),
-                                local_col*64,
+                                sK_base
+                                    + local_row * (4 * NUM_WARPS)
+                                        * TMA_K_CHUNK_BYTES
+                                    + local_col * B_TOPK
+                                        * TMA_K_CHUNK_BYTES,
+                                local_col * TMA_K_CHUNK_ELEMS,
                                 indices[local_row],
                                 (int64_t)TMA::CacheHintSm90::EVICT_LAST
                             );
@@ -431,7 +539,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
                 if (!should_skip_tma) {
                     load_kv_part(0);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 23 kv_tma_part0_issued local_warp=%d tile=%d",
+                        warp_idx,
+                        k
+                    );
                     load_kv_part(1);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 24 kv_tma_part1_issued local_warp=%d tile=%d",
+                        warp_idx,
+                        k
+                    );
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
                     CUTE_UNROLL
@@ -440,9 +558,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 }
             }
         }
+        FP8_MARK_WARP("FP8_MARK 25 kv_producer_done local_warp=%d", warp_idx);
 
 } else {
     if (warp_idx == 8 && elect_one_sync()) {
+        FP8_MARK_ONE("FP8_MARK 30 warp8_q_wait_before");
         UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
                     make_smem_ptr(plan.qkvo.q.q.data()),
@@ -455,6 +575,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         
         plan.bar_prologue.arrive_and_expect_tx(B_H*D_V*sizeof(e4m3));
         plan.bar_prologue.wait(0);
+        FP8_MARK_ONE("FP8_MARK 31 warp8_q_wait_after");
         ku::tcgen05_after_thread_sync();
         CUTE_UNROLL
         for (int tile_idx = 0; tile_idx < D_V/256; ++tile_idx) {
@@ -469,6 +590,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
         }
         ku::umma_arrive_noelect(plan.bar_prologue_utccp);
+        FP8_MARK_ONE("FP8_MARK 32 warp8_q_utccp_committed");
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks+1; ++k) {
@@ -476,16 +598,33 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 int cur_buf = k%NUM_BUFS;
                 int p_stage = k%NUM_P_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.qkvo.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
+                FP8_MARK_ONE(
+                    "FP8_MARK 33 warp8_p_free_wait_before tile=%d pstage=%d",
+                    k,
+                    p_stage
+                );
                 plan.bar_p_free[p_stage].wait(((k/NUM_P_BUFS)&1)^1);
+                FP8_MARK_ONE(
+                    "FP8_MARK 34 warp8_p_free_wait_after tile=%d pstage=%d",
+                    k,
+                    p_stage
+                );
                 ku::tcgen05_after_thread_sync();
                 if (k == 0) {
                     plan.bar_prologue_utccp.wait(0);
+                    FP8_MARK_ONE("FP8_MARK 35 warp8_q_utccp_wait_after");
                 }
                 Tensor sK_divided = flat_divide(sK, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
                 CUTE_UNROLL
                 for (int kv_part_idx = 0; kv_part_idx < 2; ++kv_part_idx) {
                     plan.bar_kv_ready[cur_buf][kv_part_idx].arrive_and_expect_tx(B_TOPK*D_V/2*sizeof(e4m3));
                     plan.bar_kv_ready[cur_buf][kv_part_idx].wait((k/NUM_BUFS)&1);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 36 warp8_kv_ready_after tile=%d part=%d stage=%d",
+                        k,
+                        kv_part_idx,
+                        cur_buf
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     // P += Q(nope) @ K(nope)^T
@@ -497,8 +636,18 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     } else {
                         ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP2, clear_accum);
                     }
+                    FP8_MARK_ONE(
+                        "FP8_MARK 37 warp8_qk_mma_issued tile=%d part=%d",
+                        k,
+                        kv_part_idx
+                    );
                 }
                 ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
+                FP8_MARK_ONE(
+                    "FP8_MARK 38 warp8_qk_committed tile=%d pstage=%d",
+                    k,
+                    p_stage
+                );
             }
 
             if (k > 0) {
@@ -509,15 +658,34 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     Tensor sV = make_tensor(make_smem_ptr(plan.qkvo.kv[cur_buf].data()), SmemLayoutV{});
 
                     // Wait for S(i-1) and O to be scaled
+                    FP8_MARK_ONE(
+                        "FP8_MARK 39 warp8_s_ready_wait_before sv_tile=%d",
+                        k - 1
+                    );
                     plan.bar_so_ready.wait((k-1)&1);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 3a warp8_s_ready_wait_after sv_tile=%d",
+                        k - 1
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     // O += sS @ sV
                     ku::utcmma_ss(tiled_mma_O, sS, sV, tO, k == 1);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 3b warp8_sv_mma_issued sv_tile=%d",
+                        k - 1
+                    );
                     ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
+                    FP8_MARK_ONE(
+                        "FP8_MARK 3c warp8_sv_committed sv_tile=%d stage=%d",
+                        k - 1,
+                        cur_buf
+                    );
                 }
         }
+        FP8_MARK_ONE("FP8_MARK 3d warp8_done");
     } else if (warp_idx == 9) {
+        FP8_MARK_WARP("FP8_MARK 40 warp9_mask_start");
         if (lane_idx < B_TOPK/8) {
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
@@ -535,7 +703,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.bar_k_valid_ready[cur_buf].arrive();
             }
         }
+        FP8_MARK_WARP("FP8_MARK 41 warp9_mask_done");
     } else if (warp_idx == 10 || warp_idx == 11) {
+        FP8_MARK_WARP("FP8_MARK 50 scale_loader_start warp=%d", warp_idx);
         const int scale_warp_idx = warp_idx - 10;
         const int scale_row = scale_warp_idx * 32 + lane_idx;
 
@@ -555,12 +725,25 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         if (elect_one_sync()) {
             plan.bar_qw_scale_ready.arrive();
         }
+        FP8_MARK_WARP("FP8_MARK 51 qw_scale_published warp=%d", warp_idx);
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
             const int cur_buf = k % NUM_BUFS;
+            FP8_MARK_WARP(
+                "FP8_MARK 52 kv_scale_free_wait_before warp=%d tile=%d stage=%d",
+                warp_idx,
+                k,
+                cur_buf
+            );
             plan.bar_sv_done[cur_buf].wait(
                 ((k / NUM_BUFS) & 1) ^ 1
+            );
+            FP8_MARK_WARP(
+                "FP8_MARK 53 kv_scale_free_wait_after warp=%d tile=%d stage=%d",
+                warp_idx,
+                k,
+                cur_buf
             );
 
             const int src_idx = __ldg(
@@ -584,11 +767,21 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             if (elect_one_sync()) {
                 plan.bar_kv_scale_ready[cur_buf].arrive();
             }
+            FP8_MARK_WARP(
+                "FP8_MARK 54 kv_scale_published warp=%d tile=%d stage=%d",
+                warp_idx,
+                k,
+                cur_buf
+            );
         }
+        FP8_MARK_WARP("FP8_MARK 55 scale_loader_done warp=%d", warp_idx);
     }
 }
 
 }
+
+#undef FP8_MARK_WARP
+#undef FP8_MARK_ONE
 
 template<int D_QK>
 void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
@@ -621,7 +814,7 @@ void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
 
     CUtensorMap tensor_map_kv = ku::make_tensor_map(
             {D_K / 8, static_cast<uint64_t>(params.s_kv)},
-            {D_K},
+            {static_cast<uint64_t>(params.stride_kv_s_kv)},
             {TMA_K_CHUNK_ELEMS, 1},
             params.kv,
             CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,

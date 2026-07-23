@@ -1004,17 +1004,16 @@ struct SM100_MMA_F8F6F4_WS_SS_NOELECT
       uint64_t const& idescE)
   {
 #if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
-    
-      uint32_t mask[4] = {0, 0, 0, 0};
+
       asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, %8}, p; \n\t"
+        "tcgen05.mma.ws.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p, 0; \n\t"
         "}\n"
         :
-        : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
-          "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+        : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
+          "r"(uint32_t(idescE>>32)), "r"(scaleC));
 #else
     CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F8F6F4_WS_SS_NOELECT without CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
 #endif
@@ -1041,7 +1040,7 @@ struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
                  SM100_MMA_F8F6F4_WS_SS_NOELECT N-mode size should be a multiple of 16 between 16 and 256 when B is MN major.");
   using FrgTypeA = UMMA::smem_desc<a_major>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
-  using FrgTypeC = UMMA::tmem_frg_1sm<c_type>;
+  using FrgTypeC = UMMA::tmem_frg_ws_1sm<c_type>;
 
   static_assert(sizeof_bits_v<ValTypeA> <= sizeof_bits_v<uint8_t> &&
                 sizeof_bits_v<ValTypeB> <= sizeof_bits_v<uint8_t>);

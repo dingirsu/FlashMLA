@@ -29,10 +29,13 @@ constexpr int D_Q = D;
 constexpr int D_K = D;
 constexpr int D_V = 512;
 constexpr int KV_SCALE_GROUPS = D_V / 64;
+constexpr int KV_SCALE_SLOT_BYTES = 16;
+constexpr int KV_BYTES_PER_TOKEN = D_K + KV_SCALE_SLOT_BYTES;
 
 constexpr int KV_SCALE_ANCHOR = 0;
 constexpr int TMA_K_CHUNK_BYTES = 128;
 constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
+static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 64;

@@ -281,7 +281,7 @@ struct Head64Fp8SparseAttnFwdParams {
     float sm_scale, sm_scale_div_log2;
 
     // Each Q token stores [64 * 512 e4m3][64 UE8M0 head scales].
-    // Each KV token stores [512 e4m3][1 UE8M0 token scale].
+    // Each KV token stores [512 e4m3][1 UE8M0 token scale][15B padding].
     void* __restrict__ q;
     void* __restrict__ kv;
     uint8_t* __restrict__ kv_scale_w; // [8] UE8M0 W(g), anchor group is 0

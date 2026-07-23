@@ -24,7 +24,8 @@ from mxfp8_test_utils import (
 )
 
 
-B_TOPK = 128
+B_TOPK = 64
+SV_M = 128
 MMA_K = 32
 MAX_INIT_VAL = -1.0e30
 LOG2_E = math.log2(math.e)
@@ -108,13 +109,22 @@ def _round_up_ue8m0(x: torch.Tensor) -> torch.Tensor:
 
 
 def _qk_mma_tiles(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Accumulate QK exactly in the kernel's 32-element block-scale K tiles."""
+    """Mirror the two 128x256 by 256x64 dual-QK products."""
     h_q = q.shape[0]
-    scores = torch.zeros((h_q, B_TOPK), dtype=torch.float32, device=q.device)
-    for d_start in range(0, D_HEAD, MMA_K):
-        d_end = d_start + MMA_K
-        scores.add_(q[:, d_start:d_end] @ k[:, d_start:d_end].transpose(0, 1))
-    return scores
+    partials = []
+    for q_view in range(2):
+        partial = torch.zeros(
+            (h_q, B_TOPK), dtype=torch.float32, device=q.device
+        )
+        for block_start in range(q_view * 128, D_HEAD, 256):
+            for d_start in range(block_start, block_start + 128, MMA_K):
+                d_end = d_start + MMA_K
+                partial.add_(
+                    q[:, d_start:d_end]
+                    @ k[:, d_start:d_end].transpose(0, 1)
+                )
+        partials.append(partial)
+    return partials[0] + partials[1]
 
 
 def _sv_mma_tiles(
@@ -123,8 +133,8 @@ def _sv_mma_tiles(
     v: torch.Tensor,
 ) -> None:
     """Accumulate S@V using CUDA's 128-wide D tiles and 32-wide K tiles."""
-    for dv_start in range(0, D_HEAD, B_TOPK):
-        dv_end = dv_start + B_TOPK
+    for dv_start in range(0, D_HEAD, SV_M):
+        dv_end = dv_start + SV_M
         o_tile = o[:, dv_start:dv_end]
         for k_start in range(0, B_TOPK, MMA_K):
             k_end = k_start + MMA_K
@@ -342,6 +352,18 @@ def _make_correctness_cases() -> list[TestParam]:
         )
         for case_idx, (s_q, s_kv, topk) in enumerate(shape_cases)
     ]
+    # Exercise exactly one 64-token kernel tile.
+    cases.append(
+        TestParam(
+            1,
+            64,
+            64,
+            h_q=64,
+            d_qk=512,
+            seed=20260723,
+            num_runs=0,
+        )
+    )
     cases.append(
         TestParam(
             62,

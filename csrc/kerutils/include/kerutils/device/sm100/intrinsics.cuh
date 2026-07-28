@@ -52,25 +52,26 @@ CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mb
 }
 
 CUTE_DEVICE
-bfloat162 bfloat162_add(const bfloat162 &a, const bloat162 &b) {
-    bfloat162 c;
+__nv_bfloat162 bfloat162_add(const __nv_bfloat162 &a, const __nv_bfloat162 &b) {
+    __nv_bfloat162 c;
     asm volatile(
-        "add.f16x2 %0, %1, %2;\n"
-        : "=l"(reinterpret_cast<uint32_t&>(c))
-        : "l"(reinterpret_cast<uint32_t const&>(a)),
-          "l"(reinterpret_cast<uint32_t const&>(b))
+        "add.bf16x2 %0, %1, %2;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
     );
     return c;
 }
 
-CUTE_DEVICE bfloat162_mul(const bfloat162 &a, const bfloat162 &b) {
-    bfloat162 c;
+CUTE_DEVICE 
+__nv_bfloat162 bfloat162_mul(const __nv_bfloat162 &a, const __nv_bfloat162 &b) {
+    __nv_bfloat162 c;
     asm volatile(
         "mul.bf16x2 %0, %1, %2;\n"
-        : "=l"(reinterpret_cast<uint32_t&>(c))
-        : "l"(reinterpret_cast<uint32_t const&>(a)),
-          "l"(reinterpret_cast<uint32_t const&>(b))
-    )
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
+    );
     return c;
 }
 
@@ -118,6 +119,20 @@ CUTE_DEVICE
 float2 float2_neg(const float2 &a) {
     float2 t = {-1.0f, -1.0f};
     return float2_mul(a, t);
+}
+
+CUTE_DEVICE
+uint16_t float2_to_e4m3x2_bits(float2 const& value) {
+    uint16_t packed;
+
+    asm volatile(
+        "cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
+        : "=h"(packed)
+        : "f"(value.y),
+          "f"(value.x)
+    );
+
+    return packed;
 }
 
 // st.bulk (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st-bulk)

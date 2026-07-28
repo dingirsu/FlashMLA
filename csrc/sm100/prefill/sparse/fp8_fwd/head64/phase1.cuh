@@ -528,7 +528,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             );
 
             // Absorb the token factor into S, then quantize each head row.
-            e4m3 s[NUM_ELEMS_PER_THREAD];
+            uint32_t s[NUM_ELEMS_PER_THREAD / 4];
             float cur_sum = 0.0f;
             float local_s_max = 0.0f;
             CUTE_UNROLL
@@ -561,10 +561,19 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             const e8m0 s_scale_e8m0(
                 s_max > 0.0f ? s_max / FP8_MAX : 1.0f
             );
-            const float current_s_scale = float(s_scale_e8m0);
+            const float current_s_scale = 1 / float(s_scale_e8m0);
             CUTE_UNROLL
-            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                s[i] = e4m3(p[i] / current_s_scale);
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
+                const uint16_t s01 = ku::float2_to_e4m3x2_bits(float2{
+                    p[i] / current_s_scale,
+                    p[i + 1] / current_s_scale
+                });
+                const uint16_t s23 = ku::float2_to_e4m3x2_bits(float2{
+                    p[i + 2] / current_s_scale,
+                    p[i + 3] / current_s_scale
+                });
+                s[i / 4] = static_cast<uint32_t>(s01)
+                    | (static_cast<uint32_t>(s23) << 16);
             }
             li = fma(li, scale_for_old, cur_sum);
             FP8_TIMEPOINT(
@@ -593,8 +602,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 );
             }
             CUTE_UNROLL
-            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                sS(h, token_base + i) = s[i];
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 16) {
+                *reinterpret_cast<uint4*>(&sS(h, token_base + i)) = make_uint4(
+                    s[i / 4],
+                    s[i / 4 + 1],
+                    s[i / 4 + 2],
+                    s[i / 4 + 3]
+                );
             }
             FP8_TIMEPOINT(
                 trace_wg0_tile,

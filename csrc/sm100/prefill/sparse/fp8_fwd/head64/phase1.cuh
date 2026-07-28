@@ -254,22 +254,24 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     TiledMMA tiled_mma_P = TiledMMA_P{};
     TiledMMA tiled_mma_O = TiledMMA_O{};
 
-    Tensor tQ_part0 = tiled_mma_P.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<(D_V/2)/2>>{})
-    );
-    Tensor tQ_part1 = tiled_mma_P.get_slice(_0{}).make_fragment_A(
-        partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<(D_V/2)/2>>{})
+    Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
+        partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_K>>{})
     );
 
-    Tensor tP0 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
-    Tensor tP1 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
-    Tensor tP2 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
+    Tensor tP0 = partition_fragment_C(
+        tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK>>{}
+    );
+    Tensor tP1 = partition_fragment_C(
+        tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK>>{}
+    );
+    Tensor tP2 = partition_fragment_C(
+        tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK>>{}
+    );
     Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_H>, Int<D_V>>{});
-    tP0.data().get() = tmem_cols::P;
-    tP1.data().get() = tmem_cols::P + 64;
-    tP2.data().get() = tmem_cols::P + 128;
-    tQ_part0.data().get() = tmem_cols::Q;
-    tQ_part1.data().get() = tmem_cols::Q + 32;
+    tP0.data().get() = tmem_cols::P0;
+    tP1.data().get() = tmem_cols::P1;
+    tP2.data().get() = tmem_cols::P2;
+    tQ.data().get() = tmem_cols::Q;
     tO.data().get() = tmem_cols::O;
 
         if (warp_idx == 0) {
@@ -440,39 +442,61 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             // Load P
             float p[NUM_ELEMS_PER_THREAD];
             auto release_p = [&]() { plan.bar_p_free[p_idx].arrive(); };
+            auto load_direct_p = [&](auto tP) {
+                Tensor tP_acc = tP(make_coord(_, _), _0{}, _0{});
+                Tensor cP = make_identity_tensor(
+                    Shape<Int<B_H>, Int<B_TOPK>>{}
+                );
+                auto tiled_tmem_load = make_tmem_copy(
+                    SM100_TMEM_LOAD_32dp32b32x{}, tP_acc
+                );
+                auto thr_tmem_load = tiled_tmem_load.get_slice(
+                    idx_in_warpgroup
+                );
+                Tensor tTR_tP = thr_tmem_load.partition_S(tP_acc);
+                Tensor tTR_cP = thr_tmem_load.partition_D(cP);
+                Tensor tTR_rP = make_tensor<float>(shape(tTR_cP));
+
+                cute::copy(tiled_tmem_load, tTR_tP, tTR_rP);
+                cutlass::arch::fence_view_async_tmem_load();
+                ku::tcgen05_before_thread_sync();
+                release_p();
+
+                float* p_exchange = reinterpret_cast<float*>(
+                    plan.p_exchange_buf
+                );
+                CUTE_UNROLL
+                for (int i = 0; i < size(tTR_rP); ++i) {
+                    auto coord = tTR_cP(i);
+                    p_exchange[
+                        get<0>(coord) * B_TOPK + get<1>(coord)
+                    ] = tTR_rP(i);
+                }
+            };
             if (p_idx == 0) {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
+                load_direct_p(tP0);
             } else if (p_idx == 1) {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P + 64,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
+                load_direct_p(tP1);
             } else {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P + 128,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
+                load_direct_p(tP2);
+            }
+
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            float* p_exchange = reinterpret_cast<float*>(plan.p_exchange_buf);
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                p[i] = p_exchange[h * B_TOPK + token_base + i];
+            }
+
+            const uint32_t is_k_valid = *reinterpret_cast<const uint32_t*>(
+                plan.is_k_valid[cur_buf] + token_base / 8
+            );
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                if (!(is_k_valid >> i & 1)) {
+                    p[i] = -CUDART_INF_F;
+                }
             }
             plan.bar_k_valid_free[cur_buf].arrive();
             FP8_TIMEPOINT(
@@ -765,7 +789,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         }
         FP8_MARK_WARP("FP8_MARK 1d wg0_epilogue_done warp=%d", warp_idx);
 } else if (warpgroup_idx == 1) {
-
     // Producer warp for KV
         int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
         FP8_MARK_WARP("FP8_MARK 20 kv_producer_start local_warp=%d", warp_idx);
@@ -886,34 +909,33 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
 } else {
     if (warp_idx == 8 && elect_one_sync()) {
-        FP8_MARK_ONE("FP8_MARK 30 warp8_q_wait_before");
+        // Performance experiment: reinterpret Q as 128 rows so UTCCP can use
+        // the wider 128-datapath path.  This does not produce Layout E Q.
         UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                make_tensor(
-                    make_smem_ptr(plan.qkvo.q.q.data()),
-                    tile_to_shape(
-                        UMMA::Layout_K_SW128_Atom<e4m3>{},
-                        Shape<Int<B_H*2>, Int<128>>{}    // We use this shape for dual gemm (TODO Link)
-                    )
+            make_tensor(
+                make_smem_ptr(plan.qkvo.q.q.data()),
+                tile_to_shape(
+                    UMMA::Layout_K_SW128_Atom<e4m3>{},
+                    Shape<Int<B_H * 2>, _128>{}
                 )
-            );
-        
-        plan.bar_prologue.arrive_and_expect_tx(B_H*D_V*sizeof(e4m3));
+            )
+        );
+        plan.bar_prologue.arrive_and_expect_tx(B_H * D_K * sizeof(e4m3));
         FP8_TIMED_WAIT(
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.q_tma_wait_ns,
             plan.bar_prologue.wait(0)
         );
-        FP8_MARK_ONE("FP8_MARK 31 warp8_q_wait_after");
         ku::tcgen05_after_thread_sync();
         CUTE_UNROLL
-        for (int tile_idx = 0; tile_idx < D_V/256; ++tile_idx) {
-            // A tile is 128 rows * 128 e4m3 values, or 64 rows * 256 values in our dual-GEMM view.
+        for (int tile_idx = 0; tile_idx < D_K / 256; ++tile_idx) {
             CUTE_UNROLL
             for (int subtile_idx = 0; subtile_idx < 4; ++subtile_idx) {
-                // A subtile is 128 rows * 16 cols (256b, 32B) (in UTCCP's view), or 64 rows * 16 cols * 2 (in our view)
                 SM100_UTCCP_128dp256bit_1cta::copy(
-                    sQ_desc + (tile_idx*(B_H*128*2) + subtile_idx*32) / 16, 
-                    tmem_cols::Q + tile_idx*32 + subtile_idx*8
+                    sQ_desc
+                        + (tile_idx * (B_H * 128 * 2)
+                           + subtile_idx * 32) / 16,
+                    tmem_cols::Q + tile_idx * 32 + subtile_idx * 8
                 );
             }
         }
@@ -922,7 +944,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.q_tmem_committed_ns
         );
-        FP8_MARK_ONE("FP8_MARK 32 warp8_q_utccp_committed");
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks+1; ++k) {
@@ -964,7 +985,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                     FP8_MARK_ONE("FP8_MARK 35 warp8_q_utccp_wait_after");
                 }
-                Tensor sK_divided = flat_divide(sK, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
+
+                // The KV producer still issues the two TMA halves separately,
+                // but one direct M=64 GEMM consumes the complete K tile.
                 CUTE_UNROLL
                 for (int kv_part_idx = 0; kv_part_idx < 2; ++kv_part_idx) {
                     plan.bar_kv_ready[cur_buf][kv_part_idx].arrive_and_expect_tx(B_TOPK*D_V/2*sizeof(e4m3));
@@ -985,27 +1008,28 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         kv_part_idx,
                         cur_buf
                     );
-                    ku::tcgen05_after_thread_sync();
-
-                    // P += Q(nope) @ K(nope)^T
-                    bool clear_accum = kv_part_idx == 0;
-                    if (p_stage == 0) {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP0, clear_accum);
-                    } else if (p_stage == 1) {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP1, clear_accum);
-                    } else {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP2, clear_accum);
-                    }
-                    FP8_TIMEPOINT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].qk_issued_ns[kv_part_idx]
-                    );
-                    FP8_MARK_ONE(
-                        "FP8_MARK 37 warp8_qk_mma_issued tile=%d part=%d",
-                        k,
-                        kv_part_idx
-                    );
                 }
+                ku::tcgen05_after_thread_sync();
+
+                if (p_stage == 0) {
+                    ku::utcmma_ts(tiled_mma_P, tQ, sK, tP0, true);
+                } else if (p_stage == 1) {
+                    ku::utcmma_ts(tiled_mma_P, tQ, sK, tP1, true);
+                } else {
+                    ku::utcmma_ts(tiled_mma_P, tQ, sK, tP2, true);
+                }
+                FP8_TIMEPOINT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].qk_issued_ns[0]
+                );
+                FP8_TIMEPOINT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].qk_issued_ns[1]
+                );
+                FP8_MARK_ONE(
+                    "FP8_MARK 37 warp8_qk_mma_issued tile=%d",
+                    k
+                );
                 ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
                 FP8_TIMEPOINT(
                     trace_mma_iter,

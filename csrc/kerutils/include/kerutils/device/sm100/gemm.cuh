@@ -935,7 +935,7 @@ struct MMA_Traits<SM100_MMA_F8F6F4_WS_TS_NOELECT<a_type, b_type, c_type,
 
   using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
-  using FrgTypeC = UMMA::tmem_frg_1sm<c_type, int32_t, UMMA::TmemAllocMode::NonInterleaved>;
+  using FrgTypeC = UMMA::tmem_frg_ws_1sm<c_type>;
 
   static_assert(sizeof_bits_v<ValTypeA> <= sizeof_bits_v<uint8_t> &&
                 sizeof_bits_v<ValTypeB> <= sizeof_bits_v<uint8_t>);

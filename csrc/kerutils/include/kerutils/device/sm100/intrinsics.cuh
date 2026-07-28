@@ -51,28 +51,28 @@ CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mb
     );
 }
 
-CUTE_DEVICE
-bfloat162 bfloat162_add(const bfloat162 &a, const bloat162 &b) {
-    bfloat162 c;
-    asm volatile(
-        "add.f16x2 %0, %1, %2;\n"
-        : "=l"(reinterpret_cast<uint32_t&>(c))
-        : "l"(reinterpret_cast<uint32_t const&>(a)),
-          "l"(reinterpret_cast<uint32_t const&>(b))
-    );
-    return c;
-}
+// CUTE_DEVICE
+// bfloat162 bfloat162_add(const bfloat162 &a, const bloat162 &b) {
+//     bfloat162 c;
+//     asm volatile(
+//         "add.f16x2 %0, %1, %2;\n"
+//         : "=l"(reinterpret_cast<uint32_t&>(c))
+//         : "l"(reinterpret_cast<uint32_t const&>(a)),
+//           "l"(reinterpret_cast<uint32_t const&>(b))
+//     );
+//     return c;
+// }
 
-CUTE_DEVICE bfloat162_mul(const bfloat162 &a, const bfloat162 &b) {
-    bfloat162 c;
-    asm volatile(
-        "mul.bf16x2 %0, %1, %2;\n"
-        : "=l"(reinterpret_cast<uint32_t&>(c))
-        : "l"(reinterpret_cast<uint32_t const&>(a)),
-          "l"(reinterpret_cast<uint32_t const&>(b))
-    )
-    return c;
-}
+// CUTE_DEVICE bfloat162_mul(const bfloat162 &a, const bfloat162 &b) {
+//     bfloat162 c;
+//     asm volatile(
+//         "mul.bf16x2 %0, %1, %2;\n"
+//         : "=l"(reinterpret_cast<uint32_t&>(c))
+//         : "l"(reinterpret_cast<uint32_t const&>(a)),
+//           "l"(reinterpret_cast<uint32_t const&>(b))
+//     )
+//     return c;
+// }
 
 // Vectorized addition for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add)
 CUTE_DEVICE

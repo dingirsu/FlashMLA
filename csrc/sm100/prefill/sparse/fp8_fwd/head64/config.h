@@ -39,8 +39,8 @@ static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 64;
-constexpr int QK_M = B_TOPK * 2;
-constexpr int QK_K = D_K / 2;
+constexpr int QK_M = B_H;
+constexpr int QK_K = D_K;
 constexpr int SV_M = 128;
 
 constexpr int NUM_BUFS = 3;
@@ -54,7 +54,9 @@ constexpr float FP8_MAX = 448.0f;
 namespace tmem_cols {
     constexpr int O = 0;
     constexpr int Q = 256;
-    constexpr int P = 320;
+    constexpr int P0 = 384;
+    constexpr int P1 = 416;
+    constexpr int P2 = 448;
 }
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
@@ -82,11 +84,7 @@ using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
 
 using SmemLayoutK = SmemLayoutKTiles<8>;
 
-using SmemLayoutK_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<e4m3>{},
-    Shape<Int<B_TOPK*2>, Int<D_V/2>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
+using SmemLayoutK_TiledMMA = SmemLayoutK;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
 	UMMA::Layout_K_INTER_Atom<e4m3>{},
@@ -201,7 +199,7 @@ struct SharedMemoryPlan {
 
 // may change to bf16 accumulator for better speed
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, 128, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 )); // maybe p output can be bf16 and use bf16 add to make one fp32
 
 using TiledMMA_O = decltype(make_tiled_mma(

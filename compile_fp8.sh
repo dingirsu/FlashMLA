@@ -50,6 +50,10 @@ if [[ "${FP8_DEBUG_MARKERS:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_FWD_DEBUG_MARKERS=1 )
 fi
 
+if [[ "${FP8_BARRIER_TIMING:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_BARRIER_TIMING=1 )
+fi
+
 "$CXX" \
     "${INCLUDES[@]}" \
     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \

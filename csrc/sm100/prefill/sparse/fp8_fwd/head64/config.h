@@ -101,6 +101,74 @@ using SmemLayoutV = decltype(coalesce(
     )
 , Shape<_1, _1>{}));
 
+#if defined(FP8_FWD_BARRIER_TIMING)
+constexpr int FP8_TIMING_MAX_TILES = 8;
+
+struct Fp8Wg0Timing {
+    uint64_t tile_start_ns;
+    uint64_t pair_wait_ns;
+    uint64_t qk_wait_ns;
+    uint64_t valid_wait_ns;
+    uint64_t scale_wait_ns;
+    uint64_t rowmax_wait_ns;
+    uint64_t smax_wait_ns;
+    uint64_t waits_done_ns;
+    uint64_t p_released_ns;
+    uint64_t p_scaled_ns;
+    uint64_t rowmax_ready_ns;
+    uint64_t softmax_exp_ready_ns;
+    uint64_t softmax_ready_ns;
+    uint64_t sv_wait_ns;
+    uint64_t s_stored_ns;
+    uint64_t o_rescaled_ns;
+    uint64_t s_arrived_ns;
+};
+
+struct Fp8KvProducerTiming {
+    uint64_t tile_start_ns;
+    uint64_t indices_ready_ns;
+    uint64_t q_reuse_wait_ns;
+    uint64_t sv_free_wait_ns;
+    uint64_t tma_part0_issued_ns;
+    uint64_t tma_part1_issued_ns;
+};
+
+struct Fp8MmaTiming {
+    uint64_t iter_start_ns;
+    uint64_t p_free_wait_ns;
+    uint64_t q_copy_wait_ns;
+    uint64_t kv_wait_ns[2];
+    uint64_t kv_ready_ns[2];
+    uint64_t qk_issued_ns[2];
+    uint64_t qk_committed_ns;
+    uint64_t s_ready_wait_ns;
+    uint64_t s_ready_ns;
+    uint64_t sv_committed_ns;
+};
+
+struct Fp8SimpleProducerTiming {
+    uint64_t tile_start_ns;
+    uint64_t buffer_free_wait_ns;
+    uint64_t arrived_ns;
+};
+
+struct Fp8BarrierTiming {
+    uint64_t origin_ns;
+    uint64_t branch_end_ns[12];
+    uint64_t qw_scale_wait_ns[4];
+    uint64_t qw_scale_arrived_ns[2];
+    uint64_t final_sv_wait_ns[4];
+    uint64_t final_sv_ready_ns[4];
+    uint64_t q_tma_wait_ns;
+    uint64_t q_tmem_committed_ns;
+    Fp8Wg0Timing wg0[4][FP8_TIMING_MAX_TILES];
+    Fp8KvProducerTiming kv[4][FP8_TIMING_MAX_TILES];
+    Fp8MmaTiming mma[FP8_TIMING_MAX_TILES + 1];
+    Fp8SimpleProducerTiming mask[FP8_TIMING_MAX_TILES];
+    Fp8SimpleProducerTiming scale[2][FP8_TIMING_MAX_TILES];
+};
+#endif
+
 struct SharedMemoryPlan {
     union {
         struct {
@@ -126,6 +194,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
+#if defined(FP8_FWD_BARRIER_TIMING)
+    Fp8BarrierTiming barrier_timing;
+#endif
 };
 
 // may change to bf16 accumulator for better speed

@@ -75,6 +75,112 @@ __nv_bfloat162 bfloat162_mul(const __nv_bfloat162 &a, const __nv_bfloat162 &b) {
     return c;
 }
 
+CUTE_DEVICE
+__half2 fp16x2_exp2(const __half2 &a) {
+    __half2 c;
+    asm volatile(
+        "ex2.approx.f16x2 %0, %1;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a))
+    );
+    return c;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_add(const __half2 &a, const __half2 &b) {
+    __half2 c;
+    asm volatile(
+        "add.rn.f16x2 %0, %1, %2;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
+    );
+    return c;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_sub(const __half2 &a, const __half2 &b) {
+    __half2 c;
+    asm volatile(
+        "sub.rn.f16x2 %0, %1, %2;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
+    );
+    return c;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_mul(const __half2 &a, const __half2 &b) {
+    __half2 c;
+    asm volatile(
+        "mul.rn.f16x2 %0, %1, %2;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
+    );
+    return c;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_fma(const __half2 &a, const __half2 &b, const __half2 &c) {
+    __half2 d;
+    asm volatile(
+        "fma.rn.f16x2 %0, %1, %2, %3;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(d))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b)),
+          "r"(reinterpret_cast<uint32_t const&>(c))
+    );
+    return d;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_max(const __half2 &a, const __half2 &b) {
+    __half2 c;
+    asm volatile(
+        "max.f16x2 %0, %1, %2;\n"
+        : "=r"(reinterpret_cast<uint32_t&>(c))
+        : "r"(reinterpret_cast<uint32_t const&>(a)),
+          "r"(reinterpret_cast<uint32_t const&>(b))
+    );
+    return c;
+}
+
+CUTE_DEVICE
+__half2 fp16x2_abs(const __half2 &a) {
+    uint32_t bits = reinterpret_cast<uint32_t const&>(a) & 0x7fff7fffu;
+    return reinterpret_cast<__half2 const&>(bits);
+}
+
+CUTE_DEVICE
+uint16_t fp16x2_to_e4m3x2_bits(const __half2 &value) {
+    uint16_t packed;
+    asm volatile(
+        "cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n"
+        : "=h"(packed)
+        : "r"(reinterpret_cast<uint32_t const&>(value))
+    );
+    return packed;
+}
+
+CUTE_DEVICE
+__nv_bfloat162 fp16x2_to_bfloat162(const __half2 &value) {
+    __nv_bfloat162 result;
+    asm volatile(
+        "{\n\t"
+        ".reg .b16 lo, hi, blo, bhi;\n\t"
+        "mov.b32 {lo, hi}, %1;\n\t"
+        "cvt.rn.bf16.f16 blo, lo;\n\t"
+        "cvt.rn.bf16.f16 bhi, hi;\n\t"
+        "mov.b32 %0, {blo, bhi};\n\t"
+        "}\n"
+        : "=r"(reinterpret_cast<uint32_t&>(result))
+        : "r"(reinterpret_cast<uint32_t const&>(value))
+    );
+    return result;
+}
+
 // Vectorized addition for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add)
 CUTE_DEVICE
 float2 float2_add(const float2 &a, const float2 &b) {
@@ -336,6 +442,43 @@ void tmem_ld_32dp32bNx(uint32_t tmem_start, void* data_) {
 #endif
 }
 
+// FP16 MMA accumulators occupy sparse 16-bit slots in 32-bit TMEM cells.
+// The pack form returns two logical half values in each 32-bit register.
+template <int kNumElements>
+__device__ __forceinline__
+void tmem_ld_32dp32bNx_pack16(uint32_t tmem_start, void* data_) {
+    static_assert(kNumElements % 2 == 0, "FP16 TMEM loads require an even element count");
+    constexpr int kNumRegisters = kNumElements / 2;
+    static_assert(
+        kNumRegisters == 1 || kNumRegisters == 2 || kNumRegisters == 4 ||
+        kNumRegisters == 8 || kNumRegisters == 16 || kNumRegisters == 32 ||
+        kNumRegisters == 64 || kNumRegisters == 128,
+        "Invalid packed FP16 TMEM element count"
+    );
+    uint32_t* data = reinterpret_cast<uint32_t*>(data_);
+#ifndef __VSCODE_IDE__
+    [&]<size_t... Is>(cute::index_sequence<Is...>) {
+        if constexpr (kNumRegisters == 1) {
+            cute::SM100_TMEM_LOAD_32dp32b1x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 2) {
+            cute::SM100_TMEM_LOAD_32dp32b2x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 4) {
+            cute::SM100_TMEM_LOAD_32dp32b4x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 8) {
+            cute::SM100_TMEM_LOAD_32dp32b8x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 16) {
+            cute::SM100_TMEM_LOAD_32dp32b16x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 32) {
+            cute::SM100_TMEM_LOAD_32dp32b32x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 64) {
+            cute::SM100_TMEM_LOAD_32dp32b64x_16b::copy(tmem_start, data[Is]...);
+        } else if constexpr (kNumRegisters == 128) {
+            cute::SM100_TMEM_LOAD_32dp32b128x_16b::copy(tmem_start, data[Is]...);
+        }
+    }(cute::make_index_sequence<kNumRegisters>{});
+#endif
+}
+
 // Load from tensor memory, 16 data path lanes, 128-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
 template <int kNumReplications>
 __device__ __forceinline__
@@ -414,6 +557,43 @@ void tmem_st_32dp32bNx(uint32_t tmem_start, void const* data_) {
             cute::SM100_TMEM_STORE_32dp32b128x::copy(data[Is]..., tmem_start);
         }
     }(cute::make_index_sequence<kNumElements>{});
+#endif
+}
+
+// Inverse of tmem_ld_32dp32bNx_pack16: unpack packed half2 registers into
+// the sparse FP16 accumulator slots consumed by tcgen05.mma.
+template <int kNumElements>
+__device__ __forceinline__
+void tmem_st_32dp32bNx_unpack16(uint32_t tmem_start, void const* data_) {
+    static_assert(kNumElements % 2 == 0, "FP16 TMEM stores require an even element count");
+    constexpr int kNumRegisters = kNumElements / 2;
+    static_assert(
+        kNumRegisters == 1 || kNumRegisters == 2 || kNumRegisters == 4 ||
+        kNumRegisters == 8 || kNumRegisters == 16 || kNumRegisters == 32 ||
+        kNumRegisters == 64 || kNumRegisters == 128,
+        "Invalid packed FP16 TMEM element count"
+    );
+    uint32_t const* data = reinterpret_cast<uint32_t const*>(data_);
+#ifndef __VSCODE_IDE__
+    [&]<size_t... Is>(cute::index_sequence<Is...>) {
+        if constexpr (kNumRegisters == 1) {
+            cute::SM100_TMEM_STORE_32dp32b1x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 2) {
+            cute::SM100_TMEM_STORE_32dp32b2x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 4) {
+            cute::SM100_TMEM_STORE_32dp32b4x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 8) {
+            cute::SM100_TMEM_STORE_32dp32b8x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 16) {
+            cute::SM100_TMEM_STORE_32dp32b16x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 32) {
+            cute::SM100_TMEM_STORE_32dp32b32x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 64) {
+            cute::SM100_TMEM_STORE_32dp32b64x_16b::copy(data[Is]..., tmem_start);
+        } else if constexpr (kNumRegisters == 128) {
+            cute::SM100_TMEM_STORE_32dp32b128x_16b::copy(data[Is]..., tmem_start);
+        }
+    }(cute::make_index_sequence<kNumRegisters>{});
 #endif
 }
 

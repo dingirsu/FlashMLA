@@ -33,6 +33,7 @@ MMA_K = 32
 SV_M = 128
 MAX_INIT_VAL = -1.0e30
 LOG2_E = math.log2(math.e)
+S_ACCUM_HEADROOM = 64.0
 
 
 @dataclass(frozen=True)
@@ -264,7 +265,7 @@ def phase1_token_tile_reference(
             s_scale = round_up_ue8m0(
                 torch.where(
                     s_absmax > 0,
-                    s_absmax / FP8_MAX,
+                    s_absmax * S_ACCUM_HEADROOM / FP8_MAX,
                     torch.ones_like(s_absmax),
                 )
             ).float()
@@ -477,6 +478,29 @@ def _case_all_ones() -> None:
     )
 
 
+def _case_all_ones_eight_tiles() -> None:
+    device = torch.device("cuda")
+    topk = 8 * B_TOPK
+    q_raw = torch.ones((1, H_Q, D_HEAD), device=device)
+    q_scale = torch.ones((1, H_Q), device=device)
+    kv_raw = torch.ones((topk, 1, D_HEAD), device=device)
+    kv_scale = torch.ones((topk,), device=device)
+    packed_q, _, _ = pack_q_raw(q_raw, q_scale)
+    packed_kv, _, _ = pack_kv_raw(kv_raw, kv_scale)
+    w = torch.ones(8, device=device).to(torch.float8_e8m0fnu).view(torch.uint8)
+    indices = torch.arange(topk, device=device, dtype=torch.int32).view(1, 1, -1)
+    length = torch.tensor([topk], device=device, dtype=torch.int32)
+    _run_and_check(
+        "all ones, eight tiles",
+        packed_q,
+        packed_kv,
+        w,
+        indices,
+        D_HEAD**-0.5,
+        length,
+    )
+
+
 def _case_single_token_load_and_scale() -> None:
     device = torch.device("cuda")
     selected = torch.tensor(
@@ -593,6 +617,7 @@ def test_fp8_sparse_prefill_head64_precision() -> None:
     torch.set_float32_matmul_precision("highest")
     try:
         _case_all_ones()
+        _case_all_ones_eight_tiles()
         _case_single_token_load_and_scale()
         _case_random_two_tiles()
         _case_pipeline_reuse()

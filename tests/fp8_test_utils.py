@@ -8,6 +8,9 @@ D_HEAD = 512
 H_Q = 64
 FP8_MAX = 448.0
 KV_GROUP_SIZE = 64
+# UE8M0 absorbs this exact power-of-two slack before the FP16 QK MMA.
+Q_ACCUM_HEADROOM_BITS = 3
+KV_ACCUM_HEADROOM_BITS = 2
 Q_DATA_BYTES = H_Q * D_HEAD
 Q_BYTES_PER_TOKEN = Q_DATA_BYTES + H_Q
 KV_SCALE_SLOT_BYTES = 16
@@ -37,7 +40,10 @@ def pack_q_per_head(
     """Pack [token, 64, 512] as data-plane followed by 64 head scales."""
     assert q.ndim == 3 and tuple(q.shape[1:]) == (H_Q, D_HEAD)
     q_f32 = q.float()
-    raw_scale = q_f32.abs().amax(dim=-1) / FP8_MAX
+    raw_scale = (
+        q_f32.abs().amax(dim=-1) / FP8_MAX
+        * (2.0**Q_ACCUM_HEADROOM_BITS)
+    )
     scale_e8m0 = round_up_ue8m0(raw_scale)
     scale_f32 = scale_e8m0.float()
     q_fp8 = (q_f32 / scale_f32.unsqueeze(-1)).clamp(
@@ -100,7 +106,9 @@ def pack_kv_rank1(
     u_exponents = (required_exp - w_exponents).amax(dim=-1)
     token_is_zero = group_absmax.amax(dim=-1) == 0
     u_exponents = torch.where(
-        token_is_zero, torch.zeros_like(u_exponents), u_exponents
+        token_is_zero,
+        torch.zeros_like(u_exponents),
+        u_exponents + KV_ACCUM_HEADROOM_BITS,
     )
     product_exponents = u_exponents.unsqueeze(-1) + w_exponents
     if product_exponents.amin().item() < -127 or product_exponents.amax().item() > 127:

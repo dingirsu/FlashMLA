@@ -28,6 +28,9 @@ ITERS = 30
 
 FP8_MAX = 448.0
 KV_GROUP_SIZE = 64
+# UE8M0 absorbs this exact power-of-two slack before the FP16 QK MMA.
+Q_ACCUM_HEADROOM_BITS = 3
+KV_ACCUM_HEADROOM_BITS = 2
 Q_DATA_BYTES = H_Q * D_HEAD
 Q_BYTES_PER_TOKEN = Q_DATA_BYTES + H_Q
 KV_BYTES_PER_TOKEN = D_HEAD + 16
@@ -70,7 +73,11 @@ def _pack_q(
     # Q absorbs W[g] because QK restores only the per-token U scale.
     w_per_d = w_scale.float().repeat_interleave(KV_GROUP_SIZE)
     q_for_kernel = q.float() * w_per_d
-    scale = _round_up_e8m0(q_for_kernel.abs().amax(dim=-1) / FP8_MAX)
+    scale = _round_up_e8m0(
+        q_for_kernel.abs().amax(dim=-1)
+        / FP8_MAX
+        * (2.0**Q_ACCUM_HEADROOM_BITS)
+    )
     q_fp8 = (q_for_kernel / scale.float().unsqueeze(-1)).clamp(
         -FP8_MAX, FP8_MAX
     ).to(torch.float8_e4m3fn)
@@ -99,7 +106,7 @@ def _pack_kv(
     u_exp = torch.where(
         grouped.abs().amax(dim=(1, 2)) == 0,
         torch.zeros_like(u_exp),
-        u_exp,
+        u_exp + KV_ACCUM_HEADROOM_BITS,
     )
     product_exp = u_exp.unsqueeze(-1) + w_exp.unsqueeze(0)
     if product_exp.amin().item() < -127 or product_exp.amax().item() > 127:

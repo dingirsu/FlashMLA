@@ -6,10 +6,21 @@ import torch
 
 D_HEAD = 512
 FP8_MAX = 448.0
+FP4_MAX = 6.0
 Q_GROUP_SIZE = 32
-KV_GROUP_SIZE = 64
 Q_BYTES_PER_TOKEN = D_HEAD + D_HEAD // Q_GROUP_SIZE
-KV_BYTES_PER_TOKEN = D_HEAD + D_HEAD // KV_GROUP_SIZE
+
+# Decode continues to use MXFP8 KV. Prefill's KV side is MXFP4 and therefore
+# has a separate packed-data footprint and a 32-value scale group.
+MXFP8_KV_GROUP_SIZE = 64
+MXFP8_KV_BYTES_PER_TOKEN = D_HEAD + D_HEAD // MXFP8_KV_GROUP_SIZE
+MXFP4_KV_GROUP_SIZE = 32
+MXFP4_KV_DATA_BYTES = D_HEAD // 2
+MXFP4_KV_BYTES_PER_TOKEN = MXFP4_KV_DATA_BYTES + D_HEAD // MXFP4_KV_GROUP_SIZE
+
+# Keep the decode helpers' historical names stable.
+KV_GROUP_SIZE = MXFP8_KV_GROUP_SIZE
+KV_BYTES_PER_TOKEN = MXFP8_KV_BYTES_PER_TOKEN
 
 
 def require_sm100_family() -> None:
@@ -39,6 +50,56 @@ def _quantize_groups(
     )
 
 
+def _encode_mxfp4_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round values to E2M1 nibbles; bit 3 is the sign bit."""
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    magnitude_code = (x.float().abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    sign_bit = (x < 0).to(torch.uint8) << 3
+    return magnitude_code.to(torch.uint8) | sign_bit
+
+
+def unpack_mxfp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack low-nibble-first E2M1 bytes into their exact FP32 values."""
+    packed = packed.to(torch.uint8)
+    codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=packed.device,
+    )
+    magnitude = levels[(codes & 0x07).long()]
+    return torch.where((codes & 0x08) != 0, -magnitude, magnitude)
+
+
+def _quantize_mxfp4_groups(
+    x: torch.Tensor, group_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize logical values to E2M1 with UE8M0 per-group scales."""
+    assert x.shape[-1] == D_HEAD
+    grouped = x.float().reshape(*x.shape[:-1], D_HEAD // group_size, group_size)
+    scale = grouped.abs().amax(dim=-1) / FP4_MAX
+    scale = torch.pow(2.0, torch.ceil(torch.log2(scale.clamp_min(2.0**-126))))
+    scale_e8m0 = scale.to(torch.float8_e8m0fnu)
+    scale_fp32 = scale_e8m0.float()
+    codes = _encode_mxfp4_e2m1(grouped / scale_fp32.unsqueeze(-1))
+    dequantized = (
+        unpack_mxfp4_e2m1(_pack_mxfp4_e2m1(codes))
+        * scale_fp32.unsqueeze(-1)
+    ).reshape_as(x.float())
+    return codes.reshape_as(x), scale_e8m0, dequantized
+
+
+def _pack_mxfp4_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    assert codes.shape[-1] % 2 == 0
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+
+
 def pack_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     data, scales, dequantized = _quantize_groups(q, Q_GROUP_SIZE)
     packed = torch.empty(
@@ -50,30 +111,31 @@ def pack_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def pack_prefill_kv(kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pack the complete prefill KV allocation as one page-tail-scale page."""
+    """Pack MXFP4 prefill KV as one page-tail-scale allocation."""
     assert kv.ndim == 3
-    data, scales, dequantized = _quantize_groups(kv, KV_GROUP_SIZE)
+    codes, scales, dequantized = _quantize_mxfp4_groups(kv, MXFP4_KV_GROUP_SIZE)
     num_tokens = kv.shape[0] * kv.shape[1]
     storage = torch.empty(
-        num_tokens * KV_BYTES_PER_TOKEN, dtype=torch.uint8, device=kv.device
+        num_tokens * MXFP4_KV_BYTES_PER_TOKEN, dtype=torch.uint8, device=kv.device
     )
-    storage[: num_tokens * D_HEAD] = data.reshape(-1)
-    storage[num_tokens * D_HEAD :] = scales.reshape(-1)
-    return storage.view(*kv.shape[:-1], KV_BYTES_PER_TOKEN), dequantized
+    data_end = num_tokens * MXFP4_KV_DATA_BYTES
+    storage[:data_end] = _pack_mxfp4_e2m1(codes).reshape(-1)
+    storage[data_end:] = scales.view(torch.uint8).reshape(-1)
+    return storage.view(*kv.shape[:-1], MXFP4_KV_BYTES_PER_TOKEN), dequantized
 
 
 def pack_prefill_kv_rank1(
     kv: torch.Tensor,
     w_exponents: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize KV with VSF(token, group) = U(token) * W(group)."""
+    """Quantize MXFP4 KV with VSF(token, group) = U(token) * W(group)."""
     assert kv.ndim == 3 and kv.shape[-1] == D_HEAD
-    num_groups = D_HEAD // KV_GROUP_SIZE
-    grouped = kv.float().reshape(*kv.shape[:-1], num_groups, KV_GROUP_SIZE)
+    num_groups = D_HEAD // MXFP4_KV_GROUP_SIZE
+    grouped = kv.float().reshape(*kv.shape[:-1], num_groups, MXFP4_KV_GROUP_SIZE)
 
     if w_exponents is None:
         w_exponents = torch.tensor(
-            [2, 1, 3, 0, 4, 2, 1, 3],
+            [2, 1, 3, 0, 4, 2, 1, 3, 0, 4, 2, 1, 3, 0, 2, 4],
             dtype=torch.int32,
             device=kv.device,
         )
@@ -81,7 +143,7 @@ def pack_prefill_kv_rank1(
         w_exponents = w_exponents.to(device=kv.device, dtype=torch.int32)
     assert tuple(w_exponents.shape) == (num_groups,)
 
-    raw_scale = grouped.abs().amax(dim=-1) / FP8_MAX
+    raw_scale = grouped.abs().amax(dim=-1) / FP4_MAX
     required_exp = torch.ceil(
         torch.log2(raw_scale.clamp_min(2.0**-126))
     ).to(torch.int32)
@@ -92,27 +154,27 @@ def pack_prefill_kv_rank1(
 
     product_scale = torch.exp2(product_exponents.float()).to(torch.float8_e8m0fnu)
     product_scale_f32 = product_scale.float()
-    quantized = (
-        grouped / product_scale_f32.unsqueeze(-1)
-    ).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    quantized = _encode_mxfp4_e2m1(grouped / product_scale_f32.unsqueeze(-1))
     dequantized = (
-        quantized.float() * product_scale_f32.unsqueeze(-1)
+        unpack_mxfp4_e2m1(_pack_mxfp4_e2m1(quantized))
+        * product_scale_f32.unsqueeze(-1)
     ).reshape_as(kv.float())
 
     w_scale = torch.exp2(w_exponents.float()).to(torch.float8_e8m0fnu)
     u_scale = torch.exp2(u_exponents.squeeze(-1).float())
     num_tokens = kv.shape[0] * kv.shape[1]
     storage = torch.empty(
-        num_tokens * KV_BYTES_PER_TOKEN, dtype=torch.uint8, device=kv.device
+        num_tokens * MXFP4_KV_BYTES_PER_TOKEN, dtype=torch.uint8, device=kv.device
     )
-    storage[: num_tokens * D_HEAD] = quantized.reshape_as(kv).view(torch.uint8).reshape(-1)
-    storage[num_tokens * D_HEAD :] = product_scale.view(torch.uint8).reshape(-1)
+    data_end = num_tokens * MXFP4_KV_DATA_BYTES
+    storage[:data_end] = _pack_mxfp4_e2m1(quantized).reshape(-1)
+    storage[data_end:] = product_scale.view(torch.uint8).reshape(-1)
     return (
-        storage.view(*kv.shape[:-1], KV_BYTES_PER_TOKEN),
+        storage.view(*kv.shape[:-1], MXFP4_KV_BYTES_PER_TOKEN),
         dequantized,
         w_scale,
         u_scale,
-        quantized.reshape_as(kv).float(),
+        unpack_mxfp4_e2m1(_pack_mxfp4_e2m1(quantized)).reshape_as(kv),
     )
 
 

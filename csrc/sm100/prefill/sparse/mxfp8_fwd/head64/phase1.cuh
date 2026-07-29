@@ -140,7 +140,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         fence_barrier_init();
         }
         // Initialize TMEM
-        cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
+        cute::TMEM::Allocator1Sm().allocate(TMEM_ALLOC_COLS, plan.tmem_start_addr.data());
         TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
@@ -148,9 +148,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     __syncthreads();
 
     if (warpgroup_idx == 0) {
-        const uint64_t w_scale_bits = __ldg(
-            reinterpret_cast<const uint64_t*>(params.kv_scale_w)
-        );
         // math instructions 
         if (idx_in_warpgroup < B_H) {
             plan.head_mi[idx_in_warpgroup] = MAX_INIT_VAL;
@@ -178,6 +175,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             for (int h = 0; h < B_H; ++h) {
                 plan.p_t[h + P_T_STRIDE * k_row] = p[h]; // How to improve the transpose efficiency here?
             }
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
 
             if (idx_in_warpgroup < B_H) {
             int h = idx_in_warpgroup;
@@ -302,7 +300,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 ku::tmem_ld_32dp32bNx<B_H_TMEM>(tmem_cols::O + tile*B_H_TMEM, o_head);
                 cutlass::arch::fence_view_async_tmem_load();
                 int w_group = dv / K_QUANT_GROUP_SIZE;
-                uint8_t w_bits = static_cast<uint8_t>(w_scale_bits >> (w_group * 8));
+                uint8_t w_bits = __ldg(params.kv_scale_w + w_group);
                 float w_scale = ue8m0_bits_to_float(w_bits);
                 CUTE_UNROLL
                 for (int h = 0; h < B_H; ++h) {
@@ -337,7 +335,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         }
 
         if (warp_idx == 0) {
-            cute::TMEM::Allocator1Sm().free(0, 512);
+            cute::TMEM::Allocator1Sm().free(0, TMEM_ALLOC_COLS);
         }
     } else if (warpgroup_idx == 1) {
         // Producer warp for KV
@@ -381,7 +379,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         all_invalid &= !plan.kv_warp_has_valid[cur_buf][producer];
                     }
                     plan.kv_skip_tma[cur_buf] = all_invalid;
-                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(B_TOPK*D_K*sizeof(e4m3));
+                    // The destination expands FP4 to byte-addressable shared
+                    // memory, but mbarrier counts packed global transfer bytes.
+                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(
+                        TMA_K_TRANSACTION_BYTES
+                    );
                 }
             }
             fence_view_async_shared();
@@ -402,7 +404,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
                 if (producer_warp_idx == 0 && elect_one_sync()) {
                     plan.bar_kv_ready[cur_buf].complete_transaction(
-                        B_TOPK*D_K*sizeof(e4m3)
+                        TMA_K_TRANSACTION_BYTES
                     );
                 }
             }
@@ -446,8 +448,21 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 make_smem_ptr(plan.s_q_scale.q_scale.mma.data()),
                 SmemLayoutPScaleBAtom{}
             );
+            // SFB for N=64 contains padded physical entries.  Initialize the
+            // backing store so an MMA-visible padding lane can never consume
+            // stale shared-memory data.
+            uint8_t* q_scale_storage = reinterpret_cast<uint8_t*>(
+                plan.s_q_scale.q_scale.mma.data()
+            );
+            CUTE_NO_UNROLL
+            for (int i = 0; i < cosize_v<SmemLayoutPScaleBAtom>; ++i) {
+                q_scale_storage[i] = UE8M0_ONE_BITS;
+            }
+            // N=64 SFB is physically represented as a 128-row scale tile.
+            // Populate both halves so every MMA datapath observes the scale
+            // for its corresponding logical Q head.
             CUTE_UNROLL
-            for (int h = 0; h < B_H; ++h) {
+            for (int h = 0; h < B_TOPK; ++h) {
                 CUTE_UNROLL
                 for (int g = 0; g < Q_SCALE_BYTES; ++g) {
                     sQ_scale(
@@ -457,7 +472,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                             g % SCALE_GROUPS_PER_TMEM_BLOCK,
                             g / SCALE_GROUPS_PER_TMEM_BLOCK
                         )
-                    ) = sQ_scale_tma(h, g);
+                    ) = sQ_scale_tma(h % B_H, g);
                 }
             }
             fence_view_async_shared();
@@ -491,7 +506,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             auto dst_Q = thr_Q.partition_D(tQ_compact);
 
             cute::copy(copy_Q_scale, src_Q, dst_Q);
-
+            cutlass::arch::fence_view_async_tmem_store();
             // V's token-dependent U(t) is folded into S before S is
             // quantized. The remaining W(g) is applied in the epilogue, so
             // every logical V scale consumed by the SV MMA is one.
@@ -539,7 +554,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
                     auto dst_K = thr_K.partition_D(tK_compact);
                     cute::copy(copy_K_scale, src_K, dst_K);
-
+                    cutlass::arch::fence_view_async_tmem_store();
                     plan.bar_kv_ready[cur_buf].wait((k/NUM_BUFS)&1);
                     ku::tcgen05_after_thread_sync();
 
@@ -547,9 +562,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     if (k == 0) {
                         int src_idx = __ldg(gIndices);
                         const uint8_t* gK_debug = reinterpret_cast<const uint8_t*>(params.kv)
-                            + static_cast<int64_t>(src_idx) * D_K;
+                            + static_cast<int64_t>(src_idx) * KV_DATA_BYTES;
                         const uint8_t* gK_scale_debug = reinterpret_cast<const uint8_t*>(params.kv)
-                            + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K
+                            + static_cast<int64_t>(params.s_kv) * params.h_kv * KV_DATA_BYTES
                             + static_cast<int64_t>(src_idx) * K_SCALE_BYTES;
                         printf("K data g/s row0 d0/64/128/256=%02x/%02x,%02x/%02x,%02x/%02x,%02x/%02x\n",
                                gK_debug[0], reinterpret_cast<uint8_t*>(&sK(_0{}, _0{}))[0],
@@ -637,16 +652,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             constexpr int NUM_ROWS_PER_SCALE_LANE = NUM_ROWS_PER_SCALE_WARP / 32;
             const int scale_warp_idx = warp_idx - 10;
             const uint8_t* kv_scale_base = reinterpret_cast<const uint8_t*>(params.kv)
-                + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K;
+                + static_cast<int64_t>(params.s_kv) * params.h_kv * KV_DATA_BYTES;
 
             int w_anchor_bits = 0;
             if (lane_idx == 0) {
-                uint64_t w_scale_bits = __ldg(
-                    reinterpret_cast<const uint64_t*>(params.kv_scale_w)
-                );
-                w_anchor_bits = static_cast<uint8_t>(
-                    w_scale_bits >> (KV_SCALE_ANCHOR * 8)
-                );
+                w_anchor_bits = __ldg(params.kv_scale_w + KV_SCALE_ANCHOR);
             }
             w_anchor_bits = __shfl_sync(0xffffffff, w_anchor_bits, 0);
 
@@ -668,36 +678,35 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         src_idx = -1;
                     }
 
-                    alignas(8) e8m0 scale[K_SCALE_BYTES];
+                    alignas(16) e8m0 scale[K_SCALE_BYTES];
                     if (src_idx >= 0) {
-                        const e8m0* src_scale = reinterpret_cast<const e8m0*>(kv_scale_base)
+                        const uint8_t* src_scale = kv_scale_base
                             + static_cast<int64_t>(src_idx) * params.h_kv * K_SCALE_BYTES;
-                        *reinterpret_cast<uint64_t*>(scale) = __ldg(
-                            reinterpret_cast<const uint64_t*>(src_scale)
-                        );
+                        auto* dst_words = reinterpret_cast<uint64_t*>(scale);
+                        const auto* src_words = reinterpret_cast<const uint64_t*>(src_scale);
+                        dst_words[0] = __ldg(src_words);
+                        dst_words[1] = __ldg(src_words + 1);
                         uint8_t anchor_bits = reinterpret_cast<uint8_t*>(scale)[KV_SCALE_ANCHOR];
                         plan.kv_u_scale[cur_buf][row] = ue8m0_ratio_to_float(
                             anchor_bits, static_cast<uint8_t>(w_anchor_bits)
                         );
                     } else {
-                        *reinterpret_cast<uint64_t*>(scale) = 0;
+                        auto* dst_words = reinterpret_cast<uint64_t*>(scale);
+                        dst_words[0] = 0;
+                        dst_words[1] = 0;
                         plan.kv_u_scale[cur_buf][row] = 1.0f;
                     }
 
                     CUTE_UNROLL
                     for (int src_sf_idx = 0; src_sf_idx < K_SCALE_BYTES; ++src_sf_idx) {
-                        CUTE_UNROLL
-                        for (int dup = 0; dup < K_SCALE_DUP; ++dup) {
-                            int dst_sf_idx = src_sf_idx * K_SCALE_DUP + dup;
-                            sK_scale(
-                                row,
-                                _0{},
-                                make_coord(
-                                    dst_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
-                                    dst_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
-                                )
-                            ) = scale[src_sf_idx];
-                        }
+                        sK_scale(
+                            row,
+                            _0{},
+                            make_coord(
+                                src_sf_idx % SCALE_GROUPS_PER_TMEM_BLOCK,
+                                src_sf_idx / SCALE_GROUPS_PER_TMEM_BLOCK
+                            )
+                        ) = scale[src_sf_idx];
                     }
                 }
                 fence_view_async_shared();
@@ -732,7 +741,8 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     KU_ASSERT(params.stride_kv_s_kv == params.h_kv * KV_BYTES_PER_TOKEN,
         "packed KV storage must be contiguous across tokens");
     KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0, "q must be 16-byte aligned");
-    KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0, "kv must be 16-byte aligned");
+    KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 32 == 0,
+        "packed MXFP4 kv must be 32-byte aligned for 16U4 TMA");
     KU_ASSERT(params.kv_scale_w != nullptr);
     KU_ASSERT(reinterpret_cast<int64_t>(params.kv_scale_w) % 8 == 0, "kv_scale_w must be 8-byte aligned");
     static_assert(D_QK == D_Q);
@@ -777,11 +787,13 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     );
 
     CUtensorMap tensor_map_kv = ku::make_tensor_map(
-            {D_K / 8, static_cast<uint64_t>(params.s_kv)},
-            {D_K},
+            // 16U4_ALIGN16B consumes packed nibbles globally and inserts an
+            // 8-byte pad after every 8 data bytes in shared memory.
+            {D_K, static_cast<uint64_t>(params.s_kv)},
+            {KV_DATA_BYTES},
             {TMA_K_CHUNK_ELEMS, 1},
             params.kv,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );

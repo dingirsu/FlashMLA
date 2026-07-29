@@ -20,6 +20,213 @@ namespace sm100::mxfp8_fwd::head64 {
 
 using namespace cute;
 
+#if defined(MXFP8_FWD_DEBUG_MARKERS)
+#define MXFP8_MARK_WARP(...)                                                    \
+    do {                                                                        \
+        if (s_q_idx == 0 && elect_one_sync()) {                                 \
+            cute::print(__VA_ARGS__);                                           \
+            cute::print("\n");                                                 \
+        }                                                                       \
+    } while (0)
+#define MXFP8_MARK_ONE(...)                                                     \
+    do {                                                                        \
+        if (s_q_idx == 0) {                                                     \
+            cute::print(__VA_ARGS__);                                           \
+            cute::print("\n");                                                 \
+        }                                                                       \
+    } while (0)
+#else
+#define MXFP8_MARK_WARP(...) do { } while (0)
+#define MXFP8_MARK_ONE(...) do { } while (0)
+#endif
+
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+CUTE_DEVICE
+uint64_t mxfp8_timing_now_ns() {
+    uint64_t timestamp;
+    asm volatile(
+        "mov.u64 %0, %%globaltimer;"
+        : "=l"(timestamp)
+        :
+        : "memory"
+    );
+    return timestamp;
+}
+
+#define MXFP8_TIMED_WAIT(sample, destination, wait_expression)                  \
+    do {                                                                        \
+        uint64_t mxfp8_wait_begin_ns = 0;                                       \
+        if (sample) {                                                           \
+            mxfp8_wait_begin_ns = mxfp8_timing_now_ns();                        \
+        }                                                                       \
+        wait_expression;                                                        \
+        if (sample) {                                                           \
+            destination = mxfp8_timing_now_ns() - mxfp8_wait_begin_ns;          \
+        }                                                                       \
+    } while (0)
+#define MXFP8_TIMEPOINT(sample, destination)                                    \
+    do {                                                                        \
+        if (sample) {                                                           \
+            destination = mxfp8_timing_now_ns()                                \
+                - plan.barrier_timing.origin_ns;                                \
+        }                                                                       \
+    } while (0)
+
+CUTE_DEVICE
+void print_mxfp8_barrier_timing(
+    const SharedMemoryPlan& plan,
+    int num_k_blocks
+) {
+    const auto& timing = plan.barrier_timing;
+    const int traced_tiles = min(num_k_blocks, MXFP8_TIMING_MAX_TILES);
+    cute::print(
+        "MXFP8_TIME header unit=ns tiles=%d traced=%d origin=%llu\n",
+        num_k_blocks,
+        traced_tiles,
+        static_cast<unsigned long long>(timing.origin_ns)
+    );
+    CUTE_UNROLL
+    for (int warp = 0; warp < 12; ++warp) {
+        cute::print(
+            "MXFP8_TIME branch warp=%d end=%llu\n",
+            warp,
+            static_cast<unsigned long long>(timing.branch_end_ns[warp])
+        );
+    }
+    cute::print(
+        "MXFP8_TIME mma_init q_wait=%llu q_scale_sync_wait=%llu "
+        "q_scale_tmem=%llu v_scale_tmem=%llu\n",
+        static_cast<unsigned long long>(timing.q_tma_wait_ns),
+        static_cast<unsigned long long>(timing.q_scale_sync_wait_ns),
+        static_cast<unsigned long long>(timing.q_scale_tmem_committed_ns),
+        static_cast<unsigned long long>(timing.v_scale_tmem_committed_ns)
+    );
+    CUTE_UNROLL
+    for (int warp = 0; warp < 4; ++warp) {
+        const auto& value = timing.epilogue[warp];
+        cute::print(
+            "MXFP8_TIME epilogue warp=%d final_sv_wait=%llu "
+            "final_sv_ready=%llu stats_stored=%llu scale_sync_wait=%llu "
+            "scale_ready=%llu o_staged=%llu o_sync_wait=%llu "
+            "store_issued=%llu\n",
+            warp,
+            static_cast<unsigned long long>(value.final_sv_wait_ns),
+            static_cast<unsigned long long>(value.final_sv_ready_ns),
+            static_cast<unsigned long long>(value.stats_stored_ns),
+            static_cast<unsigned long long>(value.scale_sync_wait_ns),
+            static_cast<unsigned long long>(value.scale_ready_ns),
+            static_cast<unsigned long long>(value.o_staged_ns),
+            static_cast<unsigned long long>(value.o_sync_wait_ns),
+            static_cast<unsigned long long>(value.store_issued_ns)
+        );
+    }
+    for (int tile = 0; tile < traced_tiles; ++tile) {
+        CUTE_UNROLL
+        for (int warp = 0; warp < 4; ++warp) {
+            const auto& value = timing.wg0[warp][tile];
+            cute::print(
+                "MXFP8_TIME wg0 warp=%d tile=%d start=%llu tile_sync_wait=%llu "
+                "qk_wait=%llu valid_wait=%llu waits_done=%llu "
+                "p_released=%llu p_prepared=%llu rowmax_wait=%llu "
+                "rowmax_ready=%llu s_quantized=%llu li_wait=%llu "
+                "softmax_ready=%llu sv_wait=%llu head_updated=%llu "
+                "pre_rescale_wait=%llu pre_rescale_ready=%llu "
+                "rescale_done=%llu rescale_wait=%llu s_arrived=%llu\n",
+                warp,
+                tile,
+                static_cast<unsigned long long>(value.tile_start_ns),
+                static_cast<unsigned long long>(value.tile_sync_wait_ns),
+                static_cast<unsigned long long>(value.qk_wait_ns),
+                static_cast<unsigned long long>(value.valid_wait_ns),
+                static_cast<unsigned long long>(value.waits_done_ns),
+                static_cast<unsigned long long>(value.p_released_ns),
+                static_cast<unsigned long long>(value.p_prepared_ns),
+                static_cast<unsigned long long>(value.rowmax_wait_ns),
+                static_cast<unsigned long long>(value.rowmax_ready_ns),
+                static_cast<unsigned long long>(value.s_quantized_ns),
+                static_cast<unsigned long long>(value.li_wait_ns),
+                static_cast<unsigned long long>(value.softmax_ready_ns),
+                static_cast<unsigned long long>(value.sv_wait_ns),
+                static_cast<unsigned long long>(value.head_updated_ns),
+                static_cast<unsigned long long>(value.pre_rescale_wait_ns),
+                static_cast<unsigned long long>(value.pre_rescale_ready_ns),
+                static_cast<unsigned long long>(value.rescale_done_ns),
+                static_cast<unsigned long long>(value.rescale_wait_ns),
+                static_cast<unsigned long long>(value.s_arrived_ns)
+            );
+        }
+        CUTE_UNROLL
+        for (int warp = 0; warp < 4; ++warp) {
+            const auto& value = timing.kv[warp][tile];
+            cute::print(
+                "MXFP8_TIME kv warp=%d tile=%d start=%llu sv_free_wait=%llu "
+                "indices_ready=%llu indices_sync_wait=%llu "
+                "transaction_ready=%llu transaction_sync_wait=%llu "
+                "tma_issued=%llu\n",
+                warp + 4,
+                tile,
+                static_cast<unsigned long long>(value.tile_start_ns),
+                static_cast<unsigned long long>(value.sv_free_wait_ns),
+                static_cast<unsigned long long>(value.indices_ready_ns),
+                static_cast<unsigned long long>(value.indices_sync_wait_ns),
+                static_cast<unsigned long long>(value.transaction_ready_ns),
+                static_cast<unsigned long long>(value.transaction_sync_wait_ns),
+                static_cast<unsigned long long>(value.tma_issued_ns)
+            );
+        }
+        const auto& mask = timing.mask[tile];
+        cute::print(
+            "MXFP8_TIME mask warp=9 tile=%d start=%llu free_wait=%llu "
+            "arrived=%llu\n",
+            tile,
+            static_cast<unsigned long long>(mask.tile_start_ns),
+            static_cast<unsigned long long>(mask.buffer_free_wait_ns),
+            static_cast<unsigned long long>(mask.arrived_ns)
+        );
+        CUTE_UNROLL
+        for (int warp = 0; warp < 2; ++warp) {
+            const auto& scale = timing.scale[warp][tile];
+            cute::print(
+                "MXFP8_TIME scale warp=%d tile=%d start=%llu free_wait=%llu "
+                "arrived=%llu\n",
+                warp + 10,
+                tile,
+                static_cast<unsigned long long>(scale.tile_start_ns),
+                static_cast<unsigned long long>(scale.buffer_free_wait_ns),
+                static_cast<unsigned long long>(scale.arrived_ns)
+            );
+        }
+    }
+    for (int iter = 0; iter <= traced_tiles; ++iter) {
+        const auto& value = timing.mma[iter];
+        cute::print(
+            "MXFP8_TIME mma warp=8 iter=%d start=%llu p_free_wait=%llu "
+            "kv_scale_wait=%llu k_scale_ready=%llu kv_wait=%llu "
+            "kv_ready=%llu qk_committed=%llu s_ready_wait=%llu "
+            "s_ready=%llu s_scale_ready=%llu sv_committed=%llu\n",
+            iter,
+            static_cast<unsigned long long>(value.iter_start_ns),
+            static_cast<unsigned long long>(value.p_free_wait_ns),
+            static_cast<unsigned long long>(value.kv_scale_wait_ns),
+            static_cast<unsigned long long>(value.k_scale_ready_ns),
+            static_cast<unsigned long long>(value.kv_wait_ns),
+            static_cast<unsigned long long>(value.kv_ready_ns),
+            static_cast<unsigned long long>(value.qk_committed_ns),
+            static_cast<unsigned long long>(value.s_ready_wait_ns),
+            static_cast<unsigned long long>(value.s_ready_ns),
+            static_cast<unsigned long long>(value.s_scale_ready_ns),
+            static_cast<unsigned long long>(value.sv_committed_ns)
+        );
+    }
+}
+#else
+#define MXFP8_TIMED_WAIT(sample, destination, wait_expression)                  \
+    do {                                                                        \
+        wait_expression;                                                        \
+    } while (0)
+#define MXFP8_TIMEPOINT(sample, destination) do { } while (0)
+#endif
+
 CUTE_DEVICE
 float ue8m0_bits_to_float(uint8_t bits) {
     TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
@@ -83,7 +290,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     if (warp_idx == 0 && elect_one_sync()) {
         cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(tma_params.tma_Q_scale.get_tma_descriptor());
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv);
     }
 
@@ -137,11 +343,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
                 }
             }
-            Tensor gQ_scale = tma_params.tma_Q_scale.get_tma_tensor(tma_params.shape_Q_scale)(_, _, s_q_idx);
-            Tensor sQ_scale = make_tensor(make_smem_ptr(plan.s_q_scale.q_scale.compact.data()), SmemLayoutQScaleTMA{});
-            plan.bar_prologue_q_scale.arrive_and_expect_tx(B_H*Q_SCALE_BYTES*sizeof(e8m0));
-            ku::launch_tma_copy(tma_params.tma_Q_scale, gQ_scale, sQ_scale, plan.bar_prologue_q_scale, TMA::CacheHintSm90::EVICT_FIRST);
-
         CUTE_UNROLL
         for (int i = 0; i < NUM_P_BUFS; ++i) {
             plan.bar_qk_done[i].init(1);
@@ -165,8 +366,94 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
     }
 
     __syncthreads();
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+    if (s_q_idx == 0) {
+        static_assert(sizeof(MxFp8BarrierTiming) % sizeof(uint64_t) == 0);
+        uint64_t* timing_words = reinterpret_cast<uint64_t*>(
+            &plan.barrier_timing
+        );
+        CUTE_UNROLL
+        for (
+            int i = threadIdx.x;
+            i < sizeof(MxFp8BarrierTiming) / sizeof(uint64_t);
+            i += NUM_THREADS
+        ) {
+            timing_words[i] = 0;
+        }
+    }
+    __syncthreads();
+    if (s_q_idx == 0 && threadIdx.x == 0) {
+        plan.barrier_timing.origin_ns = mxfp8_timing_now_ns();
+    }
+    __syncthreads();
+#endif
+    MXFP8_MARK_WARP(
+        "MXFP8_MARK 00 post_init warp=%d wg=%d",
+        warp_idx,
+        warpgroup_idx
+    );
 
     if (warpgroup_idx == 0) {
+        // The scale-factor fragment is replicated across all four physical
+        // TMEM warp rows. WG0 fills those replicas directly from GMEM.
+        constexpr int Q_SCALE_WORDS = Q_SCALE_BYTES / sizeof(uint32_t);
+        const uint8_t* q_scale_bytes = reinterpret_cast<const uint8_t*>(params.q)
+            + static_cast<int64_t>(s_q_idx) * params.stride_q_s_q
+            + D_Q;
+        uint32_t q_scale_lo[Q_SCALE_WORDS];
+        uint32_t q_scale_hi[Q_SCALE_WORDS];
+        CUTE_UNROLL
+        for (int i = 0; i < Q_SCALE_WORDS; ++i) {
+            q_scale_lo[i] = __ldg(reinterpret_cast<const uint32_t*>(
+                q_scale_bytes + lane_idx * params.stride_q_h_q
+            ) + i);
+            q_scale_hi[i] = __ldg(reinterpret_cast<const uint32_t*>(
+                q_scale_bytes + (lane_idx + 32) * params.stride_q_h_q
+            ) + i);
+        }
+        uint32_t q_scale_words_lo[8] = {
+            q_scale_lo[0], q_scale_hi[0], q_scale_lo[0], q_scale_hi[0],
+            q_scale_lo[1], q_scale_hi[1], q_scale_lo[1], q_scale_hi[1]
+        };
+        uint32_t q_scale_words_hi[8] = {
+            q_scale_lo[2], q_scale_hi[2], q_scale_lo[2], q_scale_hi[2],
+            q_scale_lo[3], q_scale_hi[3], q_scale_lo[3], q_scale_hi[3]
+        };
+        ku::tmem_st_32dp32bNx<8>(
+            tmem_cols::Q_Scale, q_scale_words_lo
+        );
+        ku::tmem_st_32dp32bNx<8>(
+            tmem_cols::Q_Scale + 8, q_scale_words_hi
+        );
+        cutlass::arch::fence_view_async_tmem_store();
+        MXFP8_TIMEPOINT(
+            s_q_idx == 0 && idx_in_warpgroup == 0,
+            plan.barrier_timing.q_scale_tmem_committed_ns
+        );
+
+        NamedBarrier::arrive_and_wait(128, NamedBarriers::q_scale_sync);
+        ku::tcgen05_after_thread_sync();
+        if (warp_idx == 0 && elect_one_sync()) {
+            plan.bar_prologue_q_scale.arrive();
+        }
+
+        // V's token-dependent U(t) is folded into S and W(g) is applied in
+        // the epilogue. Fill the fixed unit scales directly in TMEM while
+        // WG0 is otherwise only initializing its local state.
+        constexpr uint32_t UE8M0_ONE_PACKED = 0x7f7f7f7f;
+        uint32_t v_scale_words[SV_SCALE_TMEM_COLS] = {
+            UE8M0_ONE_PACKED, UE8M0_ONE_PACKED,
+            UE8M0_ONE_PACKED, UE8M0_ONE_PACKED
+        };
+        ku::tmem_st_32dp32bNx<SV_SCALE_TMEM_COLS>(
+            tmem_cols::V_Scale, v_scale_words
+        );
+        cutlass::arch::fence_view_async_tmem_store();
+        MXFP8_TIMEPOINT(
+            s_q_idx == 0 && idx_in_warpgroup == 0,
+            plan.barrier_timing.v_scale_tmem_committed_ns
+        );
+
         const uint64_t w_scale_bits = __ldg(
             reinterpret_cast<const uint64_t*>(params.kv_scale_w)
         );
@@ -182,11 +469,42 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+            const bool trace_wg0_tile = s_q_idx == 0
+                && lane_idx == 0 && k < MXFP8_TIMING_MAX_TILES;
+#endif
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].tile_start_ns
+            );
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].tile_sync_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg0_sync
+                ))
+            );
             int cur_buf = k % NUM_BUFS;
             int p_stage = k % NUM_P_BUFS;
-            plan.bar_qk_done[p_stage].wait((k / NUM_P_BUFS) & 1);
-            plan.bar_k_valid_ready[cur_buf].wait((k / NUM_BUFS) & 1);
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].qk_wait_ns,
+                plan.bar_qk_done[p_stage].wait((k / NUM_P_BUFS) & 1)
+            );
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].valid_wait_ns,
+                plan.bar_k_valid_ready[cur_buf].wait((k / NUM_BUFS) & 1)
+            );
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].waits_done_ns
+            );
+            MXFP8_MARK_WARP(
+                "MXFP8_MARK 10 wg0_deps_ready warp=%d tile=%d",
+                warp_idx,
+                k
+            );
             ku::tcgen05_after_thread_sync();
 
             float p[NUM_ELEMS_PER_THREAD];
@@ -199,6 +517,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
             plan.bar_p_free[p_stage].arrive();
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].p_released_ns
+            );
 
             Tensor sS_out = make_tensor(make_smem_ptr(plan.s_q_scale.s), SmemLayoutS{});
             Tensor sS_scale = make_tensor(make_smem_ptr(plan.s_scale.data()), SmemLayoutOScaleBAtom{});
@@ -214,7 +536,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
             plan.rowwise_max_buf[idx_in_warpgroup] = local_pi_max;
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].p_prepared_ns
+            );
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].rowmax_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg0_sync
+                ))
+            );
 
             float cur_pi_max = max(
                 local_pi_max,
@@ -224,6 +556,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             bool should_scale_o = cur_pi_max - old_mi > 6.0f;
             float new_max = should_scale_o ? max(cur_pi_max, old_mi) : old_mi;
             float scale_for_old = should_scale_o ? exp2f(old_mi - new_max) : 1.0f;
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].rowmax_ready_ns
+            );
 
             float local_sum = 0.0f;
             float scaled_s_absmax = 0.0f;
@@ -252,10 +588,24 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
                 sS_out(h, token_base + i) = e4m3(p[i] / float(scale_g));
             }
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].s_quantized_ns
+            );
 
             plan.rowwise_li_buf[idx_in_warpgroup] = local_sum;
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].li_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg0_sync
+                ))
+            );
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].softmax_ready_ns
+            );
 
             if (token_group == 0) {
                 float cur_sum = local_sum + plan.rowwise_li_buf[idx_in_warpgroup + B_H];
@@ -264,25 +614,72 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 plan.head_real_mi[h] = max(plan.head_real_mi[h], cur_pi_max);
                 plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
                 if (k > 0) {
-                    plan.bar_sv_done[(k - 1) % NUM_BUFS].wait(((k - 1) / NUM_BUFS) & 1);
+                    MXFP8_TIMED_WAIT(
+                        trace_wg0_tile,
+                        plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns,
+                        plan.bar_sv_done[(k - 1) % NUM_BUFS].wait(
+                            ((k - 1) / NUM_BUFS) & 1
+                        )
+                    );
                 }
             }
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].head_updated_ns
+            );
 
             plan.bar_k_valid_free[cur_buf].arrive();
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            MXFP8_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].pre_rescale_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg0_sync
+                ))
+            );
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].pre_rescale_ready_ns
+            );
 
             if (k > 0) {
                 ku::tcgen05_after_thread_sync();
                 rescale_O_t<B_H, B_H_TMEM, tmem_cols::O, D_V>(plan.head_scale);
                 ku::tcgen05_before_thread_sync();
-                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                MXFP8_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.barrier_timing.wg0[warp_idx][k].rescale_done_ns
+                );
+                MXFP8_TIMED_WAIT(
+                    trace_wg0_tile,
+                    plan.barrier_timing.wg0[warp_idx][k].rescale_wait_ns,
+                    (NamedBarrier::arrive_and_wait(
+                        128, NamedBarriers::wg0_sync
+                    ))
+                );
+            } else {
+                MXFP8_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.barrier_timing.wg0[warp_idx][k].rescale_done_ns
+                );
             }
 
             if (idx_in_warpgroup == 0) {
                 plan.bar_so_ready.arrive();
             }
+            MXFP8_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].s_arrived_ns
+            );
+            MXFP8_MARK_WARP(
+                "MXFP8_MARK 11 wg0_s_ready warp=%d tile=%d",
+                warp_idx,
+                k
+            );
         }
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+        const bool trace_epilogue = s_q_idx == 0 && lane_idx == 0;
+#endif
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
         if (idx_in_warpgroup < B_H) {
             float mi = plan.head_mi[idx_in_warpgroup];
@@ -300,8 +697,22 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             params.max_logits[global_index] = real_mi*CUDART_LN2_F;
             params.lse[global_index] = cur_lse;
         }
+        MXFP8_TIMEPOINT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].stats_stored_ns
+        );
 
-        plan.bar_sv_done[(num_k_blocks-1)%NUM_BUFS].wait(((num_k_blocks-1)/NUM_BUFS)&1);
+        MXFP8_TIMED_WAIT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].final_sv_wait_ns,
+            plan.bar_sv_done[(num_k_blocks - 1) % NUM_BUFS].wait(
+                ((num_k_blocks - 1) / NUM_BUFS) & 1
+            )
+        );
+        MXFP8_TIMEPOINT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].final_sv_ready_ns
+        );
         ku::tcgen05_after_thread_sync();
 
         if (idx_in_warpgroup < B_H) {
@@ -312,7 +723,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 : __fdividef(1.0f, plan.head_li[h] + exp2f(attn_sink - plan.head_mi[h]));
             plan.head_scale[h] = output_scale;
         }
-        NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+        MXFP8_TIMED_WAIT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].scale_sync_wait_ns,
+            (NamedBarrier::arrive_and_wait(
+                128, NamedBarriers::wg0_sync
+            ))
+        );
+        MXFP8_TIMEPOINT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].scale_ready_ns
+        );
 
         {
             Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.data()), SmemLayoutO{});
@@ -331,7 +752,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 }
             }
         }
-        NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+        MXFP8_TIMEPOINT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].o_staged_ns
+        );
+        MXFP8_TIMED_WAIT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].o_sync_wait_ns,
+            (NamedBarrier::arrive_and_wait(
+                128, NamedBarriers::wg0_sync
+            ))
+        );
 
         // Store O using TMA
         constexpr int B_EPI = 64;
@@ -356,21 +787,41 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 );
             }
         }
+        MXFP8_TIMEPOINT(
+            trace_epilogue,
+            plan.barrier_timing.epilogue[warp_idx].store_issued_ns
+        );
 
         if (warp_idx == 0) {
             cute::TMEM::Allocator1Sm().free(0, 512);
         }
+        MXFP8_MARK_WARP(
+            "MXFP8_MARK 12 wg0_epilogue_done warp=%d",
+            warp_idx
+        );
     } else if (warpgroup_idx == 1) {
         // Producer warp for KV
         int producer_warp_idx = cutlass::canonical_warp_idx_sync() - 4;
         constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_KV_PRODUCER_WARPS;
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+            const bool trace_kv_tile = s_q_idx == 0
+                && lane_idx == 0 && k < MXFP8_TIMING_MAX_TILES;
+#endif
+            MXFP8_TIMEPOINT(
+                trace_kv_tile,
+                plan.barrier_timing.kv[producer_warp_idx][k].tile_start_ns
+            );
             int4 indices[NUM_LOCAL_ROWS_PER_WARP];
             if (elect_one_sync()) {
                 // Copy NoPE data with gather4.
                 int cur_buf = k%NUM_BUFS;
-                plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
+                MXFP8_TIMED_WAIT(
+                    trace_kv_tile,
+                    plan.barrier_timing.kv[producer_warp_idx][k].sv_free_wait_ns,
+                    plan.bar_sv_done[cur_buf].wait((k / NUM_BUFS) & 1 ^ 1)
+                );
 
                 bool has_valid_index = false;
                 CUTE_UNROLL
@@ -389,9 +840,19 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     }
                 }
                 plan.kv_warp_has_valid[cur_buf][producer_warp_idx] = has_valid_index;
+                MXFP8_TIMEPOINT(
+                    trace_kv_tile,
+                    plan.barrier_timing.kv[producer_warp_idx][k].indices_ready_ns
+                );
             }
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
+            MXFP8_TIMED_WAIT(
+                trace_kv_tile,
+                plan.barrier_timing.kv[producer_warp_idx][k].indices_sync_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg1_tma_sync
+                ))
+            );
 
             if (elect_one_sync()) {
                 int cur_buf = k%NUM_BUFS;
@@ -406,7 +867,17 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 }
             }
             fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg1_tma_sync);
+            MXFP8_TIMEPOINT(
+                trace_kv_tile,
+                plan.barrier_timing.kv[producer_warp_idx][k].transaction_ready_ns
+            );
+            MXFP8_TIMED_WAIT(
+                trace_kv_tile,
+                plan.barrier_timing.kv[producer_warp_idx][k].transaction_sync_wait_ns,
+                (NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg1_tma_sync
+                ))
+            );
 
             int cur_buf = k%NUM_BUFS;
             uint8_t* sK_base = reinterpret_cast<uint8_t*>(plan.kvo.kv.kv[cur_buf].data());
@@ -451,95 +922,43 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
                 }
             }
+            MXFP8_TIMEPOINT(
+                trace_kv_tile,
+                plan.barrier_timing.kv[producer_warp_idx][k].tma_issued_ns
+            );
+            MXFP8_MARK_WARP(
+                "MXFP8_MARK 20 kv_tma_issued warp=%d tile=%d",
+                warp_idx,
+                k
+            );
         }
     } else {
         if (warp_idx == 8 && elect_one_sync()) {
 
             Tensor sQ_dup = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQDuplicated{});
-            plan.bar_prologue_q.wait(0);
+            MXFP8_MARK_ONE("MXFP8_MARK 30 mma_start");
+            MXFP8_TIMED_WAIT(
+                s_q_idx == 0,
+                plan.barrier_timing.q_tma_wait_ns,
+                plan.bar_prologue_q.wait(0)
+            );
 
-            plan.bar_prologue_q_scale.wait(0);
-            Tensor sQ_scale_tma = make_tensor(
-                make_smem_ptr(plan.s_q_scale.q_scale.compact.data()),
-                SmemLayoutQScaleTMA{}
+            MXFP8_TIMED_WAIT(
+                s_q_idx == 0,
+                plan.barrier_timing.q_scale_sync_wait_ns,
+                plan.bar_prologue_q_scale.wait(0)
             );
-            Tensor sQ_scale_mma = make_tensor(
-                make_smem_ptr(plan.s_q_scale.q_scale.mma.data()),
-                SmemLayoutPScaleAAtom{}
-            );
-            constexpr int QK_SCALE_GROUPS = QK_K / MXFP8_SCALE_VEC_SIZE;
-            CUTE_UNROLL
-            for (int row = 0; row < QK_M; ++row) {
-                CUTE_UNROLL
-                for (int g = 0; g < QK_SCALE_GROUPS; ++g) {
-                    auto dst_coord = make_coord(
-                        g % SCALE_GROUPS_PER_TMEM_BLOCK,
-                        g / SCALE_GROUPS_PER_TMEM_BLOCK
-                    );
-                    sQ_scale_mma(row, _0{}, dst_coord) =
-                        sQ_scale_tma(row % B_H, g);
-                }
-            }
-            fence_view_async_shared();
-            auto copy_q_scale_to_tmem = [&](e8m0* scale_storage) {
-                CUTE_UNROLL
-                for (int sf_block = 0; sf_block < QK_K / 128; ++sf_block) {
-                    Tensor sQ_block = make_tensor(
-                        make_smem_ptr(
-                            scale_storage
-                            + sf_block * cosize_v<SmemLayoutPScaleABlockAtom>
-                        ),
-                        SmemLayoutPScaleABlockAtom{}
-                    );
-                    Tensor tQ_block = make_tensor<typename TiledMMA_P::FrgTypeSFA>(
-                        shape(SmemLayoutPScaleABlockAtom{})
-                    );
-                    tQ_block.data().get() = tmem_cols::Q_Scale
-                        + sf_block * TMEM_SCALE_K128_STRIDE;
-                    auto sQ_compact = make_tensor(
-                        sQ_block.data(), filter_zeros(sQ_block.layout())
-                    );
-                    auto tQ_compact = make_tensor(
-                        tQ_block.data(), filter_zeros(tQ_block.layout())
-                    );
-                    auto copy_Q_scale = make_utccp_copy(
-                        SM100_UTCCP_4x32dp128bit_1cta{}, tQ_compact
-                    );
-                    auto thr_Q = copy_Q_scale.get_slice(0);
-                    auto src_Q = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_1cta>(
-                        thr_Q.partition_S(sQ_compact)
-                    );
-                    auto dst_Q = thr_Q.partition_D(tQ_compact);
-                    cute::copy(copy_Q_scale, src_Q, dst_Q);
-                }
-            };
-            copy_q_scale_to_tmem(plan.s_q_scale.q_scale.mma.data());
-
-            // V's token-dependent U(t) is folded into S before S is
-            // quantized. The remaining W(g) is applied in the epilogue, so
-            // every logical V scale consumed by the SV MMA is one.
-            Tensor sV_scale_one = make_tensor(
-                make_smem_ptr(plan.s_scale.data()),
-                SmemLayoutOScaleAAtom{}
-            );
-            uint8_t* sV_scale_storage = reinterpret_cast<uint8_t*>(plan.s_scale.data());
-            CUTE_NO_UNROLL
-            for (int i = 0; i < cosize_v<SmemLayoutOScaleAAtom>; ++i) {
-                sV_scale_storage[i] = UE8M0_ONE_BITS;
-            }
-            fence_view_async_shared();
-            auto sV_compact = make_tensor(sV_scale_one.data(), filter_zeros(sV_scale_one.layout()));
-            auto tV_compact = make_tensor(tV_scale.data(), filter_zeros(tV_scale.layout()));
-            auto copy_V_scale = make_utccp_copy(SM100_UTCCP_4x32dp128bit_1cta{}, tV_compact);
-            auto thr_V = copy_V_scale.get_slice(0);
-            auto src_V = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_1cta>(
-                thr_V.partition_S(sV_compact)
-            );
-            auto dst_V = thr_V.partition_D(tV_compact);
-            cute::copy(copy_V_scale, src_V, dst_V);
 
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks+1; ++k) {
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+                const bool trace_mma_iter = s_q_idx == 0
+                    && k <= MXFP8_TIMING_MAX_TILES;
+#endif
+                MXFP8_TIMEPOINT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].iter_start_ns
+                );
                 if (k < num_k_blocks) {
                     // Pi = QKi^T
                     int cur_buf = k % NUM_BUFS;
@@ -549,10 +968,22 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         SmemLayoutK_TiledMMA{}
                     );
 
-                    plan.bar_p_free[p_stage].wait(((k / NUM_P_BUFS) & 1) ^ 1);
+                    MXFP8_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].p_free_wait_ns,
+                        plan.bar_p_free[p_stage].wait(
+                            ((k / NUM_P_BUFS) & 1) ^ 1
+                        )
+                    );
                     ku::tcgen05_after_thread_sync();
 
-                    plan.bar_kv_scale_ready[cur_buf].wait((k/NUM_BUFS)&1);
+                    MXFP8_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].kv_scale_wait_ns,
+                        plan.bar_kv_scale_ready[cur_buf].wait(
+                            (k / NUM_BUFS) & 1
+                        )
+                    );
                     CUTE_UNROLL
                     for (int sf_block = 0; sf_block < QK_K / 128; ++sf_block) {
                         Tensor sK_block = make_tensor(
@@ -583,8 +1014,20 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         auto dst_K = thr_K.partition_D(tK_compact);
                         cute::copy(copy_K_scale, src_K, dst_K);
                     }
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].k_scale_ready_ns
+                    );
 
-                    plan.bar_kv_ready[cur_buf].wait((k/NUM_BUFS)&1);
+                    MXFP8_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].kv_wait_ns,
+                        plan.bar_kv_ready[cur_buf].wait((k / NUM_BUFS) & 1)
+                    );
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].kv_ready_ns
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     ku::utcmma_blockscaled_ss(
@@ -598,6 +1041,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
 
                     ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].qk_committed_ns
+                    );
+                    MXFP8_MARK_ONE(
+                        "MXFP8_MARK 31 qk_committed tile=%d",
+                        k
+                    );
                 }
 
                 if (k > 0) {
@@ -609,7 +1060,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     Tensor sV = make_tensor(make_smem_ptr(plan.kvo.kv.kv[cur_buf].data()), SmemLayoutV{});
 
                     // Wait for S(i-1) and O to be scaled
-                    plan.bar_so_ready.wait((k-1)&1);
+                    MXFP8_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].s_ready_wait_ns,
+                        plan.bar_so_ready.wait((k - 1) & 1)
+                    );
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].s_ready_ns
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     auto sS_compact = make_tensor(sS_scale.data(), filter_zeros(sS_scale.layout()));
@@ -622,6 +1081,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     auto dst_S = thr_S.partition_D(tS_compact);
                     cute::copy(copy_S_scale, src_S, dst_S);
                     ku::tcgen05_after_thread_sync();
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].s_scale_ready_ns
+                    );
 
                     // O += sS @ sV
                     CUTE_UNROLL
@@ -634,15 +1097,32 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                         );
                     }
                     ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
+                    MXFP8_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].sv_committed_ns
+                    );
+                    MXFP8_MARK_ONE(
+                        "MXFP8_MARK 32 sv_committed tile=%d",
+                        k - 1
+                    );
                 }
 
             }
+            MXFP8_MARK_ONE("MXFP8_MARK 33 mma_done");
 
         } else if (warp_idx == 9) {
             // KV valid loading warp
             if (lane_idx < B_TOPK/8) {
                 CUTE_NO_UNROLL
                 for (int k = 0; k < num_k_blocks; ++k) {
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+                    const bool trace_mask_tile = s_q_idx == 0
+                        && lane_idx == 0 && k < MXFP8_TIMING_MAX_TILES;
+#endif
+                    MXFP8_TIMEPOINT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].tile_start_ns
+                    );
                     char k_validness_mask = load_indices_and_generate_mask(
                         lane_idx,
                         gIndices + k*B_TOPK,
@@ -652,9 +1132,23 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                     );
 
                     int cur_buf = k%NUM_BUFS;
-                    plan.bar_k_valid_free[cur_buf].wait((k/NUM_BUFS)&1^1);
+                    MXFP8_TIMED_WAIT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].buffer_free_wait_ns,
+                        plan.bar_k_valid_free[cur_buf].wait(
+                            (k / NUM_BUFS) & 1 ^ 1
+                        )
+                    );
                     plan.is_k_valid[cur_buf][lane_idx] = k_validness_mask;
                     plan.bar_k_valid_ready[cur_buf].arrive();
+                    MXFP8_TIMEPOINT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].arrived_ns
+                    );
+                    MXFP8_MARK_WARP(
+                        "MXFP8_MARK 40 mask_arrived tile=%d",
+                        k
+                    );
                 }
             }
         } else if (warp_idx == 10 || warp_idx == 11) {
@@ -680,8 +1174,22 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+                const bool trace_scale_tile = s_q_idx == 0
+                    && lane_idx == 0 && k < MXFP8_TIMING_MAX_TILES;
+#endif
+                MXFP8_TIMEPOINT(
+                    trace_scale_tile,
+                    plan.barrier_timing.scale[scale_warp_idx][k].tile_start_ns
+                );
                 int cur_buf = k % NUM_BUFS;
-                plan.bar_sv_done[cur_buf].wait((k / NUM_BUFS) & 1 ^ 1);
+                MXFP8_TIMED_WAIT(
+                    trace_scale_tile,
+                    plan.barrier_timing.scale[scale_warp_idx][k].buffer_free_wait_ns,
+                    plan.bar_sv_done[cur_buf].wait(
+                        (k / NUM_BUFS) & 1 ^ 1
+                    )
+                );
                 Tensor sK_scale = make_tensor(
                     make_smem_ptr(plan.kvo.kv.kv_scale[cur_buf].data()),
                     SmemLayoutPScaleBAtom{}
@@ -730,10 +1238,29 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 if (elect_one_sync()) {
                     plan.bar_kv_scale_ready[cur_buf].arrive();
                 }
+                MXFP8_TIMEPOINT(
+                    trace_scale_tile,
+                    plan.barrier_timing.scale[scale_warp_idx][k].arrived_ns
+                );
+                MXFP8_MARK_WARP(
+                    "MXFP8_MARK 50 scale_arrived warp=%d tile=%d",
+                    warp_idx,
+                    k
+                );
             }
         }
     }
 
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+    if (s_q_idx == 0 && lane_idx == 0) {
+        plan.barrier_timing.branch_end_ns[warp_idx] = mxfp8_timing_now_ns()
+            - plan.barrier_timing.origin_ns;
+    }
+    __syncthreads();
+    if (s_q_idx == 0 && threadIdx.x == 0) {
+        print_mxfp8_barrier_timing(plan, num_k_blocks);
+    }
+#endif
 
 #else
     if (cute::thread0()) {
@@ -742,6 +1269,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 #endif
 }
 
+#undef MXFP8_MARK_WARP
+#undef MXFP8_MARK_ONE
+#undef MXFP8_TIMED_WAIT
+#undef MXFP8_TIMEPOINT
 
 template<int D_QK>
 void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
@@ -758,6 +1289,10 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
     KU_ASSERT(params.stride_kv_s_kv == params.h_kv * KV_BYTES_PER_TOKEN,
         "packed KV storage must be contiguous across tokens");
     KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0, "q must be 16-byte aligned");
+    KU_ASSERT(params.stride_q_h_q % alignof(uint32_t) == 0,
+        "stride_q_h_q must be 4-byte aligned for direct Q-scale loads");
+    KU_ASSERT(params.stride_q_s_q % alignof(uint32_t) == 0,
+        "stride_q_s_q must be 4-byte aligned for direct Q-scale loads");
     KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0, "kv must be 16-byte aligned");
     KU_ASSERT(params.kv_scale_w != nullptr);
     KU_ASSERT(reinterpret_cast<int64_t>(params.kv_scale_w) % 8 == 0, "kv_scale_w must be 8-byte aligned");
@@ -789,19 +1324,6 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
         SmemLayoutQBlock{}
     );
 
-    auto shape_Q_scale = make_shape(B_H, Q_SCALE_BYTES, params.s_q);
-    auto tma_Q_scale = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(
-            make_gmem_ptr((e8m0*)((uint8_t*)params.q + D_Q)),
-            make_layout(
-                shape_Q_scale,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
-            )
-        ),
-        SmemLayoutQScaleTMA{}
-    );
-
     CUtensorMap tensor_map_kv = ku::make_tensor_map(
             {D_K / 8, static_cast<uint64_t>(params.s_kv)},
             {D_K},
@@ -814,12 +1336,10 @@ void run_mxfp8_fwd_phase1_kernel(const MxFp8SparseAttnFwdParams& params) {
 
     TmaParams<
         decltype(shape_O), decltype(tma_O),
-        decltype(shape_Q), decltype(tma_Q),
-        decltype(shape_Q_scale), decltype(tma_Q_scale)
+        decltype(shape_Q), decltype(tma_Q)
     > tma_params = {
         shape_O, tma_O,
         shape_Q, tma_Q,
-        shape_Q_scale, tma_Q_scale,
         tensor_map_kv
     };
 

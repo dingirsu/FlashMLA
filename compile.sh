@@ -46,6 +46,14 @@ NVCC_FLAGS=(
     --compiler-options=-fPIC
 )
 
+if [[ "${MXFP8_DEBUG_MARKERS:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DMXFP8_FWD_DEBUG_MARKERS=1 )
+fi
+
+if [[ "${MXFP8_BARRIER_TIMING:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DMXFP8_FWD_BARRIER_TIMING=1 )
+fi
+
 "$CXX" \
     "${INCLUDES[@]}" \
     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \

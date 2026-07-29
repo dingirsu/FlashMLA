@@ -20,13 +20,11 @@ using e8m0 = cutlass::float_ue8m0_t;
 
 template<
     typename Shape_O, typename TMA_O,
-    typename Shape_Q, typename TMA_Q,
-    typename Shape_Q_Scale, typename TMA_Q_Scale
+    typename Shape_Q, typename TMA_Q
 >
 struct TmaParams {
     Shape_O shape_O; TMA_O tma_O;
     Shape_Q shape_Q; TMA_Q tma_Q;
-    Shape_Q_Scale shape_Q_scale; TMA_Q_Scale tma_Q_scale;
     CUtensorMap tensor_map_kv;
 };
 
@@ -45,7 +43,6 @@ constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
 constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
 constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
 constexpr int KV_SCALE_ANCHOR = 0;
-constexpr uint8_t UE8M0_ONE_BITS = 0x7f;
 constexpr int Q_BYTES_PER_TOKEN = D_Q + Q_SCALE_BYTES;
 constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
 constexpr int TMA_K_CHUNK_BYTES = 128;
@@ -66,7 +63,6 @@ constexpr int NUM_THREADS = 128 + 128 + 128;
 constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
 constexpr float FP8_MAX = 448.0f;
-constexpr int Q_SCALE_SMEM_ELEMS = B_H * (D / MXFP8_SCALE_VEC_SIZE);
 
 static_assert(Q_BYTES_PER_TOKEN == 528);
 static_assert(KV_BYTES_PER_TOKEN == 520);
@@ -105,12 +101,6 @@ using SmemLayoutQDuplicated = decltype(coalesce(tile_to_shape(
     Shape<Int<QK_M>, Int<D_Q>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
-
-
-using SmemLayoutQScaleTMA = Layout<
-    Shape<Int<B_H>, Int<Q_SCALE_BYTES>>,
-    Stride<Int<Q_SCALE_BYTES>, _1>
->;
 
 template<int NUM_TILES>
 using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(
@@ -183,6 +173,88 @@ using SmemLayoutOScaleAAtom = decltype(cutlass::detail::Sm1xxBlockScaledConfig<M
 
 static_assert(cosize_v<SmemLayoutOScaleAAtom> <= cosize_v<SmemLayoutOScaleBAtom>);
 
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+constexpr int MXFP8_TIMING_MAX_TILES = 8;
+
+struct MxFp8Wg0Timing {
+    uint64_t tile_start_ns;
+    uint64_t tile_sync_wait_ns;
+    uint64_t qk_wait_ns;
+    uint64_t valid_wait_ns;
+    uint64_t waits_done_ns;
+    uint64_t p_released_ns;
+    uint64_t p_prepared_ns;
+    uint64_t rowmax_wait_ns;
+    uint64_t rowmax_ready_ns;
+    uint64_t s_quantized_ns;
+    uint64_t li_wait_ns;
+    uint64_t softmax_ready_ns;
+    uint64_t sv_wait_ns;
+    uint64_t head_updated_ns;
+    uint64_t pre_rescale_wait_ns;
+    uint64_t pre_rescale_ready_ns;
+    uint64_t rescale_done_ns;
+    uint64_t rescale_wait_ns;
+    uint64_t s_arrived_ns;
+};
+
+struct MxFp8KvProducerTiming {
+    uint64_t tile_start_ns;
+    uint64_t sv_free_wait_ns;
+    uint64_t indices_ready_ns;
+    uint64_t indices_sync_wait_ns;
+    uint64_t transaction_ready_ns;
+    uint64_t transaction_sync_wait_ns;
+    uint64_t tma_issued_ns;
+};
+
+struct MxFp8MmaTiming {
+    uint64_t iter_start_ns;
+    uint64_t p_free_wait_ns;
+    uint64_t kv_scale_wait_ns;
+    uint64_t k_scale_ready_ns;
+    uint64_t kv_wait_ns;
+    uint64_t kv_ready_ns;
+    uint64_t qk_committed_ns;
+    uint64_t s_ready_wait_ns;
+    uint64_t s_ready_ns;
+    uint64_t s_scale_ready_ns;
+    uint64_t sv_committed_ns;
+};
+
+struct MxFp8SimpleProducerTiming {
+    uint64_t tile_start_ns;
+    uint64_t buffer_free_wait_ns;
+    uint64_t arrived_ns;
+};
+
+struct MxFp8EpilogueTiming {
+    uint64_t final_sv_wait_ns;
+    uint64_t final_sv_ready_ns;
+    uint64_t stats_stored_ns;
+    uint64_t scale_sync_wait_ns;
+    uint64_t scale_ready_ns;
+    uint64_t o_staged_ns;
+    uint64_t o_sync_wait_ns;
+    uint64_t store_issued_ns;
+};
+
+struct MxFp8BarrierTiming {
+    uint64_t origin_ns;
+    uint64_t branch_end_ns[12];
+    uint64_t q_tma_wait_ns;
+    uint64_t q_scale_sync_wait_ns;
+    uint64_t q_scale_tmem_committed_ns;
+    uint64_t v_scale_tmem_committed_ns;
+    MxFp8Wg0Timing wg0[4][MXFP8_TIMING_MAX_TILES];
+    MxFp8KvProducerTiming kv[4][MXFP8_TIMING_MAX_TILES];
+    MxFp8MmaTiming mma[MXFP8_TIMING_MAX_TILES + 1];
+    MxFp8SimpleProducerTiming mask[MXFP8_TIMING_MAX_TILES];
+    MxFp8SimpleProducerTiming scale[2][MXFP8_TIMING_MAX_TILES];
+    MxFp8EpilogueTiming epilogue[4];
+};
+#endif
+
 struct SharedMemoryPlan {
     array_aligned<e4m3, QK_M*D_Q> q;
     union {
@@ -192,10 +264,13 @@ struct SharedMemoryPlan {
         } kv;
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } kvo;
+    // Keep the historical union footprint/alignment: the neighboring SMEM
+    // tensor descriptors rely on this placement even though Q scales now
+    // bypass this staging storage.
     union {
         e4m3 s[B_H*B_TOPK];
         struct {
-            array_aligned<e8m0, Q_SCALE_SMEM_ELEMS> compact;
+            array_aligned<e8m0, B_H * (D / MXFP8_SCALE_VEC_SIZE)> compact;
             array_aligned<e8m0, cosize_v<SmemLayoutPScaleAAtom>> mma;
         } q_scale;
     } s_q_scale;
@@ -214,6 +289,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
+#if defined(MXFP8_FWD_BARRIER_TIMING)
+    MxFp8BarrierTiming barrier_timing;
+#endif
 };
 
 static_assert(cosize_v<SmemLayoutQDuplicated> == 2 * cosize_v<SmemLayoutQ>);
@@ -227,6 +305,7 @@ static_assert(sizeof(SharedMemoryPlan) < 227 * 1024, "MXFP8 prefill shared memor
 enum NamedBarriers : int {
     wg0_sync = 0,
     wg1_tma_sync = 1,
+    q_scale_sync = 2,
 };
 
 } // namespace sm100::mxfp8_fwd::head64

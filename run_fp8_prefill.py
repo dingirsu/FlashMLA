@@ -170,8 +170,8 @@ def main() -> None:
     major, _ = torch.cuda.get_device_capability()
     if major != 10:
         raise RuntimeError("the FP8 kernel requires an SM100-family GPU")
-    if TOPK < 64 or TOPK % 64 != 0 or TOPK > S_KV:
-        raise ValueError("TOPK must be a multiple of 64 in [64, S_KV]")
+    if TOPK < 128 or TOPK % 128 != 0 or TOPK > S_KV:
+        raise ValueError("TOPK must be a multiple of 128 in [128, S_KV]")
 
     torch.manual_seed(SEED)
     device = torch.device("cuda")

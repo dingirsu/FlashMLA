@@ -38,13 +38,13 @@ constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
-constexpr int B_TOPK = 64;
+constexpr int B_TOPK = 128;
 constexpr int QK_M = B_TOPK * 2;
 constexpr int QK_K = D_K / 2;
 constexpr int SV_M = 128;
 
-constexpr int NUM_BUFS = 3;
-constexpr int NUM_P_BUFS = 3;
+constexpr int NUM_BUFS = 2;
+constexpr int NUM_P_BUFS = 1;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 constexpr int B_H_TMEM = B_H;
@@ -172,7 +172,7 @@ struct Fp8BarrierTiming {
 struct SharedMemoryPlan {
     union {
         struct {
-            array_aligned<e4m3, cosize_v<SmemLayoutK>> _kv[2]; // to align with kv[2]
+            array_aligned<e4m3, cosize_v<SmemLayoutK>> _kv[NUM_BUFS - 1];
             array_aligned<e4m3, cosize_v<SmemLayoutQ>> q;
         } q;
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_BUFS];
@@ -201,7 +201,7 @@ struct SharedMemoryPlan {
 
 // may change to bf16 accumulator for better speed
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, 128, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK * 2, UMMA::Major::K, UMMA::Major::K>{}
 )); // maybe p output can be bf16 and use bf16 add to make one fp32
 
 using TiledMMA_O = decltype(make_tiled_mma(

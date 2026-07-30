@@ -28,7 +28,7 @@ from fp8_test_utils import (
 )
 
 
-B_TOPK = 64
+B_TOPK = 128
 MMA_K = 32
 SV_M = 128
 MAX_INIT_VAL = -1.0e30
@@ -252,8 +252,8 @@ def phase1_token_tile_reference(
             softmax_s = torch.exp2(p_masked - new_mi.unsqueeze(-1))
             cur_sum_halves = torch.stack(
                 (
-                    softmax_s[:, :32].sum(dim=-1),
-                    softmax_s[:, 32:].sum(dim=-1),
+                    softmax_s[:, : B_TOPK // 2].sum(dim=-1),
+                    softmax_s[:, B_TOPK // 2 :].sum(dim=-1),
                 ),
                 dim=-1,
             )
@@ -511,7 +511,7 @@ def _case_single_token_load_and_scale() -> None:
 def _case_random_two_tiles() -> None:
     device = torch.device("cuda")
     torch.manual_seed(20260724)
-    s_q, s_kv, topk = 3, 192, 128
+    s_q, s_kv, topk = 3, 384, 256
     q = torch.randn((s_q, H_Q, D_HEAD), device=device) * 0.35
     kv = torch.randn((s_kv, 1, D_HEAD), device=device) * 0.35
     packed_q, _, _, _ = pack_q_per_head(q)
@@ -520,7 +520,7 @@ def _case_random_two_tiles() -> None:
     indices = torch.stack(
         [torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]
     ).to(torch.int32).unsqueeze(1)
-    length = torch.tensor([128, 73, 64], device=device, dtype=torch.int32)
+    length = torch.tensor([256, 173, 128], device=device, dtype=torch.int32)
     attn_sink = torch.linspace(-1.0, 1.0, H_Q, device=device)
     _run_and_check(
         "random rank-1 KV, two tiles",
@@ -537,7 +537,7 @@ def _case_random_two_tiles() -> None:
 def _case_pipeline_reuse() -> None:
     device = torch.device("cuda")
     torch.manual_seed(20260725)
-    s_q, s_kv, topk = 2, 384, 320
+    s_q, s_kv, topk = 2, 512, 384
     q = torch.randn((s_q, H_Q, D_HEAD), device=device) * 0.3
     kv = torch.randn((s_kv, 1, D_HEAD), device=device) * 0.3
     packed_q, _, _, _ = pack_q_per_head(q)
@@ -546,9 +546,9 @@ def _case_pipeline_reuse() -> None:
     indices = torch.stack(
         [torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]
     ).to(torch.int32).unsqueeze(1)
-    length = torch.tensor([320, 257], device=device, dtype=torch.int32)
+    length = torch.tensor([384, 257], device=device, dtype=torch.int32)
     _run_and_check(
-        "five tiles with P0/P1/P2 and KV stage reuse",
+        "three tiles with KV stage reuse",
         packed_q,
         packed_kv,
         w,
@@ -561,20 +561,20 @@ def _case_pipeline_reuse() -> None:
 def _case_invalid_mask() -> None:
     device = torch.device("cuda")
     torch.manual_seed(20260726)
-    s_q, s_kv, topk = 3, 64, 64
+    s_q, s_kv, topk = 3, 96, B_TOPK
     q = torch.randn((s_q, H_Q, D_HEAD), device=device) * 0.25
     kv = torch.randn((s_kv, 1, D_HEAD), device=device) * 0.25
     packed_q, _, _, _ = pack_q_per_head(q)
     packed_kv, _, _, w_scale, _ = pack_kv_rank1(kv)
     w = w_scale.to(torch.float8_e8m0fnu).view(torch.uint8)
 
-    indices = torch.stack(
-        [torch.randperm(s_kv, device=device) for _ in range(s_q)]
-    ).to(torch.int32).unsqueeze(1)
+    indices = torch.randint(
+        s_kv, (s_q, 1, topk), device=device, dtype=torch.int32
+    )
     indices[1, 0, 7] = -1
     indices[1, 0, 19] = s_kv + 11
     indices[2].fill_(-1)
-    length = torch.tensor([64, 37, 0], device=device, dtype=torch.int32)
+    length = torch.tensor([128, 91, 0], device=device, dtype=torch.int32)
     _run_and_check(
         "invalid indices and zero topk_length",
         packed_q,

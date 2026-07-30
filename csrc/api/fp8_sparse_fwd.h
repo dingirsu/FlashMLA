@@ -56,7 +56,7 @@ static std::vector<at::Tensor> fp8_sparse_attn_prefill_interface(
         kv.size(1) == kv_bytes_per_token,
         "kv last dim must be ", kv_bytes_per_token, ", got ", kv.size(1)
     );
-    TORCH_CHECK(topk >= 64 && topk % 64 == 0, "topk must be a positive multiple of 64");
+    TORCH_CHECK(topk >= 128 && topk % 128 == 0, "topk must be a positive multiple of 128");
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);

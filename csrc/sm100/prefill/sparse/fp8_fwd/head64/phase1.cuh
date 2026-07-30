@@ -261,13 +261,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<(D_V/2)/2>>{})
     );
 
-    Tensor tP0 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
-    Tensor tP1 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
-    Tensor tP2 = partition_fragment_C(tiled_mma_P, Shape<Int<B_H>, _128>{});
+    Tensor tP = partition_fragment_C(
+        tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK * 2>>{}
+    );
     Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<B_H>, Int<D_V>>{});
-    tP0.data().get() = tmem_cols::P;
-    tP1.data().get() = tmem_cols::P + 64;
-    tP2.data().get() = tmem_cols::P + 128;
+    tP.data().get() = tmem_cols::P;
     tQ_part0.data().get() = tmem_cols::Q;
     tQ_part1.data().get() = tmem_cols::Q + 32;
     tO.data().get() = tmem_cols::O;
@@ -432,48 +430,29 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             );
             ku::tcgen05_after_thread_sync();
 
-            // One scale per lane stays in registers; shuffles expose the 32
-            // token scales needed by every head in this half tile.
-            const float lane_kv_scale =
-                plan.kv_dim_scale[cur_buf][token_base + lane_idx];
+            // Each lane holds two scales; shuffles expose this thread's
+            // 64-token half of the 128-token tile.
+            float lane_kv_scale[NUM_ELEMS_PER_THREAD / 32];
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD / 32; ++i) {
+                lane_kv_scale[i] = plan.kv_dim_scale[cur_buf][
+                    token_base + i * 32 + lane_idx
+                ];
+            }
 
             // Load P
             float p[NUM_ELEMS_PER_THREAD];
             auto release_p = [&]() { plan.bar_p_free[p_idx].arrive(); };
-            if (p_idx == 0) {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
-            } else if (p_idx == 1) {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P + 64,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
-            } else {
-                retrieve_mask_and_reduce_p<
-                    NUM_ELEMS_PER_THREAD,
-                    tmem_cols::P + 128,
-                    NamedBarriers::wg0_warp02_sync,
-                    NamedBarriers::wg0_warp13_sync,
-                    false
-                >(
-                    plan.is_k_valid[cur_buf], warp_idx, lane_idx,
-                    release_p, plan.p_exchange_buf, p
-                );
-            }
+            retrieve_mask_and_reduce_p<
+                NUM_ELEMS_PER_THREAD,
+                tmem_cols::P,
+                NamedBarriers::wg0_warp02_sync,
+                NamedBarriers::wg0_warp13_sync,
+                false
+            >(
+                plan.is_k_valid[cur_buf], warp_idx, lane_idx,
+                release_p, plan.p_exchange_buf, p
+            );
             plan.bar_k_valid_free[cur_buf].arrive();
             FP8_TIMEPOINT(
                 trace_wg0_tile,
@@ -488,7 +467,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
                 const float kv_scale = __shfl_sync(
-                    0xffffffff, lane_kv_scale, i
+                    0xffffffff, lane_kv_scale[i / 32], i % 32
                 );
                 p[i] *= q_scale * kv_scale * params.sm_scale_div_log2;
             }
@@ -536,7 +515,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 const float softmax_s = exp2f(p[i] - new_max);
                 cur_sum += softmax_s;
                 const float kv_scale = __shfl_sync(
-                    0xffffffff, lane_kv_scale, i
+                    0xffffffff, lane_kv_scale[i / 32], i % 32
                 );
                 p[i] = softmax_s * kv_scale;
                 local_s_max = max(local_s_max, fabsf(p[i]));
@@ -561,7 +540,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             const e8m0 s_scale_e8m0(
                 s_max > 0.0f ? s_max / FP8_MAX : 1.0f
             );
-            const float current_s_scale = 1 / float(s_scale_e8m0);
+            const float current_s_scale = float(s_scale_e8m0);
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
                 const uint16_t s01 = ku::float2_to_e4m3x2_bits(float2{
@@ -810,7 +789,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
                 bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
 
-                if (k == 2) {
+                if (k == NUM_BUFS - 1) {
                     FP8_TIMED_WAIT(
                         trace_kv_tile,
                         plan.barrier_timing.kv[warp_idx][k].q_reuse_wait_ns,
@@ -1003,13 +982,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
                     // P += Q(nope) @ K(nope)^T
                     bool clear_accum = kv_part_idx == 0;
-                    if (p_stage == 0) {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP0, clear_accum);
-                    } else if (p_stage == 1) {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP1, clear_accum);
-                    } else {
-                        ku::utcmma_ts(tiled_mma_P, kv_part_idx ? tQ_part1 : tQ_part0, sK_divided(_, _, kv_part_idx), tP2, clear_accum);
-                    }
+                    ku::utcmma_ts(
+                        tiled_mma_P,
+                        kv_part_idx ? tQ_part1 : tQ_part0,
+                        sK_divided(_, _, kv_part_idx),
+                        tP,
+                        clear_accum
+                    );
                     FP8_TIMEPOINT(
                         trace_mma_iter,
                         plan.barrier_timing.mma[k].qk_issued_ns[kv_part_idx]
@@ -1119,14 +1098,14 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     } else if (warp_idx == 10 || warp_idx == 11) {
         FP8_MARK_WARP("FP8_MARK 50 scale_loader_start warp=%d", warp_idx);
         const int scale_warp_idx = warp_idx - 10;
-        const int scale_row = scale_warp_idx * 32 + lane_idx;
+        const int q_scale_row = scale_warp_idx * 32 + lane_idx;
 
         const uint8_t* q_scale_base =
             reinterpret_cast<const uint8_t*>(params.q)
             + static_cast<int64_t>(s_q_idx) * params.stride_q_s_q
             + B_H * D_Q;
-        plan.q_head_scale[scale_row] = ue8m0_bits_to_float(
-            __ldg(q_scale_base + scale_row)
+        plan.q_head_scale[q_scale_row] = ue8m0_bits_to_float(
+            __ldg(q_scale_base + q_scale_row)
         );
         if (scale_warp_idx == 0 && lane_idx < KV_SCALE_GROUPS) {
             plan.kv_w_scale[lane_idx] = ue8m0_bits_to_float(
@@ -1174,23 +1153,28 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 cur_buf
             );
 
-            const int src_idx = __ldg(
-                gIndices + k * B_TOPK + scale_row
-            );
-            const bool is_valid = src_idx >= 0
-                && src_idx < params.s_kv
-                && k * B_TOPK + scale_row < topk_length;
-            uint8_t scale_bits = 0x7f;
-            if (is_valid) {
-                const uint8_t* kv_scale_ptr =
-                    reinterpret_cast<const uint8_t*>(params.kv)
-                    + static_cast<int64_t>(src_idx)
-                        * params.stride_kv_s_kv
-                    + D_K;
-                scale_bits = __ldg(kv_scale_ptr);
+            CUTE_UNROLL
+            for (int i = 0; i < B_TOPK / 64; ++i) {
+                const int scale_row = scale_warp_idx * (B_TOPK / 2)
+                    + i * 32 + lane_idx;
+                const int src_idx = __ldg(
+                    gIndices + k * B_TOPK + scale_row
+                );
+                const bool is_valid = src_idx >= 0
+                    && src_idx < params.s_kv
+                    && k * B_TOPK + scale_row < topk_length;
+                uint8_t scale_bits = 0x7f;
+                if (is_valid) {
+                    const uint8_t* kv_scale_ptr =
+                        reinterpret_cast<const uint8_t*>(params.kv)
+                        + static_cast<int64_t>(src_idx)
+                            * params.stride_kv_s_kv
+                        + D_K;
+                    scale_bits = __ldg(kv_scale_ptr);
+                }
+                plan.kv_dim_scale[cur_buf][scale_row] =
+                    ue8m0_bits_to_float(scale_bits);
             }
-            plan.kv_dim_scale[cur_buf][scale_row] =
-                ue8m0_bits_to_float(scale_bits);
             fence_view_async_shared();
             if (elect_one_sync()) {
                 plan.bar_kv_scale_ready[cur_buf].arrive();

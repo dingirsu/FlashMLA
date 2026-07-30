@@ -228,15 +228,6 @@ void print_mxfp8_barrier_timing(
 #endif
 
 CUTE_DEVICE
-float ue8m0_bits_to_float(uint8_t bits) {
-    TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
-    if (bits == 0) {
-        return __uint_as_float(0x00400000u); // UE8M0 0x00 is 2^-127.
-    }
-    return __uint_as_float(static_cast<uint32_t>(bits) << 23);
-}
-
-CUTE_DEVICE
 float ue8m0_ratio_to_float(uint8_t numerator_bits, uint8_t denominator_bits) {
     TRAP_ONLY_DEVICE_ASSERT(numerator_bits != 0xff && denominator_bits != 0xff);
     int exponent = static_cast<int>(numerator_bits) - static_cast<int>(denominator_bits);
@@ -250,21 +241,76 @@ float ue8m0_ratio_to_float(uint8_t numerator_bits, uint8_t denominator_bits) {
     return exponent < -149 ? 0.0f : CUDART_INF_F;
 }
 
-template<int B_H, int B_H_TMEM, int TMEM_COL_START, int D_V>
 CUTE_DEVICE
-void rescale_O_t(float scale[B_H]) {
-    float o[B_H_TMEM];
+void transpose_bf16_8x8(uint32_t values[4], int lane_idx) {
+    // Swap the lane and packed-element index bits within each 8-lane group.
     CUTE_UNROLL
-    for (int tile = 0; tile < D_V/SV_M; ++tile) {
-        ku::tmem_ld_32dp32bNx<B_H_TMEM>(TMEM_COL_START + tile*B_H_TMEM, o);
-        cutlass::arch::fence_view_async_tmem_load();
-        CUTE_UNROLL
-        for (int i = 0; i < B_H; ++i) {
-            o[i] *= scale[i];
-        }
-        ku::tmem_st_32dp32bNx<B_H_TMEM>(TMEM_COL_START + tile*B_H_TMEM, o);
-        cutlass::arch::fence_view_async_tmem_store();
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t peer = __shfl_xor_sync(
+            0xffffffffu, values[i], 1, 8
+        );
+        values[i] = (lane_idx & 1) == 0
+            ? (values[i] & 0x0000ffffu) | (peer << 16)
+            : (values[i] & 0xffff0000u) | (peer >> 16);
     }
+
+    const uint32_t peer0 = __shfl_xor_sync(
+        0xffffffffu, values[0], 2, 8
+    );
+    const uint32_t peer1 = __shfl_xor_sync(
+        0xffffffffu, values[1], 2, 8
+    );
+    const uint32_t peer2 = __shfl_xor_sync(
+        0xffffffffu, values[2], 2, 8
+    );
+    const uint32_t peer3 = __shfl_xor_sync(
+        0xffffffffu, values[3], 2, 8
+    );
+    if ((lane_idx & 2) == 0) {
+        values[1] = peer0;
+        values[3] = peer2;
+    } else {
+        values[0] = peer1;
+        values[2] = peer3;
+    }
+
+    const uint32_t peer02 = __shfl_xor_sync(
+        0xffffffffu, values[0], 4, 8
+    );
+    const uint32_t peer12 = __shfl_xor_sync(
+        0xffffffffu, values[1], 4, 8
+    );
+    const uint32_t peer22 = __shfl_xor_sync(
+        0xffffffffu, values[2], 4, 8
+    );
+    const uint32_t peer32 = __shfl_xor_sync(
+        0xffffffffu, values[3], 4, 8
+    );
+    if ((lane_idx & 4) == 0) {
+        values[2] = peer02;
+        values[3] = peer12;
+    } else {
+        values[0] = peer22;
+        values[1] = peer32;
+    }
+}
+
+template<int B_H, int B_H_TMEM, int TMEM_COL_START>
+CUTE_DEVICE
+void rescale_O_block_t(float scale[B_H], int dv_block) {
+    float o[B_H_TMEM];
+    ku::tmem_ld_32dp32bNx<B_H_TMEM>(
+        TMEM_COL_START + dv_block * B_H_TMEM, o
+    );
+    cutlass::arch::fence_view_async_tmem_load();
+    CUTE_UNROLL
+    for (int i = 0; i < B_H; ++i) {
+        o[i] *= scale[i];
+    }
+    ku::tmem_st_32dp32bNx<B_H_TMEM>(
+        TMEM_COL_START + dv_block * B_H_TMEM, o
+    );
+    cutlass::arch::fence_view_async_tmem_store();
 }
 
 using FwdMode = SparseAttnFwdMode;
@@ -350,6 +396,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
         }
         CUTE_UNROLL
         for (int i = 0; i < NUM_BUFS; ++i) {
+            CUTE_UNROLL
+            for (int dv_block = 0; dv_block < NUM_SV_TMEM_BLOCKS - 1; ++dv_block) {
+                plan.bar_sv_block_done[i][dv_block].init(1);
+            }
             plan.bar_sv_done[i].init(1);
             plan.bar_kv_ready[i].init(1);
             plan.bar_kv_scale_ready[i].init(2);
@@ -437,25 +487,33 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.bar_prologue_q_scale.arrive();
         }
 
-        // V's token-dependent U(t) is folded into S and W(g) is applied in
-        // the epilogue. Fill the fixed unit scales directly in TMEM while
-        // WG0 is otherwise only initializing its local state.
-        constexpr uint32_t UE8M0_ONE_PACKED = 0x7f7f7f7f;
-        uint32_t v_scale_words[SV_SCALE_TMEM_COLS] = {
-            UE8M0_ONE_PACKED, UE8M0_ONE_PACKED,
-            UE8M0_ONE_PACKED, UE8M0_ONE_PACKED
-        };
-        ku::tmem_st_32dp32bNx<SV_SCALE_TMEM_COLS>(
+        // U(t) is folded into S. Each 64-D group shares W(g), while the
+        // four bytes in a TMEM word replicate that scale over token groups.
+        const uint64_t w_scale_bits = __ldg(
+            reinterpret_cast<const uint64_t*>(params.kv_scale_w)
+        );
+        uint32_t v_scale_words[V_SCALE_TMEM_COLS];
+        CUTE_UNROLL
+        for (int dv_block = 0; dv_block < NUM_SV_TMEM_BLOCKS; ++dv_block) {
+            const uint32_t w_lo = static_cast<uint8_t>(
+                w_scale_bits >> (2 * dv_block * 8)
+            ) * 0x01010101u;
+            const uint32_t w_hi = static_cast<uint8_t>(
+                w_scale_bits >> ((2 * dv_block + 1) * 8)
+            ) * 0x01010101u;
+            const int col = dv_block * SV_SCALE_TMEM_COLS;
+            v_scale_words[col + 0] = w_lo;
+            v_scale_words[col + 1] = w_lo;
+            v_scale_words[col + 2] = w_hi;
+            v_scale_words[col + 3] = w_hi;
+        }
+        ku::tmem_st_32dp32bNx<V_SCALE_TMEM_COLS>(
             tmem_cols::V_Scale, v_scale_words
         );
         cutlass::arch::fence_view_async_tmem_store();
         MXFP8_TIMEPOINT(
             s_q_idx == 0 && idx_in_warpgroup == 0,
             plan.barrier_timing.v_scale_tmem_committed_ns
-        );
-
-        const uint64_t w_scale_bits = __ldg(
-            reinterpret_cast<const uint64_t*>(params.kv_scale_w)
         );
         // math instructions 
         if (idx_in_warpgroup < B_H) {
@@ -613,15 +671,6 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
                 plan.head_mi[h] = new_max;
                 plan.head_real_mi[h] = max(plan.head_real_mi[h], cur_pi_max);
                 plan.head_li[h] = fma(plan.head_li[h], scale_for_old, cur_sum);
-                if (k > 0) {
-                    MXFP8_TIMED_WAIT(
-                        trace_wg0_tile,
-                        plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns,
-                        plan.bar_sv_done[(k - 1) % NUM_BUFS].wait(
-                            ((k - 1) / NUM_BUFS) & 1
-                        )
-                    );
-                }
             }
             MXFP8_TIMEPOINT(
                 trace_wg0_tile,
@@ -643,20 +692,54 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             );
 
             if (k > 0) {
-                ku::tcgen05_after_thread_sync();
-                rescale_O_t<B_H, B_H_TMEM, tmem_cols::O, D_V>(plan.head_scale);
-                ku::tcgen05_before_thread_sync();
-                MXFP8_TIMEPOINT(
-                    trace_wg0_tile,
-                    plan.barrier_timing.wg0[warp_idx][k].rescale_done_ns
-                );
-                MXFP8_TIMED_WAIT(
-                    trace_wg0_tile,
-                    plan.barrier_timing.wg0[warp_idx][k].rescale_wait_ns,
-                    (NamedBarrier::arrive_and_wait(
-                        128, NamedBarriers::wg0_sync
-                    ))
-                );
+                const int prev_buf = (k - 1) % NUM_BUFS;
+                const int prev_phase = ((k - 1) / NUM_BUFS) & 1;
+
+                // Commit each SV stripe independently.  WG0 can rescale a
+                // completed 128-DV stripe while warp 8 is still issuing the
+                // remaining SV MMAs for this tile.
+                CUTE_UNROLL
+                for (int dv_block = 0; dv_block < NUM_SV_TMEM_BLOCKS; ++dv_block) {
+                    if (dv_block == 0) {
+                        MXFP8_TIMED_WAIT(
+                            trace_wg0_tile,
+                            plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns,
+                            plan.bar_sv_block_done[prev_buf][dv_block].wait(
+                                prev_phase
+                            )
+                        );
+                    } else if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                        plan.bar_sv_block_done[prev_buf][dv_block].wait(
+                            prev_phase
+                        );
+                    } else {
+                        plan.bar_sv_done[prev_buf].wait(prev_phase);
+                    }
+
+                    ku::tcgen05_after_thread_sync();
+                    rescale_O_block_t<B_H, B_H_TMEM, tmem_cols::O>(
+                        plan.head_scale, dv_block
+                    );
+                    ku::tcgen05_before_thread_sync();
+
+                    if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                        NamedBarrier::arrive_and_wait(
+                            128, NamedBarriers::wg0_sync
+                        );
+                    } else {
+                        MXFP8_TIMEPOINT(
+                            trace_wg0_tile,
+                            plan.barrier_timing.wg0[warp_idx][k].rescale_done_ns
+                        );
+                        MXFP8_TIMED_WAIT(
+                            trace_wg0_tile,
+                            plan.barrier_timing.wg0[warp_idx][k].rescale_wait_ns,
+                            (NamedBarrier::arrive_and_wait(
+                                128, NamedBarriers::wg0_sync
+                            ))
+                        );
+                    }
+                }
             } else {
                 MXFP8_TIMEPOINT(
                     trace_wg0_tile,
@@ -702,19 +785,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.barrier_timing.epilogue[warp_idx].stats_stored_ns
         );
 
-        MXFP8_TIMED_WAIT(
-            trace_epilogue,
-            plan.barrier_timing.epilogue[warp_idx].final_sv_wait_ns,
-            plan.bar_sv_done[(num_k_blocks - 1) % NUM_BUFS].wait(
-                ((num_k_blocks - 1) / NUM_BUFS) & 1
-            )
-        );
-        MXFP8_TIMEPOINT(
-            trace_epilogue,
-            plan.barrier_timing.epilogue[warp_idx].final_sv_ready_ns
-        );
-        ku::tcgen05_after_thread_sync();
-
+        // The softmax statistics are final before the last SV MMA finishes,
+        // so prepare the output scale now and drain each completed SV stripe
+        // directly into SMEM instead of waiting for all four stripes.
         if (idx_in_warpgroup < B_H) {
             int h = idx_in_warpgroup;
             float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + h)*CUDART_L2E_F;
@@ -735,55 +808,129 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
             plan.barrier_timing.epilogue[warp_idx].scale_ready_ns
         );
 
-        {
-            Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.data()), SmemLayoutO{});
-            float o_head[B_H_TMEM];
-            CUTE_UNROLL
-            for (int tile = 0; tile < D_V/SV_M; ++tile) {
-                int dv = tile*SV_M + idx_in_warpgroup;
-                ku::tmem_ld_32dp32bNx<B_H_TMEM>(tmem_cols::O + tile*B_H_TMEM, o_head);
-                cutlass::arch::fence_view_async_tmem_load();
-                int w_group = dv / K_QUANT_GROUP_SIZE;
-                uint8_t w_bits = static_cast<uint8_t>(w_scale_bits >> (w_group * 8));
-                float w_scale = ue8m0_bits_to_float(w_bits);
-                CUTE_UNROLL
-                for (int h = 0; h < B_H; ++h) {
-                    sO(h, dv) = bf16(o_head[h] * plan.head_scale[h] * w_scale);
-                }
-            }
-        }
-        MXFP8_TIMEPOINT(
-            trace_epilogue,
-            plan.barrier_timing.epilogue[warp_idx].o_staged_ns
-        );
-        MXFP8_TIMED_WAIT(
-            trace_epilogue,
-            plan.barrier_timing.epilogue[warp_idx].o_sync_wait_ns,
-            (NamedBarrier::arrive_and_wait(
-                128, NamedBarriers::wg0_sync
-            ))
-        );
-
-        // Store O using TMA
         constexpr int B_EPI = 64;
-        Tensor sO = make_tensor(make_smem_ptr(plan.kvo.o.data()), SmemLayoutO{});
+        const int final_buf = (num_k_blocks - 1) % NUM_BUFS;
+        const int final_phase = ((num_k_blocks - 1) / NUM_BUFS) & 1;
+        const int scratch_lo_buf = (final_buf + 1) % NUM_BUFS;
+        const int scratch_hi_buf = (final_buf + 2) % NUM_BUFS;
         Tensor tma_gO = flat_divide(
             tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
             Shape<Int<B_H>, Int<B_EPI>>{}
         )(_, _, _0{}, _);
-        Tensor sO_divided = flat_divide(
-            sO,
+        // kvo.o aliases the final V tile.  Use the two inactive KV buffers
+        // instead, with one 64-DV slot per SV stripe, so TMA can drain a
+        // stripe while later SV MMAs still read the final V buffer.
+        Tensor sO_lo = make_tensor(
+            make_smem_ptr(reinterpret_cast<bf16*>(
+                plan.kvo.kv.kv[scratch_lo_buf].data()
+            )),
+            SmemLayoutOTiles<NUM_SV_TMEM_BLOCKS>{}
+        );
+        Tensor sO_hi = make_tensor(
+            make_smem_ptr(reinterpret_cast<bf16*>(
+                plan.kvo.kv.kv[scratch_hi_buf].data()
+            )),
+            SmemLayoutOTiles<NUM_SV_TMEM_BLOCKS>{}
+        );
+        Tensor sO_lo_divided = flat_divide(
+            sO_lo,
+            Shape<Int<B_H>, Int<B_EPI>>{}
+        )(_, _, _0{}, _);
+        Tensor sO_hi_divided = flat_divide(
+            sO_hi,
             Shape<Int<B_H>, Int<B_EPI>>{}
         )(_, _, _0{}, _);
         auto thr_tma = tma_params.tma_O.get_slice(_0{});
 
+        float o_head[B_H_TMEM];
         CUTE_UNROLL
-        for (int k = 0; k < D_V/B_EPI; ++k) {
+        for (int dv_block = 0; dv_block < NUM_SV_TMEM_BLOCKS; ++dv_block) {
+            if (dv_block == 0) {
+                MXFP8_TIMED_WAIT(
+                    trace_epilogue,
+                    plan.barrier_timing.epilogue[warp_idx].final_sv_wait_ns,
+                    plan.bar_sv_block_done[final_buf][dv_block].wait(
+                        final_phase
+                    )
+                );
+            } else if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                plan.bar_sv_block_done[final_buf][dv_block].wait(final_phase);
+            } else {
+                plan.bar_sv_done[final_buf].wait(final_phase);
+            }
+            if (dv_block == 0) {
+                MXFP8_TIMEPOINT(
+                    trace_epilogue,
+                    plan.barrier_timing.epilogue[warp_idx].final_sv_ready_ns
+                );
+            }
+            ku::tcgen05_after_thread_sync();
+
+            ku::tmem_ld_32dp32bNx<B_H_TMEM>(
+                tmem_cols::O + dv_block * B_H_TMEM, o_head
+            );
+            cutlass::arch::fence_view_async_tmem_load();
+            const int d_vec = (warp_idx & 1) * 32 + (lane_idx & ~7);
+            CUTE_UNROLL
+            for (int h_base = 0; h_base < B_H; h_base += 8) {
+                uint32_t values[4];
+                CUTE_UNROLL
+                for (int i = 0; i < 4; ++i) {
+                    const int h0 = h_base + 2 * i;
+                    const int h1 = h0 + 1;
+                    const bf16 v0 = bf16(
+                        o_head[h0] * plan.head_scale[h0]
+                    );
+                    const bf16 v1 = bf16(
+                        o_head[h1] * plan.head_scale[h1]
+                    );
+                    values[i] = static_cast<uint32_t>(v0.storage)
+                        | (static_cast<uint32_t>(v1.storage) << 16);
+                }
+                transpose_bf16_8x8(values, lane_idx);
+
+                const uint4 vector = make_uint4(
+                    values[0], values[1], values[2], values[3]
+                );
+                const int h = h_base + (lane_idx & 7);
+                const int d = dv_block * B_EPI + d_vec;
+                if (warp_idx < 2) {
+                    *reinterpret_cast<uint4*>(&sO_lo(h, d)) = vector;
+                } else {
+                    *reinterpret_cast<uint4*>(&sO_hi(h, d)) = vector;
+                }
+            }
+
+            fence_view_async_shared();
+            if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            } else {
+                MXFP8_TIMEPOINT(
+                    trace_epilogue,
+                    plan.barrier_timing.epilogue[warp_idx].o_staged_ns
+                );
+                MXFP8_TIMED_WAIT(
+                    trace_epilogue,
+                    plan.barrier_timing.epilogue[warp_idx].o_sync_wait_ns,
+                    (NamedBarrier::arrive_and_wait(
+                        128, NamedBarriers::wg0_sync
+                    ))
+                );
+            }
+
+            const int epi_chunk = dv_block * (SV_M / B_EPI);
             if (warp_idx == 0 && elect_one_sync()) {
                 cute::copy(
                     tma_params.tma_O,
-                    thr_tma.partition_S(sO_divided(_, _, k)),
-                    thr_tma.partition_D(tma_gO(_, _, k))
+                    thr_tma.partition_S(sO_lo_divided(_, _, dv_block)),
+                    thr_tma.partition_D(tma_gO(_, _, epi_chunk))
+                );
+            }
+            if (warp_idx == 1 && elect_one_sync()) {
+                cute::copy(
+                    tma_params.tma_O,
+                    thr_tma.partition_S(sO_hi_divided(_, _, dv_block)),
+                    thr_tma.partition_D(tma_gO(_, _, epi_chunk + 1))
                 );
             }
         }
@@ -1088,14 +1235,23 @@ sparse_attn_fwd_kernel(__grid_constant__ const MxFp8SparseAttnFwdParams params, 
 
                     // O += sS @ sV
                     CUTE_UNROLL
-                    for (int dv_block = 0; dv_block < D_V/SV_M; ++dv_block) {
+                    for (int dv_block = 0; dv_block < NUM_SV_TMEM_BLOCKS; ++dv_block) {
                         Tensor tO_block = partition_fragment_C(tiled_mma_O, Shape<Int<SV_M>, Int<B_H>>{});
                         tO_block.data().get() = tmem_cols::O + dv_block*B_H_TMEM;
+                        tV_scale.data().get() = tmem_cols::V_Scale
+                            + dv_block * SV_SCALE_TMEM_COLS;
                         ku::utcmma_blockscaled_ss(
                             tiled_mma_O, sV(make_coord(_, dv_block), _), sS,
                             tV_scale, tS_scale, tO_block, k == 1
                         );
+                        if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                            ku::umma_arrive_noelect(
+                                plan.bar_sv_block_done[cur_buf][dv_block]
+                            );
+                        }
                     }
+                    // Keep the final completion barrier as the existing
+                    // whole-SV handoff used by KV buffer reuse.
                     ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
                     MXFP8_TIMEPOINT(
                         trace_mma_iter,

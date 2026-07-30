@@ -33,7 +33,6 @@ MMA_K = 32
 SV_M = 128
 MAX_INIT_VAL = -1.0e30
 LOG2_E = math.log2(math.e)
-S_ACCUM_HEADROOM = 64.0
 
 
 @dataclass(frozen=True)
@@ -123,16 +122,15 @@ def _qk_dual_mma(q_raw: torch.Tensor, k_raw: torch.Tensor) -> torch.Tensor:
 
 def _sv_mma(
     o: torch.Tensor,
-    s_fp8: torch.Tensor,
-    v_fp8: torch.Tensor,
+    s: torch.Tensor,
+    v: torch.Tensor,
 ) -> None:
-    s_raw = s_fp8.float()
     for dv_start in range(0, D_HEAD, SV_M):
         o_tile = o[:, dv_start : dv_start + SV_M]
         for token_start in range(0, B_TOPK, MMA_K):
             o_tile.add_(
-                s_raw[:, token_start : token_start + MMA_K]
-                @ v_fp8[
+                s[:, token_start : token_start + MMA_K]
+                @ v[
                     token_start : token_start + MMA_K,
                     dv_start : dv_start + SV_M,
                 ]
@@ -218,7 +216,6 @@ def phase1_token_tile_reference(
         o_tmem_units = torch.zeros(
             (H_Q, D_HEAD), dtype=torch.float32, device=packed_q.device
         )
-        previous_s_scale = torch.ones_like(mi)
 
         for tile_idx in range(num_tiles):
             token_start = tile_idx * B_TOPK
@@ -261,24 +258,27 @@ def phase1_token_tile_reference(
             li_halves = li_halves * scale_for_old.unsqueeze(-1) + cur_sum_halves
 
             s_for_sv = softmax_s * gathered_u.unsqueeze(0)
-            s_absmax = s_for_sv.abs().amax(dim=-1)
+            grouped_s_for_sv = s_for_sv.reshape(H_Q, B_TOPK // MMA_K, MMA_K)
+            s_absmax = grouped_s_for_sv.abs().amax(dim=-1)
             s_scale = round_up_ue8m0(
                 torch.where(
                     s_absmax > 0,
-                    s_absmax * S_ACCUM_HEADROOM / FP8_MAX,
+                    s_absmax / FP8_MAX,
                     torch.ones_like(s_absmax),
                 )
             ).float()
-            s_fp8 = (s_for_sv / s_scale.unsqueeze(-1)).to(
-                torch.float8_e4m3fn
-            )
+            s_fp8_grouped = (
+                grouped_s_for_sv / s_scale.unsqueeze(-1)
+            ).to(torch.float8_e4m3fn)
+            s_fp8 = s_fp8_grouped.reshape(H_Q, B_TOPK)
+            s_dequant = (
+                s_fp8_grouped.float() * s_scale.unsqueeze(-1)
+            ).reshape(H_Q, B_TOPK)
+            v_dequant_w = gathered_k_raw * w_per_d.unsqueeze(0)
 
             if tile_idx > 0:
-                o_tmem_units *= (
-                    scale_for_old * previous_s_scale / s_scale
-                ).unsqueeze(-1)
-            _sv_mma(o_tmem_units, s_fp8, gathered_k_raw)
-            previous_s_scale = s_scale
+                o_tmem_units *= scale_for_old.unsqueeze(-1)
+            _sv_mma(o_tmem_units, s_dequant, v_dequant_w)
             mi = new_mi
 
             qk_min, qk_max = _finite_minmax(qk_raw)
@@ -340,8 +340,6 @@ def phase1_token_tile_reference(
             li == 0, torch.zeros_like(li), denominator.reciprocal()
         )
         out = o_tmem_units * output_scale.unsqueeze(-1)
-        out *= previous_s_scale.unsqueeze(-1)
-        out *= w_per_d.unsqueeze(0)
         out_rows.append(out.to(torch.bfloat16))
         max_rows.append(max_logits)
         lse_rows.append(lse)
@@ -385,7 +383,7 @@ def _print_snapshots(snapshots: list[TileSnapshot]) -> None:
         print("P scaled h0:", s.p_scaled[0].cpu())
         print("softmax S h0:", s.softmax_s[0].cpu())
         print("S*U h0:", s.s_for_sv[0].cpu())
-        print("S scale h0:8:", s.s_scale[:8].cpu())
+        print("S scale h0:", s.s_scale[0].cpu())
         print("S fp8 h0:", s.s_fp8[0].float().cpu())
         print("O TMEM units h0 d0:32:", s.o_tmem_units[0, :32].cpu())
 
@@ -443,7 +441,7 @@ def _run_and_check(
             rtol=5.0e-3,
         )
         assert_close(
-            f"{name}: S head quant, SV MMA, O rescale, or W(g) epilogue",
+            f"{name}: S topk quant, MXFP8 VS MMA, O rescale, or W(g) scale",
             out,
             reference.out,
             atol=4.0e-2,
@@ -572,7 +570,7 @@ def _case_pipeline_reuse() -> None:
     ).to(torch.int32).unsqueeze(1)
     length = torch.tensor([320, 257], device=device, dtype=torch.int32)
     _run_and_check(
-        "five tiles with P0/P1/P2 and KV stage reuse",
+        "five tiles with P0/P1 and KV stage reuse",
         packed_q,
         packed_kv,
         w,

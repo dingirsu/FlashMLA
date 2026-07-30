@@ -56,6 +56,8 @@ constexpr int QK_N = B_TOPK;
 constexpr int QK_K = D_K;
 constexpr int SV_M = 128;
 constexpr int SV_SCALE_K = 128;
+constexpr int NUM_SV_TMEM_BLOCKS = D_V / SV_M;
+constexpr int V_SCALE_TMEM_COLS = NUM_SV_TMEM_BLOCKS * SV_SCALE_TMEM_COLS;
 constexpr int NUM_BUFS = 3;
 constexpr int NUM_P_BUFS = 2;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
@@ -68,11 +70,13 @@ static_assert(Q_BYTES_PER_TOKEN == 528);
 static_assert(KV_BYTES_PER_TOKEN == 520);
 static_assert(K_SCALE_DUP == 2);
 static_assert(D_K % TMA_K_CHUNK_BYTES == 0);
+static_assert(D_V % SV_M == 0);
+static_assert(NUM_SV_TMEM_BLOCKS > 1);
 
 // Tensor memory columns
 namespace tmem_cols {
     //   0 ~ 256: output
-    // 256 ~ 296: Q/K/S/V scale-factor columns
+    // 256 ~ 308: Q/K/S/V scale-factor columns
     // 384 ~ 448: P stage 0
     // 448 ~ 512: P stage 1
     constexpr int O = 0;
@@ -282,6 +286,9 @@ struct SharedMemoryPlan {
     float kv_u_scale[NUM_BUFS][B_TOPK];
     transac_bar_t bar_prologue_q, bar_prologue_q_scale;
     transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T done
+    // Each early barrier covers one 128-DV SV MMA stripe.  The final stripe
+    // uses bar_sv_done so existing KV-buffer reuse remains unchanged.
+    transac_bar_t bar_sv_block_done[NUM_BUFS][NUM_SV_TMEM_BLOCKS - 1];
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
     transac_bar_t bar_kv_ready[NUM_BUFS], bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
@@ -299,7 +306,11 @@ static_assert(cosize_v<SmemLayoutQ> == (D_Q / Q_TMA_K) * cosize_v<SmemLayoutQBlo
 static_assert(cosize_v<SmemLayoutK> == cosize_v<SmemLayoutK_TiledMMA>);
 static_assert(cosize_v<SmemLayoutPScaleAAtom> == 4 * cosize_v<SmemLayoutPScaleABlockAtom>);
 static_assert(cosize_v<SmemLayoutPScaleBAtom> == 4 * cosize_v<SmemLayoutPScaleBBlockAtom>);
-static_assert(tmem_cols::V_Scale + SV_SCALE_TMEM_COLS <= tmem_cols::P0);
+static_assert(
+    cosize_v<SmemLayoutOTiles<NUM_SV_TMEM_BLOCKS>> * sizeof(bf16)
+        <= B_TOPK * D_K * sizeof(e4m3)
+);
+static_assert(tmem_cols::V_Scale + V_SCALE_TMEM_COLS <= tmem_cols::P0);
 static_assert(sizeof(SharedMemoryPlan) < 227 * 1024, "MXFP8 prefill shared memory exceeds the SM100 limit");
 
 enum NamedBarriers : int {

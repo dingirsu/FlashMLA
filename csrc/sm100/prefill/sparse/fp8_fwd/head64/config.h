@@ -42,31 +42,28 @@ constexpr int B_TOPK = 64;
 constexpr int QK_M = B_TOPK * 2;
 constexpr int QK_K = D_K / 2;
 constexpr int SV_M = 128;
-constexpr int O_CHUNK_SIZE = 128;
-constexpr int NUM_O_CHUNKS = D_V / O_CHUNK_SIZE;
-constexpr int O_TMEM_COLS_PER_CHUNK = O_CHUNK_SIZE / 2;
-constexpr int O_MMA_STAGE_SIZE = 256;
-constexpr int NUM_O_MMA_STAGES = D_V / O_MMA_STAGE_SIZE;
-constexpr int O_CHUNKS_PER_MMA_STAGE = O_MMA_STAGE_SIZE / O_CHUNK_SIZE;
-constexpr int O_TMEM_COLS_PER_MMA_STAGE = O_MMA_STAGE_SIZE / 2;
-static_assert(NUM_O_CHUNKS == 4);
-static_assert(NUM_O_MMA_STAGES == 2);
+constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+constexpr int SV_SCALE_K = 128;
+constexpr int NUM_SV_TMEM_BLOCKS = D_V / SV_M;
+constexpr int SV_SCALE_TMEM_COLS = 4;
+constexpr int V_SCALE_TMEM_COLS = NUM_SV_TMEM_BLOCKS * SV_SCALE_TMEM_COLS;
+static_assert(NUM_SV_TMEM_BLOCKS == 4);
 
 constexpr int NUM_BUFS = 3;
-constexpr int NUM_P_BUFS = 3;
+constexpr int NUM_P_BUFS = 2;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
 constexpr float FP8_MAX = 448.0f;
-// Keep the raw SV accumulator below FP16 range; the power-of-two factor is
-// restored exactly by current_s_scale in O rescale/the epilogue.
-constexpr float S_ACCUM_HEADROOM = 64.0f;
 
 namespace tmem_cols {
     constexpr int O = 0;
     constexpr int Q = 256;
-    constexpr int P = 320;
+    constexpr int V_Scale = 320;
+    constexpr int S_Scale = V_Scale + V_SCALE_TMEM_COLS;
+    constexpr int P0 = 384;
+    constexpr int P1 = P0 + B_TOPK;
 }
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
@@ -113,6 +110,36 @@ using SmemLayoutV = decltype(coalesce(
     )
 , Shape<_1, _1>{}));
 
+using TiledMMA_P = decltype(make_tiled_mma(
+    SM100_MMA_F8F6F4_WS_TS_NOELECT<
+        e4m3, e4m3, float, B_H, 128, UMMA::Major::K, UMMA::Major::K
+    >{}
+));
+
+using TiledMMA_O = decltype(make_tiled_mma(
+    SM100_MMA_MXF8F6F4_SS_NOELECT<
+        e4m3, e4m3, float, e8m0, SV_M, B_H,
+        UMMA::Major::MN, UMMA::Major::K
+    >{}
+));
+
+// UTCCP moves the S scale fragment in 128-wide K blocks.  Each sparse tile
+// has 64 tokens, so the second half of this layout is padding.
+using SmemLayoutOScaleBAtom = decltype(
+    cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>
+        ::deduce_smem_layoutSFB(
+            TiledMMA_O{},
+            Shape<Int<SV_M>, Int<B_H>, Int<SV_SCALE_K>>{}
+        )
+);
+using SmemLayoutOScaleAAtom = decltype(
+    cutlass::detail::Sm1xxBlockScaledConfig<MXFP8_SCALE_VEC_SIZE>
+        ::deduce_smem_layoutSFA(
+            TiledMMA_O{},
+            Shape<Int<SV_M>, Int<B_H>, Int<SV_SCALE_K>>{}
+        )
+);
+
 #if defined(FP8_FWD_BARRIER_TIMING)
 constexpr int FP8_TIMING_MAX_TILES = 8;
 
@@ -123,7 +150,6 @@ struct Fp8Wg0Timing {
     uint64_t valid_wait_ns;
     uint64_t scale_wait_ns;
     uint64_t rowmax_wait_ns;
-    uint64_t smax_wait_ns;
     uint64_t waits_done_ns;
     uint64_t p_released_ns;
     uint64_t p_scaled_ns;
@@ -132,7 +158,8 @@ struct Fp8Wg0Timing {
     uint64_t softmax_ready_ns;
     uint64_t sv_wait_ns;
     uint64_t s_stored_ns;
-    uint64_t o_stage_arrived_ns[NUM_O_MMA_STAGES];
+    uint64_t o_block_ready_ns[NUM_SV_TMEM_BLOCKS];
+    uint64_t o_block_rescaled_ns[NUM_SV_TMEM_BLOCKS];
     uint64_t o_rescaled_ns;
     uint64_t s_arrived_ns;
 };
@@ -156,9 +183,8 @@ struct Fp8MmaTiming {
     uint64_t qk_committed_ns;
     uint64_t s_ready_wait_ns;
     uint64_t s_ready_ns;
-    uint64_t o_stage_wait_ns[NUM_O_MMA_STAGES];
-    uint64_t o_stage_ready_ns[NUM_O_MMA_STAGES];
-    uint64_t o_stage_committed_ns[NUM_O_MMA_STAGES];
+    uint64_t s_scale_ready_ns;
+    uint64_t o_block_committed_ns[NUM_SV_TMEM_BLOCKS];
     uint64_t sv_committed_ns;
 };
 
@@ -175,9 +201,9 @@ struct Fp8BarrierTiming {
     uint64_t qw_scale_arrived_ns[2];
     uint64_t final_sv_wait_ns[4];
     uint64_t final_sv_ready_ns[4];
-    uint64_t final_o_stage_wait_ns[4][NUM_O_MMA_STAGES];
-    uint64_t final_o_stage_ready_ns[4][NUM_O_MMA_STAGES];
-    uint64_t final_o_stage_drained_ns[4][NUM_O_MMA_STAGES];
+    uint64_t final_o_block_wait_ns[4][NUM_SV_TMEM_BLOCKS];
+    uint64_t final_o_block_ready_ns[4][NUM_SV_TMEM_BLOCKS];
+    uint64_t final_o_block_drained_ns[4][NUM_SV_TMEM_BLOCKS];
     uint64_t q_tma_wait_ns;
     uint64_t q_tmem_committed_ns;
     Fp8Wg0Timing wg0[4][FP8_TIMING_MAX_TILES];
@@ -199,17 +225,21 @@ struct SharedMemoryPlan {
     } qkvo;
     float p_exchange_buf[4][32 * (B_TOPK/2)];
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
+    array_aligned<e8m0, cosize_v<SmemLayoutOScaleBAtom>> s_scale;
     float kv_dim_scale[NUM_BUFS][B_TOPK];
     float q_head_scale[B_H];
     float kv_w_scale[KV_SCALE_GROUPS];
+    uint8_t kv_w_scale_bits[KV_SCALE_GROUPS];
+    float head_scale[B_H];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
-    transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
-    transac_bar_t bar_sv_done[NUM_BUFS][NUM_O_MMA_STAGES];
+    transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T (the nope part) done
+    transac_bar_t bar_sv_block_done[NUM_BUFS][NUM_SV_TMEM_BLOCKS - 1];
+    transac_bar_t bar_sv_done[NUM_BUFS];
     transac_bar_t bar_kv_ready[NUM_BUFS][2];
     transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
-    transac_bar_t bar_so_ready[NUM_O_MMA_STAGES];
+    transac_bar_t bar_so_ready;
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
@@ -218,13 +248,9 @@ struct SharedMemoryPlan {
 #endif
 };
 
-using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, half_t, B_H, 128, UMMA::Major::K, UMMA::Major::K>{}
-));
-
-using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, half_t, B_H, O_MMA_STAGE_SIZE, UMMA::Major::K, UMMA::Major::MN>{}
-));
+static_assert(cosize_v<SmemLayoutOScaleAAtom> <= cosize_v<SmemLayoutOScaleBAtom>);
+static_assert(tmem_cols::S_Scale + SV_SCALE_TMEM_COLS <= tmem_cols::P0);
+static_assert(tmem_cols::P1 + B_TOPK <= 512);
 
 enum NamedBarriers : int {
     wg0_sync = 0,

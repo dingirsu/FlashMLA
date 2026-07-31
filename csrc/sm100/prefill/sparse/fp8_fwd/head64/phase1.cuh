@@ -944,7 +944,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     make_smem_ptr(plan.qkvo.q.q.data()),
                     tile_to_shape(
                         UMMA::Layout_K_SW128_Atom<e4m3>{},
-                        Shape<Int<B_H * 2>, Int<128>>{}
+                        Shape<Int<B_H>, Int<128>>{}
                     )
                 )
             );
@@ -958,14 +958,14 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         FP8_MARK_ONE("FP8_MARK 31 warp8_q_wait_after");
         ku::tcgen05_after_thread_sync();
         CUTE_UNROLL
-        for (int tile_idx = 0; tile_idx < D_V/256; ++tile_idx) {
-            // UTCCP uses its 128-datapath view to populate the direct TS Q
-            // fragment, which is consumed as a logical 64x512 matrix.
+        for (int tile_idx = 0; tile_idx < D_Q / 128; ++tile_idx) {
             CUTE_UNROLL
-            for (int subtile_idx = 0; subtile_idx < 4; ++subtile_idx) {
-                SM100_UTCCP_128dp256bit_1cta::copy(
-                    sQ_desc + (tile_idx*(B_H*128*2) + subtile_idx*32) / 16, 
-                    tmem_cols::Q + tile_idx*32 + subtile_idx*8
+            for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
+                // The direct M=64 fragment broadcasts each 64-row Q chunk
+                // into its two TMEM datapath halves.
+                SM100_UTCCP_2x64dp128bitlw0213_1cta::copy(
+                    sQ_desc + (tile_idx * B_H * 128 + subtile_idx * 16) / 16,
+                    tmem_cols::Q + tile_idx * 32 + subtile_idx * 4
                 );
             }
         }

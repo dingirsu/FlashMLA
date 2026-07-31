@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import argparse
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
@@ -16,7 +17,7 @@ import fp8_test_ext as ext  # noqa: E402
 
 
 # Keep the benchmark configuration here so kernel-edit/compile/test is one command.
-S_Q = 4096
+S_Q = 16384
 S_KV = 32768
 TOPK = 512
 H_Q = 64
@@ -165,6 +166,10 @@ def _time_us(fn: Callable[[], object]) -> float:
 
 @torch.inference_mode()
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true")
+    args = parser.parse_args()
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     major, _ = torch.cuda.get_device_capability()
@@ -200,6 +205,11 @@ def main() -> None:
         return ext.fp8_sparse_prefill_fwd(
             packed_q, packed_kv, kv_scale_w, indices, sm_scale, None, None
         )
+    
+    if args.profile:
+        fp8_outputs = run_fp8()
+        torch.cuda.synchronize()
+        return
 
     bf16_outputs = run_bf16()
     fp8_outputs = run_fp8()

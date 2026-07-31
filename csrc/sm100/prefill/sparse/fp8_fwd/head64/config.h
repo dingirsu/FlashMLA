@@ -39,23 +39,33 @@ static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
 constexpr int B_TOPK = 128;
-constexpr int QK_M = B_TOPK * 2;
-constexpr int QK_K = D_K / 2;
+constexpr int QK_M = B_H;
+constexpr int QK_K = D_K;
 constexpr int SV_M = 128;
+constexpr int NUM_SV_TMEM_BLOCKS = D_V / SV_M;
+// One logical 128-DV stripe occupies 64 TMEM columns in the dual-GEMM view.
+constexpr int SV_TMEM_COLS_PER_BLOCK = SV_M / 2;
+static_assert(NUM_SV_TMEM_BLOCKS == 4);
+static_assert(NUM_SV_TMEM_BLOCKS * SV_TMEM_COLS_PER_BLOCK == D_V / 2);
 
-constexpr int NUM_BUFS = 2;
-constexpr int NUM_P_BUFS = 1;
+constexpr int NUM_BUFS = 3;
+// The direct TS Q fragment reserves [256, 384).  A complete 64x128 FP32 P
+// occupies 64 columns, so two P stages fit after it.
+constexpr int NUM_P_BUFS = 2;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
 constexpr float FP8_MAX = 448.0f;
+static_assert(SV_TMEM_COLS_PER_BLOCK == B_H_TMEM);
 
 namespace tmem_cols {
     constexpr int O = 0;
     constexpr int Q = 256;
-    constexpr int P = 320;
+    constexpr int P0 = 384;
+    constexpr int P1 = P0 + B_TOPK / 2;
 }
+static_assert(tmem_cols::P1 + B_TOPK / 2 <= 512);
 
 using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<e4m3>{},
@@ -82,11 +92,7 @@ using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
 
 using SmemLayoutK = SmemLayoutKTiles<8>;
 
-using SmemLayoutK_TiledMMA = decltype(coalesce(tile_to_shape(
-    UMMA::Layout_K_SW128_Atom<e4m3>{},
-    Shape<Int<B_TOPK*2>, Int<D_V/2>>{},
-    Step<_1, _2>{}
-), Shape<_1, _1>{}));
+using SmemLayoutK_TiledMMA = SmemLayoutK;
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
 	UMMA::Layout_K_INTER_Atom<e4m3>{},
@@ -178,15 +184,15 @@ struct SharedMemoryPlan {
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
-    float p_exchange_buf[4][32 * (B_TOPK/2)];
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
     float kv_dim_scale[NUM_BUFS][B_TOPK];
     float q_head_scale[B_H];
     float kv_w_scale[KV_SCALE_GROUPS];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
-    transac_bar_t bar_qk_done[NUM_BUFS];    // Pi = QKi^T (the nope part) done
-    transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
+    transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T (the nope part) done
+    transac_bar_t bar_sv_block_done[NUM_BUFS][NUM_SV_TMEM_BLOCKS - 1];
+    transac_bar_t bar_sv_done[NUM_BUFS];    // Final SV stripe is committed.
     transac_bar_t bar_kv_ready[NUM_BUFS][2];
     transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
@@ -201,11 +207,11 @@ struct SharedMemoryPlan {
 
 // may change to bf16 accumulator for better speed
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK * 2, UMMA::Major::K, UMMA::Major::K>{}
+    SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 )); // maybe p output can be bf16 and use bf16 add to make one fp32
 
 using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{}
+    SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, SV_M, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
 enum NamedBarriers : int {

@@ -49,6 +49,7 @@ static_assert(NUM_SV_TMEM_BLOCKS == 4);
 static_assert(NUM_SV_TMEM_BLOCKS * SV_TMEM_COLS_PER_BLOCK == D_V / 2);
 
 constexpr int NUM_BUFS = 3;
+constexpr int NUM_S_BUFS = 2;
 // The direct TS Q fragment reserves [256, 384).  A complete 64x128 FP32 P
 // occupies 64 columns, so two P stages fit after it.
 constexpr int NUM_P_BUFS = 2;
@@ -130,6 +131,19 @@ struct Fp8Wg0Timing {
     uint64_t s_arrived_ns;
 };
 
+// Keep the O-rescale handoff split by SV stripe; the aggregate WG0 fields
+// above remain unchanged for existing trace consumers.
+struct Fp8ORescaleStripeTiming {
+    uint64_t stripe_start_ns;
+    uint64_t sv_wait_ns;
+    uint64_t sv_ready_ns;
+    uint64_t tmem_load_done_ns;
+    uint64_t fp32_mul_done_ns;
+    uint64_t tmem_store_done_ns;
+    uint64_t wg0_sync_done_ns;
+    uint64_t warp_rescale_active;
+};
+
 struct Fp8KvProducerTiming {
     uint64_t tile_start_ns;
     uint64_t indices_ready_ns;
@@ -168,6 +182,8 @@ struct Fp8BarrierTiming {
     uint64_t q_tma_wait_ns;
     uint64_t q_tmem_committed_ns;
     Fp8Wg0Timing wg0[4][FP8_TIMING_MAX_TILES];
+    Fp8ORescaleStripeTiming o_rescale[4][FP8_TIMING_MAX_TILES]
+                                          [NUM_SV_TMEM_BLOCKS];
     Fp8KvProducerTiming kv[4][FP8_TIMING_MAX_TILES];
     Fp8MmaTiming mma[FP8_TIMING_MAX_TILES + 1];
     Fp8SimpleProducerTiming mask[FP8_TIMING_MAX_TILES];
@@ -184,7 +200,7 @@ struct SharedMemoryPlan {
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
-    array_aligned<e4m3, cosize_v<SmemLayoutS>> s;
+    array_aligned<e4m3, cosize_v<SmemLayoutS>> s[NUM_S_BUFS];
     float kv_dim_scale[NUM_BUFS][B_TOPK];
     float q_head_scale[B_H];
     float kv_w_scale[KV_SCALE_GROUPS];
@@ -193,10 +209,13 @@ struct SharedMemoryPlan {
     transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_block_done[NUM_BUFS][NUM_SV_TMEM_BLOCKS - 1];
     transac_bar_t bar_sv_done[NUM_BUFS];    // Final SV stripe is committed.
+    // A stripe may accept the next SV accumulation only after WG0 has
+    // rescaled the preceding tile's value in the same TMEM columns.
+    transac_bar_t bar_o_rescale_done[NUM_SV_TMEM_BLOCKS];
     transac_bar_t bar_kv_ready[NUM_BUFS][2];
     transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
-    transac_bar_t bar_so_ready;   // S and O are ready
+    transac_bar_t bar_so_ready;   // Current S buffer is ready.
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];

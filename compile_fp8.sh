@@ -64,6 +64,16 @@ if [[ "${FP8_BENCH_KV_DATA_CONST:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_FWD_BENCH_KV_DATA_CONST=1 )
 fi
 
+# Diagnostic-only O-rescale ablations. They intentionally do not preserve
+# numerical correctness and are used only to isolate pipeline costs.
+if [[ "${FP8_BENCH_O_RESCALE_SKIP_MUL:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_BENCH_O_RESCALE_SKIP_MUL=1 )
+fi
+
+if [[ "${FP8_BENCH_O_RESCALE_SKIP_TMEM:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_BENCH_O_RESCALE_SKIP_TMEM=1 )
+fi
+
 "$CXX" \
     "${INCLUDES[@]}" \
     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \

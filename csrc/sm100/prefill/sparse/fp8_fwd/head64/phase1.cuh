@@ -408,6 +408,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 #endif
 
     if (warpgroup_idx == 0) {
+        cutlass::arch::warpgroup_reg_alloc<208>();
         FP8_TIMED_WAIT(
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.qw_scale_wait_ns[warp_idx],
@@ -507,16 +508,52 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.barrier_timing.wg0[warp_idx][k].p_released_ns
             );
 
-            float cur_pi_max = -CUDART_INF_F;
+            // Keep four independent max chains. The 64-element P fragment is
+            // already resident in registers, so extra accumulators trade
+            // registers for shorter dependent latency on the WG0 path.
+            float pi_max0 = -CUDART_INF_F;
+            float pi_max1 = -CUDART_INF_F;
+            float pi_max2 = -CUDART_INF_F;
+            float pi_max3 = -CUDART_INF_F;
             CUTE_UNROLL
-            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                const float kv_scale = __shfl_sync(
-                    0xffffffff, lane_kv_scale[i / 32], i % 32
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD / 4; ++i) {
+                const int base = i * 4;
+                const float scaled_p0 = p[base + 0] * (
+                    qk_base_scale * __shfl_sync(
+                        0xffffffff, lane_kv_scale[(base + 0) / 32],
+                        (base + 0) % 32
+                    )
                 );
-                const float scaled_p = p[i] * (qk_base_scale * kv_scale);
-                p[i] = scaled_p;
-                cur_pi_max = max(cur_pi_max, scaled_p);
+                const float scaled_p1 = p[base + 1] * (
+                    qk_base_scale * __shfl_sync(
+                        0xffffffff, lane_kv_scale[(base + 1) / 32],
+                        (base + 1) % 32
+                    )
+                );
+                const float scaled_p2 = p[base + 2] * (
+                    qk_base_scale * __shfl_sync(
+                        0xffffffff, lane_kv_scale[(base + 2) / 32],
+                        (base + 2) % 32
+                    )
+                );
+                const float scaled_p3 = p[base + 3] * (
+                    qk_base_scale * __shfl_sync(
+                        0xffffffff, lane_kv_scale[(base + 3) / 32],
+                        (base + 3) % 32
+                    )
+                );
+                p[base + 0] = scaled_p0;
+                p[base + 1] = scaled_p1;
+                p[base + 2] = scaled_p2;
+                p[base + 3] = scaled_p3;
+                pi_max0 = max(pi_max0, scaled_p0);
+                pi_max1 = max(pi_max1, scaled_p1);
+                pi_max2 = max(pi_max2, scaled_p2);
+                pi_max3 = max(pi_max3, scaled_p3);
             }
+            float cur_pi_max = max(
+                max(pi_max0, pi_max1), max(pi_max2, pi_max3)
+            );
             FP8_TIMEPOINT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].p_scaled_ns
@@ -554,18 +591,54 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
             // Absorb the token factor into S, then quantize each head row.
             uint32_t s[NUM_ELEMS_PER_THREAD / 4];
-            float cur_sum = 0.0f;
-            float local_s_max = 0.0f;
+            float sum0 = 0.0f;
+            float sum1 = 0.0f;
+            float sum2 = 0.0f;
+            float sum3 = 0.0f;
+            float s_max0 = 0.0f;
+            float s_max1 = 0.0f;
+            float s_max2 = 0.0f;
+            float s_max3 = 0.0f;
             CUTE_UNROLL
-            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                const float softmax_s = exp2f(p[i] - new_max);
-                cur_sum += softmax_s;
-                const float kv_scale = __shfl_sync(
-                    0xffffffff, lane_kv_scale[i / 32], i % 32
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD / 4; ++i) {
+                const int base = i * 4;
+                const float softmax_s0 = exp2f(p[base + 0] - new_max);
+                const float softmax_s1 = exp2f(p[base + 1] - new_max);
+                const float softmax_s2 = exp2f(p[base + 2] - new_max);
+                const float softmax_s3 = exp2f(p[base + 3] - new_max);
+                sum0 += softmax_s0;
+                sum1 += softmax_s1;
+                sum2 += softmax_s2;
+                sum3 += softmax_s3;
+                const float s0 = softmax_s0 * __shfl_sync(
+                    0xffffffff, lane_kv_scale[(base + 0) / 32],
+                    (base + 0) % 32
                 );
-                p[i] = softmax_s * kv_scale;
-                local_s_max = max(local_s_max, p[i]);
+                const float s1 = softmax_s1 * __shfl_sync(
+                    0xffffffff, lane_kv_scale[(base + 1) / 32],
+                    (base + 1) % 32
+                );
+                const float s2 = softmax_s2 * __shfl_sync(
+                    0xffffffff, lane_kv_scale[(base + 2) / 32],
+                    (base + 2) % 32
+                );
+                const float s3 = softmax_s3 * __shfl_sync(
+                    0xffffffff, lane_kv_scale[(base + 3) / 32],
+                    (base + 3) % 32
+                );
+                p[base + 0] = s0;
+                p[base + 1] = s1;
+                p[base + 2] = s2;
+                p[base + 3] = s3;
+                s_max0 = max(s_max0, s0);
+                s_max1 = max(s_max1, s1);
+                s_max2 = max(s_max2, s2);
+                s_max3 = max(s_max3, s3);
             }
+            const float cur_sum = (sum0 + sum1) + (sum2 + sum3);
+            const float local_s_max = max(
+                max(s_max0, s_max1), max(s_max2, s_max3)
+            );
             FP8_TIMEPOINT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].softmax_exp_ready_ns
@@ -634,9 +707,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             fence_view_async_shared();
             plan.bar_so_ready.arrive();
 
-            // SV(k-1) fills four persistent TMEM O stripes.  As soon as a
-            // stripe commits, rescale that stripe and release its TMEM columns
-            // for the next SV tile.  This lets SV(j) overlap rescale O(j+1).
+            // The default path releases each O stripe as it is rescaled. The
+            // opt-in path waits for the final SV commit, then batches all four
+            // TMEM round trips under one warpgroup synchronization point.
             if (k > 0) {
                 const int prev_buf = (k - 1) % NUM_BUFS;
                 const int prev_phase = ((k - 1) / NUM_BUFS) & 1;
@@ -645,6 +718,90 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 const bool warp_needs_o_rescale = __any_sync(
                     0xffffffff, o_rescale != 1.0f
                 );
+#if defined(FP8_FWD_WHOLE_O_RESCALE)
+#if defined(FP8_FWD_BARRIER_TIMING)
+                auto* const first_stripe_timing = trace_wg0_tile
+                    ? &plan.barrier_timing.o_rescale[warp_idx][k][0]
+                    : nullptr;
+                FP8_TIMEPOINT(
+                    trace_wg0_tile,
+                    first_stripe_timing->stripe_start_ns
+                );
+                if (trace_wg0_tile) {
+                    first_stripe_timing->warp_rescale_active =
+                        static_cast<uint64_t>(warp_needs_o_rescale);
+                }
+#endif
+                // The final barrier is signalled after all SV stripes commit.
+                FP8_TIMED_WAIT(
+                    trace_wg0_tile,
+                    first_stripe_timing->sv_wait_ns,
+                    plan.bar_sv_done[prev_buf].wait(prev_phase)
+                );
+#if defined(FP8_FWD_BARRIER_TIMING)
+                if (trace_wg0_tile) {
+                    plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns =
+                        first_stripe_timing->sv_wait_ns;
+                }
+#endif
+                CUTE_UNROLL
+                for (int dv_block = 0;
+                     dv_block < NUM_SV_TMEM_BLOCKS;
+                     ++dv_block) {
+#if defined(FP8_FWD_BARRIER_TIMING)
+                    auto* const stripe_timing = trace_wg0_tile
+                        ? &plan.barrier_timing.o_rescale[warp_idx][k][dv_block]
+                        : nullptr;
+                    if (dv_block != 0) {
+                        FP8_TIMEPOINT(
+                            trace_wg0_tile,
+                            stripe_timing->stripe_start_ns
+                        );
+                        if (trace_wg0_tile) {
+                            stripe_timing->warp_rescale_active =
+                                static_cast<uint64_t>(warp_needs_o_rescale);
+                        }
+                    }
+#endif
+                    if (warp_needs_o_rescale) {
+                        if (dv_block == 0) {
+                            ku::tcgen05_after_thread_sync();
+                        }
+#if defined(FP8_FWD_BARRIER_TIMING)
+                        rescale_o_tmem_stripe(
+                            o_rescale,
+                            tmem_cols::O + dv_block * SV_TMEM_COLS_PER_BLOCK,
+                            plan.barrier_timing.origin_ns,
+                            stripe_timing
+                        );
+#else
+                        rescale_o_tmem_stripe(
+                            o_rescale,
+                            tmem_cols::O + dv_block * SV_TMEM_COLS_PER_BLOCK
+                        );
+#endif
+                        if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
+                            ku::tcgen05_before_thread_sync();
+                        }
+                    }
+                    FP8_TIMEPOINT(
+                        trace_wg0_tile,
+                        stripe_timing->sv_ready_ns
+                    );
+                }
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+                CUTE_UNROLL
+                for (int dv_block = 0;
+                     dv_block < NUM_SV_TMEM_BLOCKS;
+                     ++dv_block) {
+                    plan.bar_o_rescale_done[dv_block].arrive();
+                    FP8_TIMEPOINT(
+                        trace_wg0_tile,
+                        plan.barrier_timing.o_rescale[warp_idx][k][dv_block]
+                            .wg0_sync_done_ns
+                    );
+                }
+#else
                 CUTE_UNROLL
                 for (int dv_block = 0;
                      dv_block < NUM_SV_TMEM_BLOCKS;
@@ -726,6 +883,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         stripe_timing->wg0_sync_done_ns
                     );
                 }
+#endif
             }
             FP8_TIMEPOINT(
                 trace_wg0_tile,
@@ -882,6 +1040,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         }
 
 } else if (warpgroup_idx == 1) {
+    cutlass::arch::warpgroup_reg_dealloc<80>();
 
     // Producer warp for KV
         int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
@@ -1257,7 +1416,18 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         + static_cast<int64_t>(src_idx)
                             * params.stride_kv_s_kv
                         + D_K;
+#if defined(FP8_FWD_VECTOR_KV_SCALE_LOAD)
+                    // The trailing scale slot is 16-byte aligned. Keep this
+                    // opt-in because random top-k indices can change cache
+                    // behavior even when the extracted scale byte is identical.
+                    const uint4 packed_scale_slot = __ldg(
+                        reinterpret_cast<const uint4*>(kv_scale_ptr)
+                    );
+                    scale_bits = static_cast<uint8_t>(packed_scale_slot.x);
+#else
                     scale_bits = __ldg(kv_scale_ptr);
+#endif
+
                 }
                 plan.kv_dim_scale[cur_buf][scale_row] =
                     ue8m0_bits_to_float(scale_bits);

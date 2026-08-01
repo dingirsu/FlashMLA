@@ -19,6 +19,169 @@ namespace sm100::fwd::head64 {
 
 using namespace cute;
 
+#if defined(BF16_FWD_BARRIER_TIMING)
+CUTE_DEVICE
+uint64_t bf16_timing_now_ns() {
+    uint64_t timestamp;
+    asm volatile(
+        "mov.u64 %0, %%globaltimer;"
+        : "=l"(timestamp)
+        :
+        : "memory"
+    );
+    return timestamp;
+}
+
+#define BF16_TIMED_WAIT(sample, destination, wait_expression)                    \
+    do {                                                                         \
+        uint64_t bf16_wait_begin_ns = 0;                                         \
+        if (sample) {                                                            \
+            bf16_wait_begin_ns = bf16_timing_now_ns();                          \
+        }                                                                        \
+        wait_expression;                                                         \
+        if (sample) {                                                            \
+            destination = bf16_timing_now_ns() - bf16_wait_begin_ns;             \
+        }                                                                        \
+    } while (0)
+#define BF16_TIMEPOINT(sample, destination)                                      \
+    do {                                                                         \
+        if (sample) {                                                            \
+            destination = bf16_timing_now_ns()                                   \
+                - plan.barrier_timing.origin_ns;                                \
+        }                                                                        \
+    } while (0)
+
+CUTE_DEVICE
+void print_bf16_barrier_timing(
+    const SharedMemoryPlan& plan,
+    int num_k_blocks
+) {
+    const auto& timing = plan.barrier_timing;
+    const int traced_tiles = min(num_k_blocks, BF16_TIMING_MAX_TILES);
+    cute::print(
+        "BF16_TIME header unit=ns tiles=%d traced=%d origin=%llu\n",
+        num_k_blocks,
+        traced_tiles,
+        static_cast<unsigned long long>(timing.origin_ns)
+    );
+    CUTE_UNROLL
+    for (int warp = 0; warp < 12; ++warp) {
+        cute::print(
+            "BF16_TIME branch warp=%d end=%llu\n",
+            warp,
+            static_cast<unsigned long long>(timing.branch_end_ns[warp])
+        );
+    }
+    cute::print(
+        "BF16_TIME q_pipeline tma_wait=%llu tmem_commit=%llu\n",
+        static_cast<unsigned long long>(timing.q_tma_wait_ns),
+        static_cast<unsigned long long>(timing.q_tmem_committed_ns)
+    );
+    CUTE_UNROLL
+    for (int warp = 0; warp < 4; ++warp) {
+        cute::print(
+            "BF16_TIME final warp=%d sv_wait=%llu sv_ready=%llu "
+            "epi_start=%llu epi_tmem=%llu epi_smem=%llu epi_tma=%llu\n",
+            warp,
+            static_cast<unsigned long long>(timing.final_sv_wait_ns[warp]),
+            static_cast<unsigned long long>(timing.final_sv_ready_ns[warp]),
+            static_cast<unsigned long long>(timing.epilogue_start_ns[warp]),
+            static_cast<unsigned long long>(timing.epilogue_tmem_done_ns[warp]),
+            static_cast<unsigned long long>(timing.epilogue_smem_done_ns[warp]),
+            static_cast<unsigned long long>(timing.epilogue_tma_done_ns[warp])
+        );
+    }
+    for (int tile = 0; tile < traced_tiles; ++tile) {
+        CUTE_UNROLL
+        for (int warp = 0; warp < BF16_TIMING_WG0_WARPS; ++warp) {
+            const auto& value = timing.wg0[warp][tile];
+            cute::print(
+                "BF16_TIME wg0 warp=%d tile=%d start=%llu qk_wait=%llu "
+                "valid_wait=%llu waits_done=%llu p_released=%llu "
+                "rowmax_wait=%llu rowmax_ready=%llu softmax_exp_ready=%llu "
+                "softmax_ready=%llu sv_wait=%llu s_stored=%llu "
+                "o_rescale_start=%llu o_rescale_done=%llu active=%llu "
+                "s_arrived=%llu\n",
+                warp,
+                tile,
+                static_cast<unsigned long long>(value.tile_start_ns),
+                static_cast<unsigned long long>(value.qk_wait_ns),
+                static_cast<unsigned long long>(value.valid_wait_ns),
+                static_cast<unsigned long long>(value.waits_done_ns),
+                static_cast<unsigned long long>(value.p_released_ns),
+                static_cast<unsigned long long>(value.rowmax_wait_ns),
+                static_cast<unsigned long long>(value.rowmax_ready_ns),
+                static_cast<unsigned long long>(value.softmax_exp_ready_ns),
+                static_cast<unsigned long long>(value.softmax_ready_ns),
+                static_cast<unsigned long long>(value.sv_wait_ns),
+                static_cast<unsigned long long>(value.s_stored_ns),
+                static_cast<unsigned long long>(value.o_rescale_start_ns),
+                static_cast<unsigned long long>(value.o_rescale_done_ns),
+                static_cast<unsigned long long>(value.o_rescale_active),
+                static_cast<unsigned long long>(value.s_arrived_ns)
+            );
+        }
+        CUTE_UNROLL
+        for (int warp = 0; warp < BF16_TIMING_KV_WARPS; ++warp) {
+            const auto& value = timing.kv[warp][tile];
+            cute::print(
+                "BF16_TIME kv warp=%d tile=%d start=%llu indices_ready=%llu "
+                "q_reuse_wait=%llu sv_free_wait=%llu tma0_issued=%llu "
+                "tma1_issued=%llu\n",
+                warp + 4,
+                tile,
+                static_cast<unsigned long long>(value.tile_start_ns),
+                static_cast<unsigned long long>(value.indices_ready_ns),
+                static_cast<unsigned long long>(value.q_reuse_wait_ns),
+                static_cast<unsigned long long>(value.sv_free_wait_ns),
+                static_cast<unsigned long long>(value.tma_part0_issued_ns),
+                static_cast<unsigned long long>(value.tma_part1_issued_ns)
+            );
+        }
+        const auto& mask = timing.mask[tile];
+        cute::print(
+            "BF16_TIME mask warp=9 tile=%d start=%llu free_wait=%llu "
+            "arrived=%llu\n",
+            tile,
+            static_cast<unsigned long long>(mask.tile_start_ns),
+            static_cast<unsigned long long>(mask.buffer_free_wait_ns),
+            static_cast<unsigned long long>(mask.arrived_ns)
+        );
+    }
+    for (int iter = 0; iter <= traced_tiles; ++iter) {
+        const auto& value = timing.mma[iter];
+        cute::print(
+            "BF16_TIME mma warp=8 iter=%d start=%llu p_free_wait=%llu "
+            "q_copy_wait=%llu kv0_wait=%llu kv0_ready=%llu qk0_issued=%llu "
+            "kv1_wait=%llu kv1_ready=%llu qk1_issued=%llu "
+            "qk_committed=%llu s_ready_wait=%llu s_ready=%llu "
+            "sv_issued=%llu sv_committed=%llu\n",
+            iter,
+            static_cast<unsigned long long>(value.iter_start_ns),
+            static_cast<unsigned long long>(value.p_free_wait_ns),
+            static_cast<unsigned long long>(value.q_copy_wait_ns),
+            static_cast<unsigned long long>(value.kv_wait_ns[0]),
+            static_cast<unsigned long long>(value.kv_ready_ns[0]),
+            static_cast<unsigned long long>(value.qk_issued_ns[0]),
+            static_cast<unsigned long long>(value.kv_wait_ns[1]),
+            static_cast<unsigned long long>(value.kv_ready_ns[1]),
+            static_cast<unsigned long long>(value.qk_issued_ns[1]),
+            static_cast<unsigned long long>(value.qk_committed_ns),
+            static_cast<unsigned long long>(value.s_ready_wait_ns),
+            static_cast<unsigned long long>(value.s_ready_ns),
+            static_cast<unsigned long long>(value.sv_issued_ns),
+            static_cast<unsigned long long>(value.sv_committed_ns)
+        );
+    }
+}
+#else
+#define BF16_TIMED_WAIT(sample, destination, wait_expression)                    \
+    do {                                                                         \
+        wait_expression;                                                         \
+    } while (0)
+#define BF16_TIMEPOINT(sample, destination) do { } while (0)
+#endif
+
 /*
 Pipeline Overview:
 
@@ -148,6 +311,27 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     }
 
     __syncthreads();
+#if defined(BF16_FWD_BARRIER_TIMING)
+    if (s_q_idx == 0) {
+        static_assert(sizeof(Bf16BarrierTiming) % sizeof(uint32_t) == 0);
+        uint32_t* timing_words = reinterpret_cast<uint32_t*>(
+            &plan.barrier_timing
+        );
+        CUTE_UNROLL
+        for (
+            int i = threadIdx.x;
+            i < sizeof(Bf16BarrierTiming) / sizeof(uint32_t);
+            i += NUM_THREADS
+        ) {
+            timing_words[i] = 0;
+        }
+    }
+    __syncthreads();
+    if (s_q_idx == 0 && threadIdx.x == 0) {
+        plan.barrier_timing.origin_ns = bf16_timing_now_ns();
+    }
+    __syncthreads();
+#endif
 
     if (warpgroup_idx == 0) {
         // Scale & Exp warps
@@ -168,10 +352,37 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
-            // Wait for P
-            NamedBarrier::arrive_and_wait(64, NamedBarriers::wg0_warp02_sync+(warp_idx&1));
-            plan.bar_qk_nope_done[k%NUM_BUFS].wait((k/NUM_BUFS)&1);
-            plan.bar_k_valid_ready[k%NUM_BUFS].wait((k/NUM_BUFS)&1);    // Put the barrier wait here for more code reordering space
+#if defined(BF16_FWD_BARRIER_TIMING)
+            const bool trace_wg0_tile = s_q_idx == 0
+                && lane_idx == 0 && warp_idx < BF16_TIMING_WG0_WARPS
+                && k < BF16_TIMING_MAX_TILES;
+#endif
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].tile_start_ns
+            );
+            // Wait for P.  The named barrier is the intra-WG reduction handoff.
+            NamedBarrier::arrive_and_wait(
+                64, NamedBarriers::wg0_warp02_sync + (warp_idx & 1)
+            );
+            BF16_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].qk_wait_ns,
+                plan.bar_qk_nope_done[k % NUM_BUFS].wait(
+                    (k / NUM_BUFS) & 1
+                )
+            );
+            BF16_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].valid_wait_ns,
+                plan.bar_k_valid_ready[k % NUM_BUFS].wait(
+                    (k / NUM_BUFS) & 1
+                )
+            );
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].waits_done_ns
+            );
             ku::tcgen05_after_thread_sync();
             
             // Load P
@@ -190,14 +401,26 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                 p
             );
             plan.bar_k_valid_free[k%NUM_BUFS].arrive();
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].p_released_ns
+            );
             
             // Get rowwise max of Pi
             float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
             cur_pi_max *= params.sm_scale_div_log2;
 
             plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            BF16_TIMED_WAIT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].rowmax_wait_ns,
+                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync)
+            );
             cur_pi_max = max(cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup^64]);
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].rowmax_ready_ns
+            );
             real_mi = max(real_mi, cur_pi_max);
             bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
             // By this point:
@@ -220,27 +443,63 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             // Calculate S
             nv_bfloat162 s[NUM_ELEMS_PER_THREAD/2];
             float cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>(s, p, params.sm_scale_div_log2, new_max);
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].softmax_exp_ready_ns
+            );
             li = fma(li, scale_for_old, cur_sum);
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].softmax_ready_ns
+            );
 
             // Wait for last SV gemm, write S
             if (k > 0) {
-                plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);
+                BF16_TIMED_WAIT(
+                    trace_wg0_tile,
+                    plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns,
+                    plan.bar_sv_done[(k - 1) % NUM_BUFS].wait(
+                        ((k - 1) / NUM_BUFS) & 1
+                    )
+                );
             }
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; i += 1) {
                 *(uint128_t*)(sS_base + B_H*8*i) = *(uint128_t*)(s + i*4);
             }
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].s_stored_ns
+            );
 
             // Scale O
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].o_rescale_start_ns
+            );
+#if defined(BF16_FWD_BARRIER_TIMING)
+            if (trace_wg0_tile) {
+                plan.barrier_timing.wg0[warp_idx][k].o_rescale_active =
+                    static_cast<uint64_t>(k > 0 && should_scale_o);
+            }
+#endif
             if (k > 0 && should_scale_o) {
-                // plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);   // NOTE We have waited for last SV gemm before
+                // The preceding SV completion was already observed above.
                 ku::tcgen05_after_thread_sync();
                 rescale_O<D_V, 32, tmem_cols::O>(scale_for_old);
                 ku::tcgen05_before_thread_sync();
             }
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].o_rescale_done_ns
+            );
             
             fence_view_async_shared();
             plan.bar_so_ready.arrive();
+            BF16_TIMEPOINT(
+                trace_wg0_tile,
+                plan.barrier_timing.wg0[warp_idx][k].s_arrived_ns
+            );
         }
 
         // Epilogue
@@ -267,8 +526,22 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
         }
 
         // Wait for the last GEMM
-        plan.bar_sv_done[(num_k_blocks-1)%NUM_BUFS].wait(((num_k_blocks-1)/NUM_BUFS)&1);
+        BF16_TIMED_WAIT(
+            s_q_idx == 0 && lane_idx == 0,
+            plan.barrier_timing.final_sv_wait_ns[warp_idx],
+            plan.bar_sv_done[(num_k_blocks - 1) % NUM_BUFS].wait(
+                ((num_k_blocks - 1) / NUM_BUFS) & 1
+            )
+        );
+        BF16_TIMEPOINT(
+            s_q_idx == 0 && lane_idx == 0,
+            plan.barrier_timing.final_sv_ready_ns[warp_idx]
+        );
         ku::tcgen05_after_thread_sync();
+        BF16_TIMEPOINT(
+            s_q_idx == 0 && lane_idx == 0,
+            plan.barrier_timing.epilogue_start_ns[warp_idx]
+        );
 
         // Fetch dO if necessary
 
@@ -315,6 +588,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                     ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
                     cutlass::arch::fence_view_async_tmem_load();
                 }
+                BF16_TIMEPOINT(
+                    s_q_idx == 0 && lane_idx == 0,
+                    plan.barrier_timing.epilogue_tmem_done_ns[warp_idx]
+                );
 
                 // Convert and store
                 CUTE_UNROLL
@@ -327,6 +604,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                     }
                     *(uint128_t*)(sO_addrs[i] + (c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI)*64) = *(uint128_t*)(o_bf16);
                 }
+                BF16_TIMEPOINT(
+                    s_q_idx == 0 && lane_idx == 0,
+                    plan.barrier_timing.epilogue_smem_done_ns[warp_idx]
+                );
 
                 // Sync
                 fence_view_async_shared();
@@ -350,6 +631,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                 }
             }
         }
+        BF16_TIMEPOINT(
+            s_q_idx == 0 && lane_idx == 0,
+            plan.barrier_timing.epilogue_tma_done_ns[warp_idx]
+        );
 
 
         if (warp_idx == 0) {
@@ -362,6 +647,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
         if (elect_one_sync()) {
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
+#if defined(BF16_FWD_BARRIER_TIMING)
+                const bool trace_kv_tile = s_q_idx == 0
+                    && lane_idx == 0 && warp_idx < BF16_TIMING_KV_WARPS
+                    && k < BF16_TIMING_MAX_TILES;
+#endif
+                BF16_TIMEPOINT(
+                    trace_kv_tile,
+                    plan.barrier_timing.kv[warp_idx][k].tile_start_ns
+                );
                 int4 indices[NUM_LOCAL_ROWS_PER_WARP];
                 int max_indices = -1, min_indices = params.s_kv;
                 CUTE_UNROLL
@@ -372,14 +666,26 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                 }
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
                 bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
+                BF16_TIMEPOINT(
+                    trace_kv_tile,
+                    plan.barrier_timing.kv[warp_idx][k].indices_ready_ns
+                );
 
                 if (k == 2) {
-                    plan.bar_prologue_utccp_nope.wait(0);   // Since q_nope coincidences with k[2]
+                    BF16_TIMED_WAIT(
+                        trace_kv_tile,
+                        plan.barrier_timing.kv[warp_idx][k].q_reuse_wait_ns,
+                        plan.bar_prologue_utccp_nope.wait(0)
+                    );  // Q shares storage with K stage 2.
                 }
 
                 // Copy NoPE
                 int cur_buf = k%NUM_BUFS;
-                plan.bar_sv_done[cur_buf].wait((k/NUM_BUFS)&1^1);
+                BF16_TIMED_WAIT(
+                    trace_kv_tile,
+                    plan.barrier_timing.kv[warp_idx][k].sv_free_wait_ns,
+                    plan.bar_sv_done[cur_buf].wait((k / NUM_BUFS) & 1 ^ 1)
+                );
                 bf16* sK_nope_base = plan.u.k.k_nope[cur_buf].data() + warp_idx*4*64;
 
                 auto load_kv_nope_part = [&](int part_idx) {
@@ -401,7 +707,15 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
                 if (!should_skip_tma) {
                     load_kv_nope_part(0);
+                    BF16_TIMEPOINT(
+                        trace_kv_tile,
+                        plan.barrier_timing.kv[warp_idx][k].tma_part0_issued_ns
+                    );
                     load_kv_nope_part(1);
+                    BF16_TIMEPOINT(
+                        trace_kv_tile,
+                        plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
+                    );
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
                     CUTE_UNROLL
@@ -450,7 +764,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             }
 
             plan.bar_prologue_q_nope.arrive_and_expect_tx(B_H*D_V*sizeof(bf16));
-            plan.bar_prologue_q_nope.wait(0);
+            BF16_TIMED_WAIT(
+                s_q_idx == 0 && lane_idx == 0,
+                plan.barrier_timing.q_tma_wait_ns,
+                plan.bar_prologue_q_nope.wait(0)
+            );
             ku::tcgen05_after_thread_sync();
             CUTE_UNROLL
             for (int tile_idx = 0; tile_idx < D_V/64/2; ++tile_idx) {
@@ -465,6 +783,10 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                 }
             }
             ku::umma_arrive_noelect(plan.bar_prologue_utccp_nope);
+            BF16_TIMEPOINT(
+                s_q_idx == 0 && lane_idx == 0,
+                plan.barrier_timing.q_tmem_committed_ns
+            );
 
             if constexpr (HAVE_ROPE) {
                 plan.bar_prologue_utccp_rope.wait(0);
@@ -472,13 +794,25 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks+1; ++k) {
+#if defined(BF16_FWD_BARRIER_TIMING)
+                const bool trace_mma_iter = s_q_idx == 0
+                    && lane_idx == 0 && k <= BF16_TIMING_MAX_TILES;
+#endif
+                BF16_TIMEPOINT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].iter_start_ns
+                );
                 if (k < num_k_blocks) {
                     // Pi = QKi^T
                     int cur_buf = k%NUM_BUFS;
                     Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.k.k_nope[cur_buf].data()), SmemLayoutKNoPE_TiledMMA{});
                     Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.k.k_rope.data()), SmemLayoutKRoPE_TiledMMA{});
 
-                    plan.bar_p_free.wait(k&1^1);
+                    BF16_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].p_free_wait_ns,
+                        plan.bar_p_free.wait(k & 1 ^ 1)
+                    );
                     ku::tcgen05_after_thread_sync();
                     
                     // Wait for K (RoPE)
@@ -492,20 +826,42 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 
                     // Wait for K (NoPE)
                     if (k == 0) {
-                        plan.bar_prologue_utccp_nope.wait(0);
+                        BF16_TIMED_WAIT(
+                            trace_mma_iter,
+                            plan.barrier_timing.mma[k].q_copy_wait_ns,
+                            plan.bar_prologue_utccp_nope.wait(0)
+                        );
                     }
                     Tensor sK_nope_divided = flat_divide(sK_nope, Tile<Int<B_TOPK*2>, Int<D_V/4>>{})(_, _, _0{}, _);
                     CUTE_UNROLL
                     for (int kv_nope_part_idx = 0; kv_nope_part_idx < 2; ++kv_nope_part_idx) {
                         plan.bar_kv_nope_ready[cur_buf][kv_nope_part_idx].arrive_and_expect_tx(B_TOPK*D_V/2*sizeof(bf16));
-                        plan.bar_kv_nope_ready[cur_buf][kv_nope_part_idx].wait((k/NUM_BUFS)&1);
+                        BF16_TIMED_WAIT(
+                            trace_mma_iter,
+                            plan.barrier_timing.mma[k].kv_wait_ns[kv_nope_part_idx],
+                            plan.bar_kv_nope_ready[cur_buf][kv_nope_part_idx].wait(
+                                (k / NUM_BUFS) & 1
+                            )
+                        );
+                        BF16_TIMEPOINT(
+                            trace_mma_iter,
+                            plan.barrier_timing.mma[k].kv_ready_ns[kv_nope_part_idx]
+                        );
                         ku::tcgen05_after_thread_sync();
 
                         // P += Q(nope) @ K(nope)^T
                         bool clear_accum = (!HAVE_ROPE) && kv_nope_part_idx == 0;
                         ku::utcmma_ts(tiled_mma_P, kv_nope_part_idx ? tQ_nope_part1 : tQ_nope_part0, sK_nope_divided(_, _, kv_nope_part_idx), tP, clear_accum);
+                        BF16_TIMEPOINT(
+                            trace_mma_iter,
+                            plan.barrier_timing.mma[k].qk_issued_ns[kv_nope_part_idx]
+                        );
                     }
                     ku::umma_arrive_noelect(plan.bar_qk_nope_done[cur_buf]);
+                    BF16_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].qk_committed_ns
+                    );
                 }
                 if (k > 0) {
                     // O += S(i-1)V(i-1)
@@ -515,12 +871,28 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                     Tensor sV = make_tensor(make_smem_ptr(plan.u.k.k_nope[cur_buf].data()), SmemLayoutV{});
 
                     // Wait for S(i-1) and O to be scaled
-                    plan.bar_so_ready.wait((k-1)&1);
+                    BF16_TIMED_WAIT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].s_ready_wait_ns,
+                        plan.bar_so_ready.wait((k - 1) & 1)
+                    );
+                    BF16_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].s_ready_ns
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     // O += sS @ sV
                     ku::utcmma_ss(tiled_mma_O, sS, sV, tO, k == 1);
+                    BF16_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].sv_issued_ns
+                    );
                     ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
+                    BF16_TIMEPOINT(
+                        trace_mma_iter,
+                        plan.barrier_timing.mma[k].sv_committed_ns
+                    );
                 }
             }
         } else if (warp_idx == 9) {
@@ -528,6 +900,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             if (lane_idx < B_TOPK/8) {
                 CUTE_NO_UNROLL
                 for (int k = 0; k < num_k_blocks; ++k) {
+#if defined(BF16_FWD_BARRIER_TIMING)
+                    const bool trace_mask_tile = s_q_idx == 0
+                        && lane_idx == 0 && k < BF16_TIMING_MAX_TILES;
+#endif
+                    BF16_TIMEPOINT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].tile_start_ns
+                    );
                     char k_validness_mask = load_indices_and_generate_mask(
                         lane_idx,
                         gIndices + k*B_TOPK,
@@ -537,9 +917,19 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
                     );
 
                     int cur_buf = k%NUM_BUFS;
-                    plan.bar_k_valid_free[cur_buf].wait((k/NUM_BUFS)&1^1);
+                    BF16_TIMED_WAIT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].buffer_free_wait_ns,
+                        plan.bar_k_valid_free[cur_buf].wait(
+                            (k / NUM_BUFS) & 1 ^ 1
+                        )
+                    );
                     plan.is_k_valid[cur_buf][lane_idx] = k_validness_mask;
                     plan.bar_k_valid_ready[cur_buf].arrive();
+                    BF16_TIMEPOINT(
+                        trace_mask_tile,
+                        plan.barrier_timing.mask[k].arrived_ns
+                    );
                 }
             }
         } else if (warp_idx == 10 || warp_idx == 11) {
@@ -572,6 +962,16 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
         }
     }
 
+#if defined(BF16_FWD_BARRIER_TIMING)
+    if (s_q_idx == 0 && lane_idx == 0) {
+        plan.barrier_timing.branch_end_ns[warp_idx] = bf16_timing_now_ns()
+            - plan.barrier_timing.origin_ns;
+    }
+    __syncthreads();
+    if (s_q_idx == 0 && threadIdx.x == 0) {
+        print_bf16_barrier_timing(plan, num_k_blocks);
+    }
+#endif
 
 #else
     if (cute::thread0()) {
@@ -579,6 +979,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     }
 #endif
 }
+
+#undef BF16_TIMED_WAIT
+#undef BF16_TIMEPOINT
 
 template<int D_QK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {

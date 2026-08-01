@@ -613,21 +613,22 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 p[base + 1] = s1;
                 p[base + 2] = s2;
                 p[base + 3] = s3;
-                s_max0 = max(s_max0, s0);
-                s_max1 = max(s_max1, s1);
-                s_max2 = max(s_max2, s2);
-                s_max3 = max(s_max3, s3);
+                // s_max0 = max(s_max0, s0);
+                // s_max1 = max(s_max1, s1);
+                // s_max2 = max(s_max2, s2);
+                // s_max3 = max(s_max3, s3);
             }
             const float cur_sum = (sum0 + sum1) + (sum2 + sum3);
-            const float local_s_max = max(
-                max(s_max0, s_max1), max(s_max2, s_max3)
-            );
+            // const float local_s_max = max(
+            //     max(s_max0, s_max1), max(s_max2, s_max3)
+            // );
+            // const float local_s_max = 1.0f;
             FP8_TIMEPOINT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].softmax_exp_ready_ns
             );
 
-            plan.rowwise_li_buf[idx_in_warpgroup] = local_s_max;
+            // plan.rowwise_li_buf[idx_in_warpgroup] = local_s_max;
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].smax_wait_ns,
@@ -635,17 +636,20 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     128, NamedBarriers::wg0_sync
                 ))
             );
-            const float s_max = max(
-                local_s_max,
-                plan.rowwise_li_buf[idx_in_warpgroup ^ B_H]
-            );
-            const e8m0 s_scale_e8m0(
-                s_max > 0.0f ? s_max / FP8_MAX : 1.0f
-            );
-            const float current_s_scale = float(s_scale_e8m0);
-            const float inv_current_s_scale = __fdividef(
-                1.0f, current_s_scale
-            );
+            // const float s_max = max(
+            //     local_s_max,
+            //     plan.rowwise_li_buf[idx_in_warpgroup ^ B_H]
+            // );
+            // const e8m0 s_scale_e8m0(
+            //     s_max > 0.0f ? s_max / FP8_MAX : 1.0f
+            // );
+
+            // const float current_s_scale = float(s_scale_e8m0);
+            // const float inv_current_s_scale = __fdividef(
+            //     1.0f, current_s_scale
+            // );
+            constexpr float current_s_scale = 1.0f/448.f;
+            constexpr float inv_current_s_scale = 448.f;
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
                 const uint16_t s01 = ku::float2_to_e4m3x2_bits(float2{
@@ -696,11 +700,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             if (k > 0) {
                 const int prev_buf = (k - 1) % NUM_BUFS;
                 const int prev_phase = ((k - 1) / NUM_BUFS) & 1;
-                const float o_rescale = scale_for_old
-                    * s_scale_for_o / current_s_scale;
-                const bool warp_needs_o_rescale = __any_sync(
-                    0xffffffff, o_rescale != 1.0f
-                );
+                // const float o_rescale = scale_for_old
+                //     * s_scale_for_o / current_s_scale;
+                // const bool warp_needs_o_rescale = __any_sync(
+                //     0xffffffff, o_rescale != 1.0f
+                // );
+                const float o_rescale = scale_for_old;
+                const bool warp_needs_o_rescale = should_scale_o;
 #if defined(FP8_FWD_WHOLE_O_RESCALE)
 #if defined(FP8_FWD_BARRIER_TIMING)
                 auto* const first_stripe_timing = trace_wg0_tile

@@ -107,6 +107,79 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 	Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+#if defined(BF16_FWD_BARRIER_TIMING)
+// `%globaltimer` is used for low-intrusion CTA-0 phase tracing.  Keep the
+// records in shared memory so the device can print one coherent trace after
+// all producer, MMA, and WG0 branches have finished.
+constexpr int BF16_TIMING_MAX_TILES = 8;
+constexpr int BF16_TIMING_WG0_WARPS = 1;
+constexpr int BF16_TIMING_KV_WARPS = 1;
+
+struct Bf16Wg0Timing {
+    uint32_t tile_start_ns;
+    uint32_t qk_wait_ns;
+    uint32_t valid_wait_ns;
+    uint32_t waits_done_ns;
+    uint32_t p_released_ns;
+    uint32_t rowmax_wait_ns;
+    uint32_t rowmax_ready_ns;
+    uint32_t softmax_exp_ready_ns;
+    uint32_t softmax_ready_ns;
+    uint32_t sv_wait_ns;
+    uint32_t s_stored_ns;
+    uint32_t o_rescale_start_ns;
+    uint32_t o_rescale_done_ns;
+    uint32_t o_rescale_active;
+    uint32_t s_arrived_ns;
+};
+
+struct Bf16KvProducerTiming {
+    uint32_t tile_start_ns;
+    uint32_t indices_ready_ns;
+    uint32_t q_reuse_wait_ns;
+    uint32_t sv_free_wait_ns;
+    uint32_t tma_part0_issued_ns;
+    uint32_t tma_part1_issued_ns;
+};
+
+struct Bf16MmaTiming {
+    uint32_t iter_start_ns;
+    uint32_t p_free_wait_ns;
+    uint32_t q_copy_wait_ns;
+    uint32_t kv_wait_ns[2];
+    uint32_t kv_ready_ns[2];
+    uint32_t qk_issued_ns[2];
+    uint32_t qk_committed_ns;
+    uint32_t s_ready_wait_ns;
+    uint32_t s_ready_ns;
+    uint32_t sv_issued_ns;
+    uint32_t sv_committed_ns;
+};
+
+struct Bf16SimpleProducerTiming {
+    uint32_t tile_start_ns;
+    uint32_t buffer_free_wait_ns;
+    uint32_t arrived_ns;
+};
+
+struct Bf16BarrierTiming {
+    uint64_t origin_ns;
+    uint32_t branch_end_ns[12];
+    uint32_t final_sv_wait_ns[4];
+    uint32_t final_sv_ready_ns[4];
+    uint32_t epilogue_start_ns[4];
+    uint32_t epilogue_tmem_done_ns[4];
+    uint32_t epilogue_smem_done_ns[4];
+    uint32_t epilogue_tma_done_ns[4];
+    uint32_t q_tma_wait_ns;
+    uint32_t q_tmem_committed_ns;
+    Bf16Wg0Timing wg0[BF16_TIMING_WG0_WARPS][BF16_TIMING_MAX_TILES];
+    Bf16KvProducerTiming kv[BF16_TIMING_KV_WARPS][BF16_TIMING_MAX_TILES];
+    Bf16MmaTiming mma[BF16_TIMING_MAX_TILES + 1];
+    Bf16SimpleProducerTiming mask[BF16_TIMING_MAX_TILES];
+};
+#endif
+
 
 struct SharedMemoryPlan {
     union {
@@ -136,6 +209,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
+#if defined(BF16_FWD_BARRIER_TIMING)
+    Bf16BarrierTiming barrier_timing;
+#endif
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

@@ -102,6 +102,8 @@ ext_modules.append(
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu",
+            "csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu",
+            "csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/fwd/head_small/instantiations/phase1_k128.cu",

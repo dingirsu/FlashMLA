@@ -51,9 +51,10 @@ uint64_t fp8_timing_now_ns() {
         }                                                                       \
     } while (0)
 
+template<bool HAVE_QK_TAIL>
 CUTE_DEVICE
 void print_fp8_barrier_timing(
-    const SharedMemoryPlan& plan,
+    const SharedMemoryPlanT<HAVE_QK_TAIL>& plan,
     int num_k_blocks
 ) {
     const auto& timing = plan.barrier_timing;
@@ -288,7 +289,7 @@ void rescale_o_tmem_stripe(
 #endif
 }
 
-template<typename TmaParams>
+template<bool HAVE_QK_TAIL, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 
@@ -302,7 +303,10 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
 
     extern __shared__ char wksp_buf[];
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+    using Plan = SharedMemoryPlanT<HAVE_QK_TAIL>;
+    constexpr int NUM_MAIN_BUFS = Plan::NUM_MAIN_BUFS;
+    constexpr int QK_DIM = HAVE_QK_TAIL ? D_Q + 64 : D_Q;
+    Plan &plan = *reinterpret_cast<Plan*>(wksp_buf);
     if (warp_idx == 0 && elect_one_sync()) {
         cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
@@ -312,6 +316,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
 
     TiledMMA tiled_mma_P = TiledMMA_P{};
+    TiledMMA tiled_mma_P_ss = TiledMMA_P_SS{};
     TiledMMA tiled_mma_O = TiledMMA_O{};
 
     Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
@@ -335,6 +340,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         if (elect_one_sync()) {
             // Copy Q
             cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+            if constexpr (HAVE_QK_TAIL) {
+                cute::prefetch_tma_descriptor(
+                    tma_params.tma_Q_tail.get_tma_descriptor()
+                );
+            }
 
             plan.bar_prologue.init(1);
             fence_barrier_init();
@@ -342,15 +352,33 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx);
             Tensor sQ = make_tensor(make_smem_ptr(plan.qkvo.q.q.data()), SmemLayoutQ{});
             ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_prologue, TMA::CacheHintSm90::EVICT_FIRST);
+            if constexpr (HAVE_QK_TAIL) {
+                Tensor gQ_tail = tma_params.tma_Q_tail.get_tma_tensor(
+                    tma_params.shape_Q_tail
+                )(_, _, s_q_idx);
+                Tensor sQ_tail = make_tensor(
+                    make_smem_ptr(plan.qk_tail.q.data()), SmemLayoutQTail{}
+                );
+                ku::launch_tma_copy(
+                    tma_params.tma_Q_tail,
+                    gQ_tail,
+                    sQ_tail,
+                    plan.bar_prologue,
+                    TMA::CacheHintSm90::EVICT_FIRST
+                );
+            }
 
             cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
             cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv));
+            if constexpr (HAVE_QK_TAIL) {
+                cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_tail);
+            }
             
             // Initialize other barriers
             plan.bar_prologue_utccp.init(1);
             plan.bar_qw_scale_ready.init(2);
             CUTE_UNROLL
-            for (int i = 0; i < NUM_BUFS; ++i) {
+            for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
                 plan.bar_sv_done[i].init(1);
                 plan.bar_kv_ready[i][0].init(1);
                 plan.bar_kv_ready[i][1].init(1);
@@ -358,9 +386,16 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.bar_k_valid_ready[i].init(B_TOPK/8);
                 plan.bar_k_valid_free[i].init(128);
             }
-            for (int i = 0; i < NUM_P_BUFS; ++i) {
+            for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
+                plan.bar_qk_part_done[i].init(1);
                 plan.bar_qk_done[i].init(1);
+            }
+            for (int i = 0; i < NUM_P_BUFS; ++i) {
                 plan.bar_p_free[i].init(128); // warp group 0 touch this
+            }
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_QK_TAIL_BUFS; ++i) {
+                plan.bar_kv_tail_ready[i].init(1);
             }
             plan.bar_so_ready.init(128);
             CUTE_UNROLL
@@ -435,12 +470,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].tile_start_ns
             );
-            const int cur_buf = k % NUM_BUFS;
+            const int cur_buf = k % NUM_MAIN_BUFS;
             const int p_idx = k % NUM_P_BUFS;
+            const int qk_tail_buf = k % NUM_QK_TAIL_BUFS;
+            const int qk_bar_idx = HAVE_QK_TAIL ? qk_tail_buf : p_idx;
+            const int qk_bar_phase = HAVE_QK_TAIL
+                ? ((k / NUM_QK_TAIL_BUFS) & 1)
+                : ((k / NUM_P_BUFS) & 1);
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].qk_wait_ns,
-                plan.bar_qk_done[p_idx].wait((k / NUM_P_BUFS) & 1)
+                plan.bar_qk_done[qk_bar_idx].wait(qk_bar_phase)
             );
             float p[NUM_ELEMS_PER_THREAD];
             ku::tcgen05_after_thread_sync();
@@ -454,12 +494,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].valid_wait_ns,
-                plan.bar_k_valid_ready[cur_buf].wait((k / NUM_BUFS) & 1)
+                plan.bar_k_valid_ready[cur_buf].wait((k / NUM_MAIN_BUFS) & 1)
             );
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].scale_wait_ns,
-                plan.bar_kv_scale_ready[cur_buf].wait((k / NUM_BUFS) & 1)
+                plan.bar_kv_scale_ready[cur_buf].wait((k / NUM_MAIN_BUFS) & 1)
             );
             FP8_TIMEPOINT(
                 trace_wg0_tile,
@@ -701,8 +741,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             // Wait for the preceding SV tile to finish, rescale all four O
             // stripes, then publish one handoff for the whole O accumulator.
             if (k > 0) {
-                const int prev_buf = (k - 1) % NUM_BUFS;
-                const int prev_phase = ((k - 1) / NUM_BUFS) & 1;
+                const int prev_buf = (k - 1) % NUM_MAIN_BUFS;
+                const int prev_phase = ((k - 1) / NUM_MAIN_BUFS) & 1;
                 // const float o_rescale = scale_for_old
                 //     * s_scale_for_o / current_s_scale;
                 // const bool warp_needs_o_rescale = __any_sync(
@@ -841,8 +881,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         FP8_TIMED_WAIT(
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.final_sv_wait_ns[warp_idx],
-            plan.bar_sv_done[(num_k_blocks - 1) % NUM_BUFS].wait(
-                ((num_k_blocks - 1) / NUM_BUFS) & 1
+            plan.bar_sv_done[(num_k_blocks - 1) % NUM_MAIN_BUFS].wait(
+                ((num_k_blocks - 1) / NUM_MAIN_BUFS) & 1
             )
         );
         FP8_TIMEPOINT(
@@ -988,22 +1028,33 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     plan.barrier_timing.kv[warp_idx][k].indices_ready_ns
                 );
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
-                bool should_skip_tma = is_all_rows_invalid && k >= NUM_BUFS;
+                bool should_skip_tma = is_all_rows_invalid && k >= NUM_MAIN_BUFS;
 
-                if (k == NUM_BUFS - 1) {
+                if (k == NUM_MAIN_BUFS - 1) {
                     FP8_TIMED_WAIT(
                         trace_kv_tile,
                         plan.barrier_timing.kv[warp_idx][k].q_reuse_wait_ns,
                         plan.bar_prologue_utccp.wait(0)
-                    );  // Q shares storage with K stage 2.
+                    );  // Q shares storage with the last main K stage.
                 }
 
                 // Copy NoPE
-                int cur_buf = k%NUM_BUFS;
+                int cur_buf = k%NUM_MAIN_BUFS;
+                const int tail_buf = k % NUM_QK_TAIL_BUFS;
+                if constexpr (HAVE_QK_TAIL) {
+                    // The tail-K stage is independent of V.  Do not
+                    // overwrite it until the tail QK commit for the same
+                    // buffer has completed.
+                    if (k >= NUM_QK_TAIL_BUFS) {
+                        plan.bar_qk_done[tail_buf].wait(
+                            ((k / NUM_QK_TAIL_BUFS) & 1) ^ 1
+                        );
+                    }
+                }
                 FP8_TIMED_WAIT(
                     trace_kv_tile,
                     plan.barrier_timing.kv[warp_idx][k].sv_free_wait_ns,
-                    plan.bar_sv_done[cur_buf].wait(((k / NUM_BUFS) & 1) ^ 1)
+                    plan.bar_sv_done[cur_buf].wait(((k / NUM_MAIN_BUFS) & 1) ^ 1)
                 );
 
                 e4m3* sK_base = plan.qkvo.kv[cur_buf].data()
@@ -1047,11 +1098,38 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         trace_kv_tile,
                         plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
                     );
+                    if constexpr (HAVE_QK_TAIL) {
+                        // Tail K has its own two-stage storage, independent
+                        // of both main K/V and the two S stages.
+                        e4m3* sK_tail_base = plan.qk_tail.kv[tail_buf].data()
+                            + warp_idx * 4 * TMA_K_TAIL_BYTES;
+                        CUTE_UNROLL
+                        for (int local_row = 0;
+                             local_row < NUM_LOCAL_ROWS_PER_WARP;
+                             ++local_row) {
+                            ku::tma_gather4(
+                                &(tma_params.tensor_map_kv_tail),
+                                plan.bar_kv_tail_ready[tail_buf],
+                                sK_tail_base
+                                    + local_row * (4 * NUM_WARPS)
+                                        * TMA_K_TAIL_BYTES,
+                                0,
+                                indices[local_row],
+                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                            );
+                        }
+                    }
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
                     CUTE_UNROLL
                     for (int part_idx = 0; part_idx < 2; ++part_idx)
                         plan.bar_kv_ready[cur_buf][part_idx].complete_transaction(NUM_LOCAL_ROWS_PER_WARP*4*D_V/2*sizeof(e4m3));
+                    if constexpr (HAVE_QK_TAIL) {
+                        plan.bar_kv_tail_ready[tail_buf].complete_transaction(
+                            NUM_LOCAL_ROWS_PER_WARP * 4
+                                * TMA_K_TAIL_BYTES * sizeof(e4m3)
+                        );
+                    }
                 }
             }
         }
@@ -1068,7 +1146,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 )
             );
         
-        plan.bar_prologue.arrive_and_expect_tx(B_H*D_V*sizeof(e4m3));
+        plan.bar_prologue.arrive_and_expect_tx(
+            B_H * (D_V + (HAVE_QK_TAIL ? 64 : 0)) * sizeof(e4m3)
+        );
         FP8_TIMED_WAIT(
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.q_tma_wait_ns,
@@ -1104,7 +1184,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.barrier_timing.mma[k].iter_start_ns
             );
             if (k < num_k_blocks) {
-                int cur_buf = k%NUM_BUFS;
+                int cur_buf = k%NUM_MAIN_BUFS;
                 int p_stage = k%NUM_P_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.qkvo.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
 
@@ -1134,7 +1214,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         trace_mma_iter,
                         plan.barrier_timing.mma[k].kv_wait_ns[kv_part_idx],
                         plan.bar_kv_ready[cur_buf][kv_part_idx].wait(
-                            (k / NUM_BUFS) & 1
+                            (k / NUM_MAIN_BUFS) & 1
                         )
                     );
                     FP8_TIMEPOINT(
@@ -1159,7 +1239,44 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     plan.barrier_timing.mma[k].qk_issued_ns[1]
                 );
 
-                ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
+                if constexpr (HAVE_QK_TAIL) {
+                    // Commit the 512-dim product first.  The tail SS MMA is
+                    // issued only after this commit has completed, so it
+                    // accumulates into the same P stage deterministically.
+                    const int tail_buf = k % NUM_QK_TAIL_BUFS;
+                    ku::umma_arrive_noelect(plan.bar_qk_part_done[cur_buf]);
+
+                    Tensor sQ_tail = make_tensor(
+                        make_smem_ptr(plan.qk_tail.q.data()),
+                        SmemLayoutQTail{}
+                    );
+                    Tensor sK_tail = make_tensor(
+                        make_smem_ptr(plan.qk_tail.kv[tail_buf].data()),
+                        SmemLayoutKTail{}
+                    );
+                    plan.bar_kv_tail_ready[tail_buf].arrive_and_expect_tx(
+                        B_TOPK * TMA_K_TAIL_BYTES * sizeof(e4m3)
+                    );
+                    plan.bar_kv_tail_ready[tail_buf].wait(
+                        (k / NUM_QK_TAIL_BUFS) & 1
+                    );
+                    plan.bar_qk_part_done[cur_buf].wait(
+                        (k / NUM_MAIN_BUFS) & 1
+                    );
+                    ku::tcgen05_after_thread_sync();
+                    if (p_stage == 0) {
+                        ku::utcmma_ss(
+                            tiled_mma_P_ss, sQ_tail, sK_tail, tP0, false
+                        );
+                    } else {
+                        ku::utcmma_ss(
+                            tiled_mma_P_ss, sQ_tail, sK_tail, tP1, false
+                        );
+                    }
+                    ku::umma_arrive_noelect(plan.bar_qk_done[tail_buf]);
+                } else {
+                    ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
+                }
                 FP8_TIMEPOINT(
                     trace_mma_iter,
                     plan.barrier_timing.mma[k].qk_committed_ns
@@ -1168,12 +1285,10 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
             if (k > 0) {
                     // O += S(i-1)V(i-1)
-                    int cur_buf = (k-1)%NUM_BUFS;
+                    int cur_buf = (k-1)%NUM_MAIN_BUFS;
 
                     Tensor sS = make_tensor(
-                        make_smem_ptr(
-                            plan.s[(k - 1) % NUM_S_BUFS].data()
-                        ),
+                        make_smem_ptr(plan.s[(k - 1) % NUM_S_BUFS].data()),
                         SmemLayoutS{}
                     );
                     Tensor sV = make_tensor(
@@ -1249,12 +1364,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     topk_length
                 );
 
-                int cur_buf = k%NUM_BUFS;
+                int cur_buf = k%NUM_MAIN_BUFS;
                 FP8_TIMED_WAIT(
                     trace_mask_tile,
                     plan.barrier_timing.mask[k].buffer_free_wait_ns,
                     plan.bar_k_valid_free[cur_buf].wait(
-                        ((k / NUM_BUFS) & 1) ^ 1
+                        ((k / NUM_MAIN_BUFS) & 1) ^ 1
                     )
                 );
                 plan.is_k_valid[cur_buf][lane_idx] = k_validness_mask;
@@ -1272,7 +1387,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         const uint8_t* q_scale_base =
             reinterpret_cast<const uint8_t*>(params.q)
             + static_cast<int64_t>(s_q_idx) * params.stride_q_s_q
-            + B_H * D_Q;
+            + B_H * QK_DIM;
         plan.q_head_scale[q_scale_row] = ue8m0_bits_to_float(
             __ldg(q_scale_base + q_scale_row)
         );
@@ -1292,7 +1407,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
-            const int cur_buf = k % NUM_BUFS;
+            const int cur_buf = k % NUM_MAIN_BUFS;
 #if defined(FP8_FWD_BARRIER_TIMING)
             const bool trace_scale_tile = s_q_idx == 0
                 && lane_idx == 0 && k < FP8_TIMING_MAX_TILES;
@@ -1306,7 +1421,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 trace_scale_tile,
                 plan.barrier_timing.scale[scale_warp_idx][k].buffer_free_wait_ns,
                 plan.bar_sv_done[cur_buf].wait(
-                    ((k / NUM_BUFS) & 1) ^ 1
+                    ((k / NUM_MAIN_BUFS) & 1) ^ 1
                 )
             );
             
@@ -1327,7 +1442,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         reinterpret_cast<const uint8_t*>(params.kv)
                         + static_cast<int64_t>(src_idx)
                             * params.stride_kv_s_kv
-                        + D_K;
+                        + QK_DIM;
 #if defined(FP8_FWD_VECTOR_KV_SCALE_LOAD)
                     // The trailing scale slot is 16-byte aligned. Keep this
                     // opt-in because random top-k indices can change cache
@@ -1364,7 +1479,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     }
     __syncthreads();
     if (s_q_idx == 0 && threadIdx.x == 0) {
-        print_fp8_barrier_timing(plan, num_k_blocks);
+        print_fp8_barrier_timing<HAVE_QK_TAIL>(plan, num_k_blocks);
     }
 #endif
 }
@@ -1374,6 +1489,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
 template<int D_QK>
 void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
+    static_assert(D_QK == 512 || D_QK == 576);
+    constexpr bool HAVE_QK_TAIL = D_QK == 576;
+    KU_ASSERT(params.d_qk == D_QK);
 
     auto shape_O = make_shape(B_H, D_V, params.s_q);
     auto tma_O = cute::make_tma_copy(
@@ -1401,6 +1519,19 @@ void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
         SmemLayoutQ{}
     );
 
+    auto shape_Q_tail = make_shape(B_H, 64, params.s_q);
+    auto tma_Q_tail = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr(reinterpret_cast<e4m3*>(params.q) + D_K),
+            make_layout(
+                shape_Q_tail,
+                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+            )
+        ),
+        SmemLayoutQTail{}
+    );
+
     CUtensorMap tensor_map_kv = ku::make_tensor_map(
             {D_K / 8, static_cast<uint64_t>(params.s_kv)},
             {static_cast<uint64_t>(params.stride_kv_s_kv)},
@@ -1411,18 +1542,31 @@ void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );
 
+    CUtensorMap tensor_map_kv_tail = ku::make_tensor_map(
+            {TMA_K_TAIL_ELEMS, static_cast<uint64_t>(params.s_kv)},
+            {static_cast<uint64_t>(params.stride_kv_s_kv)},
+            {TMA_K_TAIL_ELEMS, 1},
+            reinterpret_cast<uint8_t*>(params.kv) + D_K,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+        );
+
     TmaParams<
         decltype(shape_O), decltype(tma_O),
-        decltype(shape_Q), decltype(tma_Q)
+        decltype(shape_Q), decltype(tma_Q),
+        decltype(shape_Q_tail), decltype(tma_Q_tail)
     > tma_params = {
         shape_O, tma_O,
         shape_Q, tma_Q,
-        tensor_map_kv
+        shape_Q_tail, tma_Q_tail,
+        tensor_map_kv,
+        tensor_map_kv_tail
     };
 
-    auto kernel = &sprase_fp8_attn_fwd_kernel<decltype(tma_params)>;
+    auto kernel = &sprase_fp8_attn_fwd_kernel<HAVE_QK_TAIL, decltype(tma_params)>;
 
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    constexpr size_t smem_size = sizeof(SharedMemoryPlanT<HAVE_QK_TAIL>);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params);

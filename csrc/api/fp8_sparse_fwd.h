@@ -8,9 +8,9 @@
 /*
  * Test/debug interface for the head64 FP8 sparse prefill kernel.
  *
- * Physical layout for d_qk=512:
- *   Q[token]  = [64 * 512 E4M3 bytes][64 UE8M0 head scales]
- *   KV[token] = [512 E4M3 bytes][1 UE8M0 token scale][15 padding bytes]
+ * Physical layout:
+ *   Q[token]  = [64 * d_qk E4M3 bytes][64 UE8M0 head scales]
+ *   KV[token] = [d_qk E4M3 bytes][1 UE8M0 token scale][padding to 16B]
  *   W         = [8 UE8M0 dimension-group scales]
  */
 static std::vector<at::Tensor> fp8_sparse_attn_prefill_interface(
@@ -39,10 +39,15 @@ static std::vector<at::Tensor> fp8_sparse_attn_prefill_interface(
 
     constexpr int h_q = 64;
     constexpr int h_kv = 1;
-    constexpr int d_qk = 512;
     constexpr int d_v = 512;
-    constexpr int q_bytes_per_token = h_q * d_qk + h_q;
-    constexpr int kv_bytes_per_token = d_qk + 16;
+    const int d_qk = static_cast<int>(kv.size(1)) - 16;
+    TORCH_CHECK(
+        d_qk == 512 || d_qk == 576,
+        "kv last dim must encode d_qk 512 or 576 plus a 16-byte scale slot, got ",
+        kv.size(1)
+    );
+    const int q_bytes_per_token = h_q * d_qk + h_q;
+    const int kv_bytes_per_token = d_qk + 16;
 
     const int s_q = q.size(0);
     const int s_kv = kv.size(0);
@@ -124,6 +129,10 @@ static std::vector<at::Tensor> fp8_sparse_attn_prefill_interface(
         at::cuda::getCurrentCUDAStream().stream()
     };
 
-    sm100::fp8_fwd::head64::run_fp8_fwd_phase1_kernel<512>(params);
+    if (d_qk == 512) {
+        sm100::fp8_fwd::head64::run_fp8_fwd_phase1_kernel<512>(params);
+    } else {
+        sm100::fp8_fwd::head64::run_fp8_fwd_phase1_kernel<576>(params);
+    }
     return {out, max_logits, lse};
 }

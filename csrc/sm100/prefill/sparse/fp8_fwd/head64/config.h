@@ -16,12 +16,15 @@ using e8m0 = cutlass::float_ue8m0_t;
 
 template<
     typename Shape_O, typename TMA_O,
-    typename Shape_Q, typename TMA_Q
+    typename Shape_Q, typename TMA_Q,
+    typename Shape_Q_Tail, typename TMA_Q_Tail
 >
 struct TmaParams {
     Shape_O shape_O; TMA_O tma_O;
     Shape_Q shape_Q; TMA_Q tma_Q;
+    Shape_Q_Tail shape_Q_tail; TMA_Q_Tail tma_Q_tail;
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_tail;
 };
 
 constexpr int D = 512;
@@ -35,6 +38,8 @@ constexpr int KV_BYTES_PER_TOKEN = D_K + KV_SCALE_SLOT_BYTES;
 constexpr int KV_SCALE_ANCHOR = 0;
 constexpr int TMA_K_CHUNK_BYTES = 128;
 constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
+constexpr int TMA_K_TAIL_BYTES = 64;
+constexpr int TMA_K_TAIL_ELEMS = TMA_K_TAIL_BYTES / sizeof(uint64_t);
 static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
@@ -49,6 +54,8 @@ static_assert(NUM_SV_TMEM_BLOCKS == 4);
 static_assert(NUM_SV_TMEM_BLOCKS * SV_TMEM_COLS_PER_BLOCK == D_V / 2);
 
 constexpr int NUM_BUFS = 3;
+constexpr int NUM_MAIN_BUFS_K576 = 2;
+constexpr int NUM_QK_TAIL_BUFS = 2;
 constexpr int NUM_S_BUFS = 2;
 // The direct TS Q fragment reserves [256, 384).  A complete 64x128 FP32 P
 // occupies 64 columns, so two P stages fit after it.
@@ -74,6 +81,15 @@ using SmemLayoutQ = decltype(coalesce(tile_to_shape(
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
 
+// A 64-byte row needs the 64B swizzle atom.  The tail is kept separate from
+// the 128B-swizzled main Q/K tensors so its TMA descriptor has matching
+// swizzle and box size.
+using SmemLayoutQTail = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<e4m3>{},
+    Shape<Int<B_H>, Int<64>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
 template<int NUM_TILES>
 using SmemLayoutOTiles = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW128_Atom<bf16>{},
@@ -94,6 +110,12 @@ using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
 using SmemLayoutK = SmemLayoutKTiles<8>;
 
 using SmemLayoutK_TiledMMA = SmemLayoutK;
+
+using SmemLayoutKTail = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW64_Atom<e4m3>{},
+    Shape<Int<B_TOPK>, Int<64>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
 
 using SmemLayoutS = decltype(coalesce(tile_to_shape(
 	UMMA::Layout_K_INTER_Atom<e4m3>{},
@@ -191,32 +213,56 @@ struct Fp8BarrierTiming {
 };
 #endif
 
-struct SharedMemoryPlan {
+struct QKTailStorage {
+    // Q tail remains resident for every QK tile because the tail GEMM is SS.
+    array_aligned<e4m3, cosize_v<SmemLayoutQTail>> q;
+    array_aligned<e4m3, cosize_v<SmemLayoutKTail>> kv[NUM_QK_TAIL_BUFS];
+};
+
+struct EmptyQKTailStorage {};
+template<bool HAVE_QK_TAIL>
+struct SharedMemoryPlanT {
+    // K=576 needs room for the independent Q/K tail storage.  Keep the
+    // established three-stage main pipeline for K=512, but use two main KV
+    // stages for the tail specialization.
+    static constexpr int NUM_MAIN_BUFS = HAVE_QK_TAIL
+        ? NUM_MAIN_BUFS_K576
+        : NUM_BUFS;
+    static_assert(NUM_MAIN_BUFS >= NUM_P_BUFS);
+
     union {
         struct {
-            array_aligned<e4m3, cosize_v<SmemLayoutK>> _kv[NUM_BUFS - 1];
+            array_aligned<e4m3, cosize_v<SmemLayoutK>> _kv[NUM_MAIN_BUFS - 1];
             array_aligned<e4m3, cosize_v<SmemLayoutQ>> q;
         } q;
-        array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_BUFS];
+        array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_MAIN_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
+    // The 576-dim specialization keeps Q tail resident for the SS tail GEMM
+    // and has two independent tail-K stages.
+    std::conditional_t<HAVE_QK_TAIL, QKTailStorage, EmptyQKTailStorage> qk_tail;
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s[NUM_S_BUFS];
-    float kv_token_scale[NUM_BUFS][B_TOPK];
+    float kv_token_scale[NUM_MAIN_BUFS][B_TOPK];
     float q_head_scale[B_H];
     float kv_dim_scale[KV_SCALE_GROUPS];
-    char is_k_valid[NUM_BUFS][B_TOPK/8];
+    char is_k_valid[NUM_MAIN_BUFS][B_TOPK/8];
     transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
-    transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T (the nope part) done
-    transac_bar_t bar_sv_block_done[NUM_BUFS][NUM_SV_TMEM_BLOCKS - 1];
-    transac_bar_t bar_sv_done[NUM_BUFS];    // Final SV stripe is committed.
+    // Main QK and (for D_QK=576) tail QK use separate commit points.  The
+    // final barrier is consumed by WG0; the tail producer reuses its first
+    // two slots in the 576-dim specialization.
+    transac_bar_t bar_qk_part_done[NUM_MAIN_BUFS];
+    transac_bar_t bar_qk_done[NUM_MAIN_BUFS];  // Complete QK (including the tail)
+    transac_bar_t bar_sv_block_done[NUM_MAIN_BUFS][NUM_SV_TMEM_BLOCKS - 1];
+    transac_bar_t bar_sv_done[NUM_MAIN_BUFS];    // Final SV stripe is committed.
     // A stripe may accept the next SV accumulation only after WG0 has
     // rescaled the preceding tile's value in the same TMEM columns.
     transac_bar_t bar_o_rescale_done[NUM_SV_TMEM_BLOCKS];
-    transac_bar_t bar_kv_ready[NUM_BUFS][2];
-    transac_bar_t bar_kv_scale_ready[NUM_BUFS];
+    transac_bar_t bar_kv_ready[NUM_MAIN_BUFS][2];
+    transac_bar_t bar_kv_tail_ready[NUM_QK_TAIL_BUFS];
+    transac_bar_t bar_kv_scale_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
     transac_bar_t bar_so_ready;   // Current S buffer is ready.
-    transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
+    transac_bar_t bar_k_valid_ready[NUM_MAIN_BUFS], bar_k_valid_free[NUM_MAIN_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
 #if defined(FP8_FWD_BARRIER_TIMING)
@@ -229,15 +275,21 @@ using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 )); // maybe p output can be bf16 and use bf16 add to make one fp32
 
+using TiledMMA_P_SS = decltype(make_tiled_mma(
+    SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
+));
+
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, SV_M, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
-enum NamedBarriers : int {
+    enum NamedBarriers : int {
     wg0_sync = 0,
     wg0_warp02_sync = 1,
     wg0_warp13_sync = 2,
     pepi_sync = 3,
 };
+
+using SharedMemoryPlan = SharedMemoryPlanT<false>;
 
 }

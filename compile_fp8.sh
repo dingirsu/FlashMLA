@@ -97,11 +97,16 @@ fi
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu" \
-    -o /tmp/fp8_prefill_pic.o
+    -o /tmp/fp8_prefill_k512_pic.o
+
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
+    -o /tmp/fp8_prefill_k576_pic.o
 
 "$CXX" -shared \
     /tmp/fp8_api_pic.o \
-    /tmp/fp8_prefill_pic.o \
+    /tmp/fp8_prefill_k512_pic.o \
+    /tmp/fp8_prefill_k576_pic.o \
     -L"$TORCH_LIB" \
     -Wl,-rpath,"$TORCH_LIB" \
     -ltorch_python \

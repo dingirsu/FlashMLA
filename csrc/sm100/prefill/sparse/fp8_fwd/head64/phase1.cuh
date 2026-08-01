@@ -628,13 +628,30 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.barrier_timing.wg0[warp_idx][k].softmax_exp_ready_ns
             );
 
-            // plan.rowwise_li_buf[idx_in_warpgroup] = local_s_max;
+            // Reuse the otherwise-idle LSE exchange scratch to make the
+            // no-rescale decision uniform across WG0.  The named barrier
+            // below already orders this four-warp publication.
+            if (lane_idx == 0) {
+                plan.rowwise_li_buf[warp_idx] = static_cast<float>(
+                    should_scale_o
+                );
+            }
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].smax_wait_ns,
                 (NamedBarrier::arrive_and_wait(
                     128, NamedBarriers::wg0_sync
                 ))
+            );
+            bool wg0_needs_o_rescale = false;
+            if (lane_idx == 0) {
+                wg0_needs_o_rescale = plan.rowwise_li_buf[0] != 0.0f
+                    || plan.rowwise_li_buf[1] != 0.0f
+                    || plan.rowwise_li_buf[2] != 0.0f
+                    || plan.rowwise_li_buf[3] != 0.0f;
+            }
+            wg0_needs_o_rescale = __shfl_sync(
+                0xffffffff, wg0_needs_o_rescale, 0
             );
             // const float s_max = max(
             //     local_s_max,
@@ -863,9 +880,16 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 #endif
                         ku::tcgen05_before_thread_sync();
                     }
-                    NamedBarrier::arrive_and_wait(
-                        128, NamedBarriers::wg0_sync
-                    );
+                    // A false warp has no TMEM operation to synchronize.  If
+                    // every WG0 warp is false, its 128 mbarrier arrivals are
+                    // the per-stripe TMEM-reuse handoff directly.  Retain the
+                    // full named barrier for a mixed/active WG0 so its fixed
+                    // 128-thread participant count remains valid.
+                    if (wg0_needs_o_rescale) {
+                        NamedBarrier::arrive_and_wait(
+                            128, NamedBarriers::wg0_sync
+                        );
+                    }
                     plan.bar_o_rescale_done[dv_block].arrive();
                     FP8_TIMEPOINT(
                         trace_wg0_tile,

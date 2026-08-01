@@ -473,9 +473,16 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             float lane_kv_scale[NUM_ELEMS_PER_THREAD / 32];
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD / 32; ++i) {
-                lane_kv_scale[i] = plan.kv_dim_scale[cur_buf][
+                lane_kv_scale[i] = plan.kv_token_scale[cur_buf][
                     token_base + i * 32 + lane_idx
                 ];
+            }
+            float kv_scale[NUM_ELEMS_PER_THREAD];
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                kv_scale[i] = __shfl_sync(
+                    0xffffffff, lane_kv_scale[i / 32], i % 32
+                );
             }
 
             // Direct M=64,N=128 P maps the two WG0 warp pairs to its two
@@ -519,28 +526,16 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             for (int i = 0; i < NUM_ELEMS_PER_THREAD / 4; ++i) {
                 const int base = i * 4;
                 const float scaled_p0 = p[base + 0] * (
-                    qk_base_scale * __shfl_sync(
-                        0xffffffff, lane_kv_scale[(base + 0) / 32],
-                        (base + 0) % 32
-                    )
+                    qk_base_scale * kv_scale[base + 0]
                 );
                 const float scaled_p1 = p[base + 1] * (
-                    qk_base_scale * __shfl_sync(
-                        0xffffffff, lane_kv_scale[(base + 1) / 32],
-                        (base + 1) % 32
-                    )
+                    qk_base_scale * kv_scale[base + 1]
                 );
                 const float scaled_p2 = p[base + 2] * (
-                    qk_base_scale * __shfl_sync(
-                        0xffffffff, lane_kv_scale[(base + 2) / 32],
-                        (base + 2) % 32
-                    )
+                    qk_base_scale * kv_scale[base + 2]
                 );
                 const float scaled_p3 = p[base + 3] * (
-                    qk_base_scale * __shfl_sync(
-                        0xffffffff, lane_kv_scale[(base + 3) / 32],
-                        (base + 3) % 32
-                    )
+                    qk_base_scale * kv_scale[base + 3]
                 );
                 p[base + 0] = scaled_p0;
                 p[base + 1] = scaled_p1;
@@ -610,22 +605,10 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 sum1 += softmax_s1;
                 sum2 += softmax_s2;
                 sum3 += softmax_s3;
-                const float s0 = softmax_s0 * __shfl_sync(
-                    0xffffffff, lane_kv_scale[(base + 0) / 32],
-                    (base + 0) % 32
-                );
-                const float s1 = softmax_s1 * __shfl_sync(
-                    0xffffffff, lane_kv_scale[(base + 1) / 32],
-                    (base + 1) % 32
-                );
-                const float s2 = softmax_s2 * __shfl_sync(
-                    0xffffffff, lane_kv_scale[(base + 2) / 32],
-                    (base + 2) % 32
-                );
-                const float s3 = softmax_s3 * __shfl_sync(
-                    0xffffffff, lane_kv_scale[(base + 3) / 32],
-                    (base + 3) % 32
-                );
+                const float s0 = softmax_s0 * kv_scale[base + 0];
+                const float s1 = softmax_s1 * kv_scale[base + 1];
+                const float s2 = softmax_s2 * kv_scale[base + 2];
+                const float s3 = softmax_s3 * kv_scale[base + 3];
                 p[base + 0] = s0;
                 p[base + 1] = s1;
                 p[base + 2] = s2;
@@ -996,7 +979,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 const int d_group = c * 4 + k * 2
                     + idx_in_warpgroup / B_H;
                 const float output_dequant_scale = output_base_scale
-                    * plan.kv_w_scale[d_group];
+                    * plan.kv_dim_scale[d_group];
                 const float2 output_scale_float2 = make_float2(
                     output_dequant_scale, output_dequant_scale
                 );
@@ -1365,7 +1348,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             __ldg(q_scale_base + q_scale_row)
         );
         if (scale_warp_idx == 0 && lane_idx < KV_SCALE_GROUPS) {
-            plan.kv_w_scale[lane_idx] = ue8m0_bits_to_float(
+            plan.kv_dim_scale[lane_idx] = ue8m0_bits_to_float(
                 __ldg(params.kv_scale_w + lane_idx)
             );
         }
@@ -1429,7 +1412,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 #endif
 
                 }
-                plan.kv_dim_scale[cur_buf][scale_row] =
+                plan.kv_token_scale[cur_buf][scale_row] =
                     ue8m0_bits_to_float(scale_bits);
             }
             fence_view_async_shared();

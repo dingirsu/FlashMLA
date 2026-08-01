@@ -74,6 +74,18 @@ if [[ "${FP8_BENCH_O_RESCALE_SKIP_TMEM:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_BENCH_O_RESCALE_SKIP_TMEM=1 )
 fi
 
+# Batch all O TMEM rescale stripes after the final SV commit. Keep this opt-in
+# until functional and timing validation establish it as the release default.
+if [[ "${FP8_FWD_WHOLE_O_RESCALE:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_WHOLE_O_RESCALE=1 )
+fi
+
+# Load the aligned 16-byte token-scale slot instead of a scalar byte. This is
+# opt-in while NCU confirms the wider random load reduces sector pressure.
+if [[ "${FP8_FWD_VECTOR_KV_SCALE_LOAD:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_VECTOR_KV_SCALE_LOAD=1 )
+fi
+
 "$CXX" \
     "${INCLUDES[@]}" \
     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \

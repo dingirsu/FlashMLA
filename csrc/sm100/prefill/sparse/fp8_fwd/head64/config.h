@@ -201,9 +201,9 @@ struct SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s[NUM_S_BUFS];
-    float kv_dim_scale[NUM_BUFS][B_TOPK];
+    float kv_token_scale[NUM_BUFS][B_TOPK];
     float q_head_scale[B_H];
-    float kv_w_scale[KV_SCALE_GROUPS];
+    float kv_dim_scale[KV_SCALE_GROUPS];
     char is_k_valid[NUM_BUFS][B_TOPK/8];
     transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
     transac_bar_t bar_qk_done[NUM_P_BUFS];  // Pi = QKi^T (the nope part) done

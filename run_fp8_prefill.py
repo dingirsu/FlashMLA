@@ -17,8 +17,8 @@ import fp8_test_ext as ext  # noqa: E402
 
 
 # Keep the benchmark configuration here so kernel-edit/compile/test is one command.
-S_Q = 16384
-S_KV = 32768
+S_Q = 8192
+S_KV = 8192
 TOPK = 512
 H_Q = 64
 D_HEAD = 512

@@ -148,7 +148,6 @@ struct Fp8Wg0Timing {
     uint64_t tile_start_ns;
     uint64_t pair_wait_ns;
     uint64_t qk_wait_ns;
-    uint64_t valid_wait_ns;
     uint64_t scale_wait_ns;
     uint64_t rowmax_wait_ns;
     uint64_t smax_wait_ns;
@@ -219,7 +218,6 @@ struct Fp8BarrierTiming {
                                           [NUM_SV_TMEM_BLOCKS];
     Fp8KvProducerTiming kv[4][FP8_TIMING_MAX_TILES];
     Fp8MmaTiming mma[FP8_TIMING_MAX_TILES + 1];
-    Fp8SimpleProducerTiming mask[FP8_TIMING_MAX_TILES];
     Fp8SimpleProducerTiming scale[2][FP8_TIMING_MAX_TILES];
 };
 #endif
@@ -267,7 +265,9 @@ struct SharedMemoryPlanT {
     float q_head_scale[B_H];
     float kv_dim_scale[KV_SCALE_GROUPS];
 #endif
-    char is_k_valid[NUM_MAIN_BUFS][B_TOPK/8];
+    // Scale warps publish one 32-token validity word alongside each scale
+    // group.  Keeping it word-addressable avoids a separate mask producer.
+    uint32_t is_k_valid[NUM_MAIN_BUFS][B_TOPK/32];
 #if defined(FP8_FWD_QK576)
     transac_bar_t bar_prologue, bar_prologue_utccp;
 #else
@@ -287,7 +287,6 @@ struct SharedMemoryPlanT {
     transac_bar_t bar_kv_scale_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
     transac_bar_t bar_so_ready;   // Current S buffer is ready.
-    transac_bar_t bar_k_valid_ready[NUM_MAIN_BUFS], bar_k_valid_free[NUM_MAIN_BUFS];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
 #if defined(FP8_FWD_BARRIER_TIMING)

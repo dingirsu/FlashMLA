@@ -103,7 +103,7 @@ void print_fp8_barrier_timing(
             const auto& value = timing.wg0[warp][tile];
             cute::print(
                 "FP8_TIME wg0 warp=%d tile=%d start=%llu pair_wait=%llu "
-                "qk_wait=%llu valid_wait=%llu scale_wait=%llu rowmax_wait=%llu "
+                "qk_wait=%llu scale_mask_wait=%llu rowmax_wait=%llu "
                 "smax_wait=%llu waits_done=%llu p_released=%llu "
                 "p_scaled=%llu rowmax_ready=%llu softmax_exp_ready=%llu "
                 "softmax_ready=%llu sv_wait=%llu s_stored=%llu "
@@ -113,7 +113,6 @@ void print_fp8_barrier_timing(
                 static_cast<unsigned long long>(value.tile_start_ns),
                 static_cast<unsigned long long>(value.pair_wait_ns),
                 static_cast<unsigned long long>(value.qk_wait_ns),
-                static_cast<unsigned long long>(value.valid_wait_ns),
                 static_cast<unsigned long long>(value.scale_wait_ns),
                 static_cast<unsigned long long>(value.rowmax_wait_ns),
                 static_cast<unsigned long long>(value.smax_wait_ns),
@@ -169,19 +168,11 @@ void print_fp8_barrier_timing(
                 static_cast<unsigned long long>(value.tma_part1_issued_ns)
             );
         }
-        const auto& mask = timing.mask[tile];
-        cute::print(
-            "FP8_TIME mask warp=9 tile=%d start=%llu free_wait=%llu arrived=%llu\n",
-            tile,
-            static_cast<unsigned long long>(mask.tile_start_ns),
-            static_cast<unsigned long long>(mask.buffer_free_wait_ns),
-            static_cast<unsigned long long>(mask.arrived_ns)
-        );
         CUTE_UNROLL
         for (int warp = 0; warp < 2; ++warp) {
             const auto& scale = timing.scale[warp][tile];
             cute::print(
-                "FP8_TIME scale warp=%d tile=%d start=%llu free_wait=%llu "
+                "FP8_TIME scale_mask warp=%d tile=%d start=%llu free_wait=%llu "
                 "arrived=%llu\n",
                 warp + 10,
                 tile,
@@ -388,8 +379,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.bar_kv_ready[i][0].init(1);
                 plan.bar_kv_ready[i][1].init(1);
                 plan.bar_kv_scale_ready[i].init(2);
-                plan.bar_k_valid_ready[i].init(B_TOPK/8);
-                plan.bar_k_valid_free[i].init(128);
             }
             for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
                 plan.bar_qk_part_done[i].init(1);
@@ -510,11 +499,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             plan.bar_p_free[p_idx].arrive();
             FP8_TIMED_WAIT(
                 trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].valid_wait_ns,
-                plan.bar_k_valid_ready[cur_buf].wait((k / NUM_MAIN_BUFS) & 1)
-            );
-            FP8_TIMED_WAIT(
-                trace_wg0_tile,
                 plan.barrier_timing.wg0[warp_idx][k].scale_wait_ns,
                 plan.bar_kv_scale_ready[cur_buf].wait((k / NUM_MAIN_BUFS) & 1)
             );
@@ -564,10 +548,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
                 // The two WG0 thread halves cover disjoint token ranges for
                 // each head; max and li are merged across the halves below.
-                const uint32_t* valid_masks =
-                    reinterpret_cast<const uint32_t*>(
-                        plan.is_k_valid[cur_buf] + token_base / 8
-                    );
+                const uint32_t* valid_masks = plan.is_k_valid[cur_buf]
+                    + token_base / 32;
                 const uint32_t valid0 = valid_masks[0];
                 uint32_t valid1 = 0;
                 if constexpr (NUM_ELEMS_PER_THREAD > 32) {
@@ -584,7 +566,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     }
                 }
 
-                plan.bar_k_valid_free[cur_buf].arrive();
                 FP8_TIMEPOINT(
                     trace_wg0_tile,
                     plan.barrier_timing.wg0[warp_idx][k].p_released_ns
@@ -1403,42 +1384,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                 }
         }
-    } else if (warp_idx == 9) {
-        if (lane_idx < B_TOPK/8) {
-            CUTE_NO_UNROLL
-            for (int k = 0; k < num_k_blocks; ++k) {
-#if defined(FP8_FWD_BARRIER_TIMING)
-                const bool trace_mask_tile = s_q_idx == 0
-                    && lane_idx == 0 && k < FP8_TIMING_MAX_TILES;
-#endif
-                FP8_TIMEPOINT(
-                    trace_mask_tile,
-                    plan.barrier_timing.mask[k].tile_start_ns
-                );
-                char k_validness_mask = load_indices_and_generate_mask(
-                    lane_idx,
-                    gIndices + k*B_TOPK,
-                    params.s_kv,
-                    k*B_TOPK,
-                    topk_length
-                );
-
-                int cur_buf = k%NUM_MAIN_BUFS;
-                FP8_TIMED_WAIT(
-                    trace_mask_tile,
-                    plan.barrier_timing.mask[k].buffer_free_wait_ns,
-                    plan.bar_k_valid_free[cur_buf].wait(
-                        ((k / NUM_MAIN_BUFS) & 1) ^ 1
-                    )
-                );
-                plan.is_k_valid[cur_buf][lane_idx] = k_validness_mask;
-                plan.bar_k_valid_ready[cur_buf].arrive();
-                FP8_TIMEPOINT(
-                    trace_mask_tile,
-                    plan.barrier_timing.mask[k].arrived_ns
-                );
-            }
-        }
     } else if (warp_idx == 10 || warp_idx == 11) {
         const int scale_warp_idx = warp_idx - 10;
 #if !defined(FP8_FWD_QK576)
@@ -1519,6 +1464,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 }
                 plan.kv_token_scale[cur_buf][scale_row] =
                     ue8m0_bits_to_float(scale_bits);
+                plan.is_k_valid[cur_buf][scale_warp_idx * (B_TOPK / 64) + i]
+                    = __ballot_sync(0xffffffff, is_valid);
             }
             fence_view_async_shared();
             if (elect_one_sync()) {

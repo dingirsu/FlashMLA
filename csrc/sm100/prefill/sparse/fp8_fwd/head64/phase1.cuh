@@ -316,11 +316,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
 
     TiledMMA tiled_mma_P = TiledMMA_P{};
-    TiledMMA tiled_mma_P_ss = TiledMMA_P_SS{};
     TiledMMA tiled_mma_O = TiledMMA_O{};
 
     Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
         partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_K>>{})
+    );
+    Tensor tQ_tail = tiled_mma_P.get_slice(_0{}).make_fragment_A(
+        partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<64>>{})
     );
     Tensor tP0 = partition_fragment_C(
         tiled_mma_P, Shape<Int<B_H>, Int<B_TOPK>>{}
@@ -334,6 +336,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     tP0.data().get() = tmem_cols::P0;
     tP1.data().get() = tmem_cols::P1;
     tQ.data().get() = tmem_cols::Q;
+    tQ_tail.data().get() = tmem_cols::Q_TAIL;
     tO.data().get() = tmem_cols::O;
 
         if (warp_idx == 0) {
@@ -376,7 +379,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             
             // Initialize other barriers
             plan.bar_prologue_utccp.init(1);
+#if !defined(FP8_FWD_QK576)
             plan.bar_qw_scale_ready.init(2);
+#endif
             CUTE_UNROLL
             for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
                 plan.bar_sv_done[i].init(1);
@@ -438,11 +443,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
     if (warpgroup_idx == 0) {
         cutlass::arch::warpgroup_reg_alloc<232>();
+#if !defined(FP8_FWD_QK576)
         FP8_TIMED_WAIT(
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.qw_scale_wait_ns[warp_idx],
             plan.bar_qw_scale_ready.wait(0)
         );
+#endif
 
         float mi = MAX_INIT_VAL;
         float li = 0.0f;
@@ -452,7 +459,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         const int h = idx_in_warpgroup % B_H;
         const int token_group = idx_in_warpgroup / B_H;
         const int token_base = token_group * (B_TOPK / 2);
+#if defined(FP8_FWD_QK576)
+        const uint8_t* q_scale_base =
+            reinterpret_cast<const uint8_t*>(params.q)
+            + static_cast<int64_t>(s_q_idx) * params.stride_q_s_q
+            + B_H * QK_DIM;
+        const float q_scale = ue8m0_bits_to_float(
+            __ldg(q_scale_base + h)
+        );
+#else
         const float q_scale = plan.q_head_scale[h];
+#endif
         const float qk_base_scale = q_scale * params.sm_scale_div_log2;
         const float2 qk_base_scale2 = make_float2(
             qk_base_scale,
@@ -717,6 +734,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             // Warp 8 can keep consuming S(k-1) while WG0 publishes S(k) into
             // the other stage.  A stage is not reused until the preceding
             // iteration has observed the matching SV completion barrier.
+            // With one S stage (the 576-D fit), wait before writing the next
+            // tile because there is no alternate buffer to hide this wait.
+            if constexpr (NUM_S_BUFS == 1) {
+                if (k > 0) {
+                    const int prev_buf = (k - 1) % NUM_MAIN_BUFS;
+                    const int prev_phase = ((k - 1) / NUM_MAIN_BUFS) & 1;
+                    plan.bar_sv_done[prev_buf].wait(prev_phase);
+                }
+            }
             Tensor sS = make_tensor(
                 make_smem_ptr(plan.s[k % NUM_S_BUFS].data()), SmemLayoutS{}
             );
@@ -951,8 +977,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 // into the two TMEM row halves of its 64-column stripe.
                 const int d_group = c * 4 + k * 2
                     + idx_in_warpgroup / B_H;
+#if defined(FP8_FWD_QK576)
+                const float output_dequant_scale = output_base_scale
+                    * ue8m0_bits_to_float(
+                        __ldg(params.kv_scale_w + d_group)
+                    );
+#else
                 const float output_dequant_scale = output_base_scale
                     * plan.kv_dim_scale[d_group];
+#endif
                 const float2 output_dequant_scale2 = make_float2(
                     output_dequant_scale,
                     output_dequant_scale
@@ -1100,8 +1133,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
                     );
                     if constexpr (HAVE_QK_TAIL) {
-                        // Tail K has its own two-stage storage, independent
-                        // of both main K/V and the two S stages.
+                        // Buffer 0 initially holds Q tail.  Do not let the
+                        // first tail-K gather overwrite it until warp 8 has
+                        // copied Q tail to TMEM.
+                        if (k == 0) {
+                            plan.bar_prologue_utccp.wait(0);
+                        }
                         e4m3* sK_tail_base = plan.qk_tail.kv[tail_buf].data()
                             + warp_idx * 4 * TMA_K_TAIL_BYTES;
                         CUTE_UNROLL
@@ -1146,7 +1183,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     )
                 )
             );
-        
         plan.bar_prologue.arrive_and_expect_tx(
             B_H * (D_V + (HAVE_QK_TAIL ? 64 : 0)) * sizeof(e4m3)
         );
@@ -1165,6 +1201,27 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 SM100_UTCCP_2x64dp128bitlw0213_1cta::copy(
                     sQ_desc + (tile_idx * B_H * 128 + subtile_idx * 16) / 16,
                     tmem_cols::Q + tile_idx * 32 + subtile_idx * 4
+                );
+            }
+        }
+        if constexpr (HAVE_QK_TAIL) {
+            // The 64-D Q tail occupies the TMEM columns that would otherwise
+            // hold P1.  Four 128-bit copies cover the 64x64 fragment.
+            UMMA::SmemDescriptor sQ_tail_desc =
+                UMMA::make_umma_desc<UMMA::Major::K>(
+                    make_tensor(
+                        make_smem_ptr(plan.qk_tail.q.data()),
+                        tile_to_shape(
+                            UMMA::Layout_K_SW64_Atom<e4m3>{},
+                            Shape<Int<B_H>, Int<64>>{}
+                        )
+                    )
+                );
+            CUTE_UNROLL
+            for (int subtile_idx = 0; subtile_idx < 4; ++subtile_idx) {
+                SM100_UTCCP_2x64dp128bitlw0213_1cta::copy(
+                    sQ_tail_desc + (subtile_idx * 16) / 16,
+                    tmem_cols::Q_TAIL + subtile_idx * 4
                 );
             }
         }
@@ -1241,16 +1298,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 );
 
                 if constexpr (HAVE_QK_TAIL) {
-                    // Commit the 512-dim product first.  The tail SS MMA is
+                    // Commit the 512-dim product first.  The tail TS MMA is
                     // issued only after this commit has completed, so it
                     // accumulates into the same P stage deterministically.
                     const int tail_buf = k % NUM_QK_TAIL_BUFS;
                     ku::umma_arrive_noelect(plan.bar_qk_part_done[cur_buf]);
 
-                    Tensor sQ_tail = make_tensor(
-                        make_smem_ptr(plan.qk_tail.q.data()),
-                        SmemLayoutQTail{}
-                    );
                     Tensor sK_tail = make_tensor(
                         make_smem_ptr(plan.qk_tail.kv[tail_buf].data()),
                         SmemLayoutKTail{}
@@ -1266,12 +1319,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                     ku::tcgen05_after_thread_sync();
                     if (p_stage == 0) {
-                        ku::utcmma_ss(
-                            tiled_mma_P_ss, sQ_tail, sK_tail, tP0, false
+                        ku::utcmma_ts(
+                            tiled_mma_P, tQ_tail, sK_tail, tP0, false
                         );
                     } else {
-                        ku::utcmma_ss(
-                            tiled_mma_P_ss, sQ_tail, sK_tail, tP1, false
+                        ku::utcmma_ts(
+                            tiled_mma_P, tQ_tail, sK_tail, tP1, false
                         );
                     }
                     ku::umma_arrive_noelect(plan.bar_qk_done[tail_buf]);
@@ -1383,6 +1436,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         }
     } else if (warp_idx == 10 || warp_idx == 11) {
         const int scale_warp_idx = warp_idx - 10;
+#if !defined(FP8_FWD_QK576)
         const int q_scale_row = scale_warp_idx * 32 + lane_idx;
 
         const uint8_t* q_scale_base =
@@ -1405,6 +1459,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             s_q_idx == 0 && lane_idx == 0,
             plan.barrier_timing.qw_scale_arrived_ns[scale_warp_idx]
         );
+#endif
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
@@ -1492,7 +1547,7 @@ template<int D_QK>
 void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
     static_assert(D_QK == 512 || D_QK == 576);
 #if defined(FP8_FWD_QK576)
-    static_assert(D_QK == 576 && B_TOPK == 64);
+    static_assert(D_QK == 576 && B_TOPK == 128);
 #else
     static_assert(D_QK == 512 && B_TOPK == 128);
 #endif

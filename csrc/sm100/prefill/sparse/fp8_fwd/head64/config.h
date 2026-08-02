@@ -43,14 +43,7 @@ constexpr int TMA_K_TAIL_ELEMS = TMA_K_TAIL_BYTES / sizeof(uint64_t);
 static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
-// The two head-dimension instances are compiled in separate translation
-// units; the 576-D instance uses a smaller token tile to fit its tail-K
-// storage while retaining the full pipeline.
-#if defined(FP8_FWD_QK576)
-constexpr int B_TOPK = 64;
-#else
 constexpr int B_TOPK = 128;
-#endif
 constexpr int QK_M = B_H;
 constexpr int QK_K = D_K;
 constexpr int SV_M = 128;
@@ -61,12 +54,20 @@ static_assert(NUM_SV_TMEM_BLOCKS == 4);
 static_assert(NUM_SV_TMEM_BLOCKS * SV_TMEM_COLS_PER_BLOCK == D_V / 2);
 
 constexpr int NUM_BUFS = 3;
+#if defined(FP8_FWD_QK576)
+// The 576-D path keeps the full 128-token tile.  Reducing the P/S stages and
+// reusing the tail-Q storage for tail-K leaves enough SMEM for three KV
+// stages.
 constexpr int NUM_MAIN_BUFS_K576 = 3;
-constexpr int NUM_QK_TAIL_BUFS = B_TOPK == 64 ? 3 : 2;
+constexpr int NUM_QK_TAIL_BUFS = 3;
+constexpr int NUM_S_BUFS = 1;
+constexpr int NUM_P_BUFS = 1;
+#else
+constexpr int NUM_MAIN_BUFS_K576 = 3;
+constexpr int NUM_QK_TAIL_BUFS = 2;
 constexpr int NUM_S_BUFS = 2;
-// The direct TS Q fragment reserves [256, 384). Two FP32 P stages fit in the
-// remaining TMEM columns for both supported TopK tile sizes.
 constexpr int NUM_P_BUFS = 2;
+#endif
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
 constexpr int B_H_TMEM = B_H;
@@ -79,6 +80,9 @@ namespace tmem_cols {
     constexpr int Q = 256;
     constexpr int P0 = 384;
     constexpr int P1 = P0 + B_TOPK / 2;
+    // P1 is unused by the 576-D specialization; its columns hold the 64-D
+    // Q tail after the SMEM-to-TMEM copy.
+    constexpr int Q_TAIL = P1;
 }
 static_assert(tmem_cols::P1 + B_TOPK / 2 <= 512);
 
@@ -221,16 +225,19 @@ struct Fp8BarrierTiming {
 #endif
 
 struct QKTailStorage {
-    // Q tail remains resident for every QK tile because the tail GEMM is SS.
-    array_aligned<e4m3, cosize_v<SmemLayoutQTail>> q;
-    array_aligned<e4m3, cosize_v<SmemLayoutKTail>> kv[NUM_QK_TAIL_BUFS];
+    // The Q tail is copied to TMEM during the prologue, then this storage is
+    // reused by the tail-K pipeline.  The union avoids paying for both.
+    union {
+        array_aligned<e4m3, cosize_v<SmemLayoutQTail>> q;
+        array_aligned<e4m3, cosize_v<SmemLayoutKTail>> kv[NUM_QK_TAIL_BUFS];
+    };
 };
 
 struct EmptyQKTailStorage {};
 template<bool HAVE_QK_TAIL>
 struct SharedMemoryPlanT {
-    // The 64-token K=576 specialization has room for the same three-stage
-    // main-KV pipeline as K=512, plus three independent tail-K stages.
+    // The 576-D specialization uses three main KV stages.  Its Q tail and
+    // tail-K stages are stored in the separate union below.
     static constexpr int NUM_MAIN_BUFS = HAVE_QK_TAIL
         ? NUM_MAIN_BUFS_K576
         : NUM_BUFS;
@@ -244,17 +251,26 @@ struct SharedMemoryPlanT {
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_MAIN_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
-    // The 576-dim specialization keeps Q tail resident for the SS tail GEMM.
+    // For 576-D, Q tail is copied to TMEM and this storage is subsequently
+    // reused for tail K.
     std::conditional_t<HAVE_QK_TAIL, QKTailStorage, EmptyQKTailStorage> qk_tail;
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s[NUM_S_BUFS];
     float kv_token_scale[NUM_MAIN_BUFS][B_TOPK];
+#if !defined(FP8_FWD_QK576)
+    // Keep the established 512-D scale relay intact.  The 576-D instance
+    // loads these values directly in WG0 to recover the SMEM needed by its
+    // third main/tail-K stage.
     float q_head_scale[B_H];
     float kv_dim_scale[KV_SCALE_GROUPS];
+#endif
     char is_k_valid[NUM_MAIN_BUFS][B_TOPK/8];
+#if defined(FP8_FWD_QK576)
+    transac_bar_t bar_prologue, bar_prologue_utccp;
+#else
     transac_bar_t bar_prologue, bar_prologue_utccp, bar_qw_scale_ready;
+#endif
     // Main QK and (for D_QK=576) tail QK use separate commit points.  The
-    // final barrier is consumed by WG0; the tail producer reuses its first
-    // two slots in the 576-dim specialization.
+    // final barrier is consumed by WG0; tail-QK stages are reused by phase.
     transac_bar_t bar_qk_part_done[NUM_MAIN_BUFS];
     transac_bar_t bar_qk_done[NUM_MAIN_BUFS];  // Complete QK (including the tail)
     transac_bar_t bar_sv_block_done[NUM_MAIN_BUFS][NUM_SV_TMEM_BLOCKS - 1];
@@ -279,10 +295,6 @@ struct SharedMemoryPlanT {
 using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F8F6F4_WS_TS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
 )); // maybe p output can be bf16 and use bf16 add to make one fp32
-
-using TiledMMA_P_SS = decltype(make_tiled_mma(
-    SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{}
-));
 
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, SV_M, UMMA::Major::K, UMMA::Major::MN>{}

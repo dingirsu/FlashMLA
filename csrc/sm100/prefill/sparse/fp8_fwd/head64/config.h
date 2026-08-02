@@ -249,7 +249,11 @@ struct SharedMemoryPlanT {
             array_aligned<e4m3, cosize_v<SmemLayoutQ>> q;
         } q;
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_MAIN_BUFS];
-        array_aligned<bf16, cosize_v<SmemLayoutO>> o;
+        struct{
+            array_aligned<e4m3, cosize_v<SmemLayoutK>> _kv[NUM_MAIN_BUFS - 2]; // avoid overlap with q
+            array_aligned<bf16, cosize_v<SmemLayoutO>> o; // bf16 o = 64 * 512 * 2 / 128 * 512 = 1
+        } o;
+        
     } qkvo;
     // For 576-D, Q tail is copied to TMEM and this storage is subsequently
     // reused for tail K.

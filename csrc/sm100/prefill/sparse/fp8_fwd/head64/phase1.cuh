@@ -935,7 +935,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 1.0f, li + exp2f(attn_sink - mi)
             );
         }
-        Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.data()), SmemLayoutO{});
+        Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.o.data()), SmemLayoutO{});
         constexpr int B_EPI = 64;
         Tensor tma_gO = flat_divide(
             tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
@@ -1121,17 +1121,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     }
                 };
 
-                if (!should_skip_tma) {
-                    load_kv_part(0);
-                    FP8_TIMEPOINT(
-                        trace_kv_tile,
-                        plan.barrier_timing.kv[warp_idx][k].tma_part0_issued_ns
-                    );
-                    load_kv_part(1);
-                    FP8_TIMEPOINT(
-                        trace_kv_tile,
-                        plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
-                    );
+                auto load_kv_tail = [&]() {
                     if constexpr (HAVE_QK_TAIL) {
                         // Buffer 0 initially holds Q tail.  Do not let the
                         // first tail-K gather overwrite it until warp 8 has
@@ -1157,6 +1147,21 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                             );
                         }
                     }
+                };
+
+                if (!should_skip_tma) {
+                    load_kv_part(0);
+                    FP8_TIMEPOINT(
+                        trace_kv_tile,
+                        plan.barrier_timing.kv[warp_idx][k].tma_part0_issued_ns
+                    );
+                    load_kv_part(1);
+                    FP8_TIMEPOINT(
+                        trace_kv_tile,
+                        plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
+                    );
+                    load_kv_tail();
+                    
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
                     CUTE_UNROLL

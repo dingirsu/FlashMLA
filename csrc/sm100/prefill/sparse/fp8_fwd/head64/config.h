@@ -43,7 +43,14 @@ constexpr int TMA_K_TAIL_ELEMS = TMA_K_TAIL_BYTES / sizeof(uint64_t);
 static_assert(KV_BYTES_PER_TOKEN % 16 == 0);
 
 constexpr int B_H = 64;
+// The two head-dimension instances are compiled in separate translation
+// units; the 576-D instance uses a smaller token tile to fit its tail-K
+// storage while retaining the full pipeline.
+#if defined(FP8_FWD_QK576)
+constexpr int B_TOPK = 64;
+#else
 constexpr int B_TOPK = 128;
+#endif
 constexpr int QK_M = B_H;
 constexpr int QK_K = D_K;
 constexpr int SV_M = 128;
@@ -54,11 +61,11 @@ static_assert(NUM_SV_TMEM_BLOCKS == 4);
 static_assert(NUM_SV_TMEM_BLOCKS * SV_TMEM_COLS_PER_BLOCK == D_V / 2);
 
 constexpr int NUM_BUFS = 3;
-constexpr int NUM_MAIN_BUFS_K576 = 2;
-constexpr int NUM_QK_TAIL_BUFS = 2;
+constexpr int NUM_MAIN_BUFS_K576 = 3;
+constexpr int NUM_QK_TAIL_BUFS = B_TOPK == 64 ? 3 : 2;
 constexpr int NUM_S_BUFS = 2;
-// The direct TS Q fragment reserves [256, 384).  A complete 64x128 FP32 P
-// occupies 64 columns, so two P stages fit after it.
+// The direct TS Q fragment reserves [256, 384). Two FP32 P stages fit in the
+// remaining TMEM columns for both supported TopK tile sizes.
 constexpr int NUM_P_BUFS = 2;
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
 constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
@@ -222,9 +229,8 @@ struct QKTailStorage {
 struct EmptyQKTailStorage {};
 template<bool HAVE_QK_TAIL>
 struct SharedMemoryPlanT {
-    // K=576 needs room for the independent Q/K tail storage.  Keep the
-    // established three-stage main pipeline for K=512, but use two main KV
-    // stages for the tail specialization.
+    // The 64-token K=576 specialization has room for the same three-stage
+    // main-KV pipeline as K=512, plus three independent tail-K stages.
     static constexpr int NUM_MAIN_BUFS = HAVE_QK_TAIL
         ? NUM_MAIN_BUFS_K576
         : NUM_BUFS;
@@ -238,8 +244,7 @@ struct SharedMemoryPlanT {
         array_aligned<e4m3, cosize_v<SmemLayoutK>> kv[NUM_MAIN_BUFS];
         array_aligned<bf16, cosize_v<SmemLayoutO>> o;
     } qkvo;
-    // The 576-dim specialization keeps Q tail resident for the SS tail GEMM
-    // and has two independent tail-K stages.
+    // The 576-dim specialization keeps Q tail resident for the SS tail GEMM.
     std::conditional_t<HAVE_QK_TAIL, QKTailStorage, EmptyQKTailStorage> qk_tail;
     array_aligned<e4m3, cosize_v<SmemLayoutS>> s[NUM_S_BUFS];
     float kv_token_scale[NUM_MAIN_BUFS][B_TOPK];

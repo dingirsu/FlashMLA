@@ -506,8 +506,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 plan.barrier_timing.wg0[warp_idx][k].waits_done_ns
             );
 
-            // Each lane holds two scales; shuffles expose this thread's
-            // 64-token half of the 128-token tile.
+            // Shuffles expose the token scales for this thread's half-tile.
             float lane_kv_scale[NUM_ELEMS_PER_THREAD / 32];
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD / 32; ++i) {
@@ -546,15 +545,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                 }
 
-                // Direct M=64,N=128 P maps the two WG0 warp pairs to its two
-                // 64-token halves, so no peer P exchange or reduction is
-                // needed.
+                // The two WG0 thread halves cover disjoint token ranges for
+                // each head; max and li are merged across the halves below.
                 const uint32_t* valid_masks =
                     reinterpret_cast<const uint32_t*>(
                         plan.is_k_valid[cur_buf] + token_base / 8
                     );
                 const uint32_t valid0 = valid_masks[0];
-                const uint32_t valid1 = valid_masks[1];
+                uint32_t valid1 = 0;
+                if constexpr (NUM_ELEMS_PER_THREAD > 32) {
+                    valid1 = valid_masks[1];
+                }
 
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
@@ -1490,6 +1491,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 template<int D_QK>
 void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
     static_assert(D_QK == 512 || D_QK == 576);
+#if defined(FP8_FWD_QK576)
+    static_assert(D_QK == 576 && B_TOPK == 64);
+#else
+    static_assert(D_QK == 512 && B_TOPK == 128);
+#endif
     constexpr bool HAVE_QK_TAIL = D_QK == 576;
     KU_ASSERT(params.d_qk == D_QK);
 

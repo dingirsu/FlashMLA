@@ -1,3 +1,5 @@
+#define FP8_FWD_QK576 1
+
 #include "../phase1.h"
 #include "../phase1.cuh"
 

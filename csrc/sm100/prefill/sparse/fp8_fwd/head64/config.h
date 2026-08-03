@@ -306,7 +306,7 @@ using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_F8F6F4_WS_SS_NOELECT<e4m3, e4m3, float, B_H, SV_M, UMMA::Major::K, UMMA::Major::MN>{}
 ));
 
-    enum NamedBarriers : int {
+enum NamedBarriers : int {
     wg0_sync = 0,
     wg0_warp02_sync = 1,
     wg0_warp13_sync = 2,

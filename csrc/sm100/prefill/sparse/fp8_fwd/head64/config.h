@@ -282,7 +282,10 @@ struct SharedMemoryPlanT {
     // A stripe may accept the next SV accumulation only after WG0 has
     // rescaled the preceding tile's value in the same TMEM columns.
     transac_bar_t bar_o_rescale_done[NUM_SV_TMEM_BLOCKS];
-    transac_bar_t bar_kv_ready[NUM_MAIN_BUFS][2];
+    // Each of the four producer warps owns one 16 KiB transaction.  They
+    // arrive on a single full-KV barrier before issuing their gathers; the
+    // MMA warp only waits once for the complete 64 KiB tile.
+    transac_bar_t bar_kv_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_kv_tail_ready[NUM_QK_TAIL_BUFS];
     transac_bar_t bar_kv_scale_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];

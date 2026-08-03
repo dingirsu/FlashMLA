@@ -376,8 +376,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             CUTE_UNROLL
             for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
                 plan.bar_sv_done[i].init(1);
-                plan.bar_kv_ready[i][0].init(1);
-                plan.bar_kv_ready[i][1].init(1);
+                plan.bar_kv_ready[i].init(NUM_KV_PRODUCER_WARPS);
                 plan.bar_kv_scale_ready[i].init(2);
             }
             for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
@@ -1088,7 +1087,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         ) {
                             ku::tma_gather4(
                                 &(tma_params.tensor_map_kv),
-                                plan.bar_kv_ready[cur_buf][part_idx],
+                                plan.bar_kv_ready[cur_buf],
                                 sK_base
                                     + local_row * (4 * NUM_WARPS)
                                         * TMA_K_CHUNK_BYTES
@@ -1131,6 +1130,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 };
 
                 if (!should_skip_tma) {
+                    // Every producer declares its own transaction before
+                    // issuing TMA.  This keeps the expected-byte count armed
+                    // even when another producer finishes early.
+                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(
+                        B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
+                    );
                     load_kv_part(0);
                     FP8_TIMEPOINT(
                         trace_kv_tile,
@@ -1145,9 +1150,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
-                    CUTE_UNROLL
-                    for (int part_idx = 0; part_idx < 2; ++part_idx)
-                        plan.bar_kv_ready[cur_buf][part_idx].complete_transaction(NUM_LOCAL_ROWS_PER_WARP*4*D_V/2*sizeof(e4m3));
+                    plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(
+                        B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
+                    );
+                    plan.bar_kv_ready[cur_buf].complete_transaction(
+                        B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
+                    );
                     if constexpr (HAVE_QK_TAIL) {
                         plan.bar_kv_tail_ready[tail_buf].complete_transaction(
                             NUM_LOCAL_ROWS_PER_WARP * 4
@@ -1249,24 +1257,19 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
 
                 }
-                // The producer still signals the two gather halves
-                // independently, but the direct GEMM consumes the full K.
-                CUTE_UNROLL
-                for (int kv_part_idx = 0; kv_part_idx < 2; ++kv_part_idx) {
-                    plan.bar_kv_ready[cur_buf][kv_part_idx].arrive_and_expect_tx(B_TOPK*D_V/2*sizeof(e4m3));
-                    FP8_TIMED_WAIT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].kv_wait_ns[kv_part_idx],
-                        plan.bar_kv_ready[cur_buf][kv_part_idx].wait(
-                            (k / NUM_MAIN_BUFS) & 1
-                        )
-                    );
-                    FP8_TIMEPOINT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].kv_ready_ns[kv_part_idx]
-                    );
-
-                }
+                // Producers arm the full-KV transaction barrier before their
+                // gathers, so the MMA consumer only needs one wait.
+                FP8_TIMED_WAIT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].kv_wait_ns[0],
+                    plan.bar_kv_ready[cur_buf].wait(
+                        (k / NUM_MAIN_BUFS) & 1
+                    )
+                );
+                FP8_TIMEPOINT(
+                    trace_mma_iter,
+                    plan.barrier_timing.mma[k].kv_ready_ns[0]
+                );
                 ku::tcgen05_after_thread_sync();
 
                 if (p_stage == 0) {

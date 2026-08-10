@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-CUDA_HOME=${CUDA_HOME:-/share/home/jintao/nvidia}
-DSV4=${DSV4:-/share/home/jintao/miniconda3/envs/dsv4}
-TORCH_ROOT=${TORCH_ROOT:-$DSV4/lib/python3.13/site-packages/torch}
+CUDA_HOME=/usr/local/cuda
+PYTHON="$ROOT/.venv/bin/python"
+TORCH_ROOT=${TORCH_ROOT:-$("$PYTHON" -c 'import torch; print(torch.__path__[0])')}
+PYTHON_INCLUDE=${PYTHON_INCLUDE:-$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')}
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=${CXX:-c++}
@@ -17,7 +18,7 @@ INCLUDES=(
     -I"$ROOT/csrc/cutlass/tools/util/include"
     -I"$TORCH_ROOT/include"
     -I"$TORCH_ROOT/include/torch/csrc/api/include"
-    -I"$DSV4/include/python3.13"
+    -I"$PYTHON_INCLUDE"
     -I"$CUDA_HOME/include"
 )
 

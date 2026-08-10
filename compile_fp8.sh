@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/share/home/jintao/weijia/FlashMLA
-CUDA_HOME=/share/home/jintao/nvidia
-DSV4=/share/home/jintao/miniconda3/envs/dsv4
-TORCH_ROOT="$DSV4/lib/python3.13/site-packages/torch"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CUDA_HOME=/usr/local/cuda
+PYTHON="$ROOT/.venv/bin/python"
+TORCH_ROOT="$("$PYTHON" -c 'import torch; print(torch.__path__[0])')"
+PYTHON_INCLUDE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=c++
@@ -17,7 +18,7 @@ INCLUDES=(
     -I"$ROOT/csrc/cutlass/tools/util/include"
     -I"$TORCH_ROOT/include"
     -I"$TORCH_ROOT/include/torch/csrc/api/include"
-    -I"$DSV4/include/python3.13"
+    -I"$PYTHON_INCLUDE"
     -I"$CUDA_HOME/include"
 )
 
@@ -103,10 +104,25 @@ fi
     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
     -o /tmp/fp8_prefill_k576_pic.o
 
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/sm100/decode/fp8_head64/instantiations/model1.cu" \
+    -o /tmp/fp8_decode_pic.o
+
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
+    -o /tmp/fp8_sched_pic.o
+
+"$NVCC" "${NVCC_FLAGS[@]}" \
+    "$ROOT/csrc/smxx/decode/combine/combine.cu" \
+    -o /tmp/fp8_combine_pic.o
+
 "$CXX" -shared \
     /tmp/fp8_api_pic.o \
     /tmp/fp8_prefill_k512_pic.o \
     /tmp/fp8_prefill_k576_pic.o \
+    /tmp/fp8_decode_pic.o \
+    /tmp/fp8_sched_pic.o \
+    /tmp/fp8_combine_pic.o \
     -L"$TORCH_LIB" \
     -Wl,-rpath,"$TORCH_LIB" \
     -ltorch_python \

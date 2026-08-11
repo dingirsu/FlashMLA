@@ -69,7 +69,7 @@ constexpr int NUM_S_BUFS = 2;
 constexpr int NUM_P_BUFS = 2;
 #endif
 constexpr int NUM_KV_PRODUCER_WARPS = 4;
-constexpr int NUM_THREADS = 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads
+constexpr int NUM_THREADS = 128 + 128 + 128 + 128; // 128 scale & exp threads, 128 TMA threads, 32 UTCMMA threads, 128 rescale threads
 constexpr int B_H_TMEM = B_H;
 constexpr float MAX_INIT_VAL = -1e30f;
 constexpr float FP8_MAX = 448.0f;
@@ -141,87 +141,6 @@ using SmemLayoutV = decltype(coalesce(
     )
 , Shape<_1, _1>{}));
 
-#if defined(FP8_FWD_BARRIER_TIMING)
-constexpr int FP8_TIMING_MAX_TILES = 8;
-
-struct Fp8Wg0Timing {
-    uint64_t tile_start_ns;
-    uint64_t pair_wait_ns;
-    uint64_t qk_wait_ns;
-    uint64_t scale_wait_ns;
-    uint64_t rowmax_wait_ns;
-    uint64_t smax_wait_ns;
-    uint64_t waits_done_ns;
-    uint64_t p_released_ns;
-    uint64_t p_scaled_ns;
-    uint64_t rowmax_ready_ns;
-    uint64_t softmax_exp_ready_ns;
-    uint64_t softmax_ready_ns;
-    uint64_t sv_wait_ns;
-    uint64_t s_stored_ns;
-    uint64_t o_rescaled_ns;
-    uint64_t s_arrived_ns;
-};
-
-// Keep the O-rescale handoff split by SV stripe; the aggregate WG0 fields
-// above remain unchanged for existing trace consumers.
-struct Fp8ORescaleStripeTiming {
-    uint64_t stripe_start_ns;
-    uint64_t sv_wait_ns;
-    uint64_t sv_ready_ns;
-    uint64_t tmem_load_done_ns;
-    uint64_t fp32_mul_done_ns;
-    uint64_t tmem_store_done_ns;
-    uint64_t wg0_sync_done_ns;
-    uint64_t warp_rescale_active;
-};
-
-struct Fp8KvProducerTiming {
-    uint64_t tile_start_ns;
-    uint64_t indices_ready_ns;
-    uint64_t q_reuse_wait_ns;
-    uint64_t sv_free_wait_ns;
-    uint64_t tma_part0_issued_ns;
-    uint64_t tma_part1_issued_ns;
-};
-
-struct Fp8MmaTiming {
-    uint64_t iter_start_ns;
-    uint64_t p_free_wait_ns;
-    uint64_t q_copy_wait_ns;
-    uint64_t kv_wait_ns[2];
-    uint64_t kv_ready_ns[2];
-    uint64_t qk_issued_ns[2];
-    uint64_t qk_committed_ns;
-    uint64_t s_ready_wait_ns;
-    uint64_t s_ready_ns;
-    uint64_t sv_committed_ns;
-};
-
-struct Fp8SimpleProducerTiming {
-    uint64_t tile_start_ns;
-    uint64_t buffer_free_wait_ns;
-    uint64_t arrived_ns;
-};
-
-struct Fp8BarrierTiming {
-    uint64_t origin_ns;
-    uint64_t branch_end_ns[12];
-    uint64_t qw_scale_wait_ns[4];
-    uint64_t qw_scale_arrived_ns[2];
-    uint64_t final_sv_wait_ns[4];
-    uint64_t final_sv_ready_ns[4];
-    uint64_t q_tma_wait_ns;
-    uint64_t q_tmem_committed_ns;
-    Fp8Wg0Timing wg0[4][FP8_TIMING_MAX_TILES];
-    Fp8ORescaleStripeTiming o_rescale[4][FP8_TIMING_MAX_TILES]
-                                          [NUM_SV_TMEM_BLOCKS];
-    Fp8KvProducerTiming kv[4][FP8_TIMING_MAX_TILES];
-    Fp8MmaTiming mma[FP8_TIMING_MAX_TILES + 1];
-    Fp8SimpleProducerTiming scale[2][FP8_TIMING_MAX_TILES];
-};
-#endif
-
 struct QKTailStorage {
     // The Q tail is copied to TMEM during the prologue, then this storage is
     // reused by the tail-K pipeline.  The union avoids paying for both.
@@ -279,9 +198,6 @@ struct SharedMemoryPlanT {
     transac_bar_t bar_qk_done[NUM_MAIN_BUFS];  // Complete QK (including the tail)
     transac_bar_t bar_sv_block_done[NUM_MAIN_BUFS][NUM_SV_TMEM_BLOCKS - 1];
     transac_bar_t bar_sv_done[NUM_MAIN_BUFS];    // Final SV stripe is committed.
-    // A stripe may accept the next SV accumulation only after WG0 has
-    // rescaled the preceding tile's value in the same TMEM columns.
-    transac_bar_t bar_o_rescale_done[NUM_SV_TMEM_BLOCKS];
     // Each of the four producer warps owns one 16 KiB transaction.  They
     // arrive on a single full-KV barrier before issuing their gathers; the
     // MMA warp only waits once for the complete 64 KiB tile.
@@ -289,12 +205,15 @@ struct SharedMemoryPlanT {
     transac_bar_t bar_kv_tail_ready[NUM_QK_TAIL_BUFS];
     transac_bar_t bar_kv_scale_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
-    transac_bar_t bar_so_ready;   // Current S buffer is ready.
+    // WG0 publishes S and new_max independently. WG3 consumes new_max,
+    // rescales O when needed, then lets the SV consumer proceed. new_max
+    // reuses rowwise_max_buf[0:B_H]; the consumed handoff prevents WG0's
+    // next row-max reduction from overwriting it early.
+    transac_bar_t bar_s_ready[NUM_S_BUFS];
+    transac_bar_t bar_new_max_ready, bar_new_max_consumed, bar_o_ready;
+    uint32_t o_rescale_warp_needed[4];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
-#if defined(FP8_FWD_BARRIER_TIMING)
-    Fp8BarrierTiming barrier_timing;
-#endif
 };
 
 // may change to bf16 accumulator for better speed
@@ -311,6 +230,7 @@ enum NamedBarriers : int {
     wg0_warp02_sync = 1,
     wg0_warp13_sync = 2,
     pepi_sync = 3,
+    wg3_sync = 4,
 };
 
 using SharedMemoryPlan = SharedMemoryPlanT<false>;

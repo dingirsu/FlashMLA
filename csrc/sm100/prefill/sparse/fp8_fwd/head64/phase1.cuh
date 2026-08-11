@@ -161,13 +161,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             for (int i = 0; i < NUM_QK_TAIL_BUFS; ++i) {
                 plan.bar_kv_tail_ready[i].init(1);
             }
-            plan.bar_so_ready.init(128);
             CUTE_UNROLL
-            for (int dv_block = 0;
-                 dv_block < NUM_SV_TMEM_BLOCKS;
-                 ++dv_block) {
-                plan.bar_o_rescale_done[dv_block].init(128);
+            for (int i = 0; i < NUM_S_BUFS; ++i) {
+                plan.bar_s_ready[i].init(128);
             }
+            plan.bar_new_max_ready.init(128);
+            plan.bar_new_max_consumed.init(128);
+            plan.bar_o_ready.init(128);
             fence_barrier_init();
         }
 
@@ -179,7 +179,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
     __syncthreads();
 
     if (warpgroup_idx == 0) {
-        cutlass::arch::warpgroup_reg_alloc<232>();
+        cutlass::arch::warpgroup_reg_alloc<200>();
 #if !defined(FP8_FWD_QK576)
         plan.bar_qw_scale_ready.wait(0);
 #endif
@@ -187,7 +187,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         float mi = MAX_INIT_VAL;
         float li = 0.0f;
         float real_mi = -CUDART_INF_F;
-        float s_scale_for_o = 1.0f;
 
         const int h = idx_in_warpgroup % B_H;
         const int token_group = idx_in_warpgroup / B_H;
@@ -308,6 +307,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 }
             }
 
+            if (k > 0) {
+                plan.bar_new_max_consumed.wait((k - 1) & 1);
+            }
             plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
             NamedBarrier::arrive_and_wait(
                 128, NamedBarriers::wg0_sync
@@ -329,6 +331,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 scale_for_old = exp2f(mi - new_max);
             }
             mi = new_max;   // mi is still identical within each row
+            if (idx_in_warpgroup < B_H) {
+                plan.rowwise_max_buf[idx_in_warpgroup] = new_max;
+            }
+            fence_view_async_shared();
+            plan.bar_new_max_ready.arrive();
+
             // Absorb the token factor into S, then quantize each head row.
             uint32_t s[NUM_ELEMS_PER_THREAD / 4];
             float cur_sum = 0.0f;
@@ -349,27 +357,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 p[i + 0] = s_pair.x;
                 p[i + 1] = s_pair.y;
             }
-            // Reuse the otherwise-idle LSE exchange scratch to make the
-            // no-rescale decision uniform across WG0.  The named barrier
-            // below already orders this four-warp publication.
-            if (lane_idx == 0) {
-                plan.rowwise_li_buf[warp_idx] = static_cast<float>(
-                    should_scale_o
-                );
-            }
-            NamedBarrier::arrive_and_wait(
-                128, NamedBarriers::wg0_sync
-            );
-            bool wg0_needs_o_rescale = false;
-            if (lane_idx == 0) {
-                wg0_needs_o_rescale = plan.rowwise_li_buf[0] != 0.0f
-                    || plan.rowwise_li_buf[1] != 0.0f
-                    || plan.rowwise_li_buf[2] != 0.0f
-                    || plan.rowwise_li_buf[3] != 0.0f;
-            }
-            wg0_needs_o_rescale = __shfl_sync(
-                0xffffffff, wg0_needs_o_rescale, 0
-            );
             // const float s_max = max(
             //     local_s_max,
             //     plan.rowwise_li_buf[idx_in_warpgroup ^ B_H]
@@ -382,7 +369,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             // const float inv_current_s_scale = __fdividef(
             //     1.0f, current_s_scale
             // );
-            constexpr float current_s_scale = 1.0f/448.f;
             constexpr float inv_current_s_scale = 448.f;
             const float2 inv_current_s_scale2 = make_float2(
                 inv_current_s_scale,
@@ -432,52 +418,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 );
             }
             // S can be consumed as soon as its SMEM stores are visible. O
-            // reuse is guarded by the whole-O handoff below.
+            // is independently handed off by WG3.
             fence_view_async_shared();
-            plan.bar_so_ready.arrive();
-
-            // Wait for the preceding SV tile to finish, rescale all four O
-            // stripes, then publish one handoff for the whole O accumulator.
-            if (k > 0) {
-                const int prev_buf = (k - 1) % NUM_MAIN_BUFS;
-                const int prev_phase = ((k - 1) / NUM_MAIN_BUFS) & 1;
-                // const float o_rescale = scale_for_old
-                //     * s_scale_for_o / current_s_scale;
-                // const bool warp_needs_o_rescale = __any_sync(
-                //     0xffffffff, o_rescale != 1.0f
-                // );
-                const float o_rescale = scale_for_old;
-                const bool warp_needs_o_rescale = should_scale_o;
-                plan.bar_sv_done[prev_buf].wait(prev_phase);
-                CUTE_UNROLL
-                for (int dv_block = 0;
-                     dv_block < NUM_SV_TMEM_BLOCKS;
-                     ++dv_block) {
-                    if (warp_needs_o_rescale) {
-                        if (dv_block == 0) {
-                            ku::tcgen05_after_thread_sync();
-                        }
-                        rescale_o_tmem_stripe(
-                            o_rescale,
-                            tmem_cols::O + dv_block * SV_TMEM_COLS_PER_BLOCK
-                        );
-                        if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
-                            ku::tcgen05_before_thread_sync();
-                        }
-                    }
-                }
-                // The named barrier is still needed when any WG0 warp touched
-                // TMEM.  With no rescale, the single transaction-barrier
-                // arrival below is the fast relay and no named barrier is
-                // entered.
-                if (wg0_needs_o_rescale) {
-                    NamedBarrier::arrive_and_wait(
-                        128, NamedBarriers::wg0_sync
-                    );
-                }
-                plan.bar_o_rescale_done[0].arrive();
-            }
-            s_scale_for_o = current_s_scale;
+            plan.bar_s_ready[k % NUM_S_BUFS].arrive();
         }
 
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -547,7 +490,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             for (int i = 0; i < B_EPI/2; ++i)
                 o[i].x = o[i].y = 0.0f;
         }
-        const float output_base_scale = output_scale * s_scale_for_o;
+        constexpr float FINAL_S_SCALE = 1.0f / 448.0f;
+        const float output_base_scale = output_scale * FINAL_S_SCALE;
 
         bf16* sO_addrs[8];
         CUTE_UNROLL
@@ -768,7 +712,67 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
         }
 
+} else if (warpgroup_idx == 3) {
+    cutlass::arch::warpgroup_reg_alloc<152>();
+    const int local_warp_idx = warp_idx - 12;
+    float previous_max = MAX_INIT_VAL;
+
+    CUTE_NO_UNROLL
+    for (int k = 0; k < num_k_blocks; ++k) {
+        plan.bar_new_max_ready.wait(k & 1);
+        fence_view_async_shared();
+
+        const float current_max =
+            plan.rowwise_max_buf[idx_in_warpgroup % B_H];
+        const float o_rescale = exp2f(previous_max - current_max);
+        const bool warp_needs_o_rescale = __any_sync(
+            0xffffffff, o_rescale != 1.0f
+        );
+        plan.bar_new_max_consumed.arrive();
+
+        if (k > 0) {
+            const int prev_buf = (k - 1) % NUM_MAIN_BUFS;
+            const int prev_phase = ((k - 1) / NUM_MAIN_BUFS) & 1;
+            plan.bar_sv_done[prev_buf].wait(prev_phase);
+
+            if (lane_idx == 0) {
+                plan.o_rescale_warp_needed[local_warp_idx] =
+                    static_cast<uint32_t>(warp_needs_o_rescale);
+            }
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg3_sync);
+
+            const bool wg3_needs_o_rescale =
+                plan.o_rescale_warp_needed[0]
+                || plan.o_rescale_warp_needed[1]
+                || plan.o_rescale_warp_needed[2]
+                || plan.o_rescale_warp_needed[3];
+            if (warp_needs_o_rescale) {
+                ku::tcgen05_after_thread_sync();
+                CUTE_UNROLL
+                for (int dv_block = 0;
+                     dv_block < NUM_SV_TMEM_BLOCKS;
+                     ++dv_block) {
+                    rescale_o_tmem_stripe(
+                        o_rescale,
+                        tmem_cols::O
+                            + dv_block * SV_TMEM_COLS_PER_BLOCK
+                    );
+                }
+                ku::tcgen05_before_thread_sync();
+            }
+            if (wg3_needs_o_rescale) {
+                NamedBarrier::arrive_and_wait(
+                    128, NamedBarriers::wg3_sync
+                );
+            }
+        }
+
+        previous_max = current_max;
+        plan.bar_o_ready.arrive();
+    }
 } else {
+    cutlass::arch::warpgroup_reg_dealloc<80>();
     if (warp_idx == 8 && elect_one_sync()) {
         UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
@@ -896,15 +900,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         SmemLayoutV{}
                     );
 
-                    // S(i-1) is ready independently of the O accumulator.
-                    plan.bar_so_ready.wait((k - 1) & 1);
-
-                    // The entire O accumulator is handed back at once; do
-                    // not start any stripe until WG0 has finished the whole
-                    // preceding O rescale.
-                    if (k > 1) {
-                        plan.bar_o_rescale_done[0].wait((k - 2) & 1);
-                    }
+                    // S and the rescaled O accumulator are produced by
+                    // independent warpgroups.
+                    plan.bar_s_ready[(k - 1) % NUM_S_BUFS].wait(
+                        ((k - 1) / NUM_S_BUFS) & 1
+                    );
+                    plan.bar_o_ready.wait((k - 1) & 1);
                     ku::tcgen05_after_thread_sync();
 
                     Tensor sV_divided = flat_divide(
@@ -1087,6 +1088,8 @@ void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {
     auto kernel = &sprase_fp8_attn_fwd_kernel<HAVE_QK_TAIL, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlanT<HAVE_QK_TAIL>);
+    static_assert(smem_size <= 227 * 1024,
+                  "FP8 prefill shared memory exceeds the SM100 limit");
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params);

@@ -928,15 +928,17 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             run_main_loop([&](const MainLoopArgs &) {});
         }
     } else if (warpgroup_idx == 2) {
-        // WG2 replaces the old dequant stage.  Thirty-two active threads own
-        // four token rows each; every active thread issues the four 128-byte
-        // gather4 chunks for its rows.  The other 96 threads only contribute
-        // their transaction-barrier arrival, preserving the 128-thread WG2
-        // handoff configured above.
+        // WG2 loads KV with all 128 threads.  Four neighboring threads own
+        // one group of four token rows, and each thread issues one 128-byte
+        // K-dimension gather4 chunk for that group.  This preserves the
+        // 128B-swizzled destination layout while replacing the old 32-thread
+        // loader with a full-warpgroup producer.
         cutlass::arch::warpgroup_reg_dealloc<80>();
         constexpr int ROWS_PER_LOADER = 4;
-        constexpr int NUM_ACTIVE_LOADERS = B_TOPK / ROWS_PER_LOADER;
-        static_assert(NUM_ACTIVE_LOADERS == 32);
+        constexpr int NUM_ROW_GROUPS = B_TOPK / ROWS_PER_LOADER;
+        constexpr int BYTES_PER_GATHER =
+            ROWS_PER_LOADER * TMA_K_CHUNK_BYTES;
+        static_assert(NUM_ROW_GROUPS == 32);
 
         run_main_loop([&](const MainLoopArgs &args) {
             plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
@@ -953,34 +955,31 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 // until the prior SV MMA for this stage has committed.
                 plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase ^ true);
 
-                if (idx_in_warpgroup < NUM_ACTIVE_LOADERS) {
-                    constexpr int BYTES_PER_LOADER = ROWS_PER_LOADER * D_K;
-                    plan.bar_kv_ready[rs.buf_idx].arrive_and_expect_tx(
-                        BYTES_PER_LOADER * sizeof(e4m3)
-                    );
-
-                    const int row = idx_in_warpgroup * ROWS_PER_LOADER;
-                    const int4 row_coords = *reinterpret_cast<const int4 *>(
-                        plan.tma_coord[rs.index_buf_idx] + row
-                    );
-                    CUTE_UNROLL
-                    for (int col = 0; col < D_K / TMA_K_CHUNK_BYTES; ++col) {
-                        ku::tma_gather4(
-                            block_idx >= args.num_orig_kv_blocks
-                                ? &tma_params.tensor_map_extra_kv
-                                : &tma_params.tensor_map_kv,
-                            plan.bar_kv_ready[rs.buf_idx],
-                            plan.qkvo.kv[rs.buf_idx].data()
-                                + col * B_TOPK * TMA_K_CHUNK_BYTES
-                                + row * TMA_K_CHUNK_BYTES,
-                            col * TMA_K_CHUNK_ELEMS,
-                            row_coords,
-                            (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                        );
-                    }
-                } else {
-                    plan.bar_kv_ready[rs.buf_idx].arrive();
-                }
+                // Thread t maps to row group t/4 and K chunk t%4.  Every
+                // thread contributes one transaction-barrier arrival and one
+                // gather4 operation, so the total expected bytes remain
+                // B_TOPK * D_K while all 128 WG2 threads are useful.
+                const int row_group = idx_in_warpgroup / 4;
+                const int row = row_group * ROWS_PER_LOADER;
+                const int col = idx_in_warpgroup % 4;
+                const int4 row_coords = *reinterpret_cast<const int4 *>(
+                    plan.tma_coord[rs.index_buf_idx] + row
+                );
+                plan.bar_kv_ready[rs.buf_idx].arrive_and_expect_tx(
+                    BYTES_PER_GATHER * sizeof(e4m3)
+                );
+                ku::tma_gather4(
+                    block_idx >= args.num_orig_kv_blocks
+                        ? &tma_params.tensor_map_extra_kv
+                        : &tma_params.tensor_map_kv,
+                    plan.bar_kv_ready[rs.buf_idx],
+                    plan.qkvo.kv[rs.buf_idx].data()
+                        + col * B_TOPK * TMA_K_CHUNK_BYTES
+                        + row * TMA_K_CHUNK_BYTES,
+                    col * TMA_K_CHUNK_ELEMS,
+                    row_coords,
+                    (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                );
 
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 rs.update();

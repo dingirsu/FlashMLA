@@ -209,6 +209,7 @@ struct SharedMemoryPlanT {
     // Only warps that need a rescale publish new_max in
     // rowwise_max_buf[0:B_H]. The consumed handoff prevents WG0's next
     // row-max reduction from overwriting the decision or max too early.
+    transac_bar_t bar_s_96_ready[NUM_S_BUFS];
     transac_bar_t bar_s_ready[NUM_S_BUFS];
     transac_bar_t bar_o_rescale_decision_ready;
     transac_bar_t bar_o_rescale_decision_consumed;

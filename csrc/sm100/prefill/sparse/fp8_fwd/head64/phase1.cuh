@@ -163,6 +163,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
             CUTE_UNROLL
             for (int i = 0; i < NUM_S_BUFS; ++i) {
+                plan.bar_s_96_ready[i].init(128);
                 plan.bar_s_ready[i].init(128);
             }
             plan.bar_o_rescale_decision_ready.init(128);
@@ -344,25 +345,35 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             fence_view_async_shared();
             plan.bar_o_rescale_decision_ready.arrive();
 
-            // Absorb the token factor into S, then quantize each head row.
+            // For non-final tiles, publish columns [0, 96) before finishing
+            // [96, 128). Warps 0/1 own [0, 64), while warps 2/3 first
+            // produce [64, 96), publish the partial handoff, then finish
+            // [96, 128).
             uint32_t s[NUM_ELEMS_PER_THREAD / 4];
             float cur_sum = 0.0f;
+            const bool split_s_pipeline = k + 1 < num_k_blocks;
+            const int first_local_s_elems =
+                split_s_pipeline && token_group != 0
+                    ? NUM_ELEMS_PER_THREAD / 2
+                    : NUM_ELEMS_PER_THREAD;
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 2) {
-                const float2 softmax_s = make_float2(
-                    exp2f(p[i + 0] - new_max),
-                    exp2f(p[i + 1] - new_max)
-                );
-                cur_sum += softmax_s.x + softmax_s.y;
-                const float2 s_pair = ku::float2_mul(
-                    softmax_s,
-                    make_float2(
-                        kv_scale[i + 0],
-                        kv_scale[i + 1]
-                    )
-                );
-                p[i + 0] = s_pair.x;
-                p[i + 1] = s_pair.y;
+                if (i < first_local_s_elems) {
+                    const float2 softmax_s = make_float2(
+                        exp2f(p[i + 0] - new_max),
+                        exp2f(p[i + 1] - new_max)
+                    );
+                    cur_sum += softmax_s.x + softmax_s.y;
+                    const float2 s_pair = ku::float2_mul(
+                        softmax_s,
+                        make_float2(
+                            kv_scale[i + 0],
+                            kv_scale[i + 1]
+                        )
+                    );
+                    p[i + 0] = s_pair.x;
+                    p[i + 1] = s_pair.y;
+                }
             }
             // const float s_max = max(
             //     local_s_max,
@@ -383,22 +394,23 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             );
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
-                const uint16_t s01 = ku::float2_to_e4m3x2_bits(
-                    ku::float2_mul(
-                        make_float2(p[i], p[i + 1]),
-                        inv_current_s_scale2
-                    )
-                );
-                const uint16_t s23 = ku::float2_to_e4m3x2_bits(
-                    ku::float2_mul(
-                        make_float2(p[i + 2], p[i + 3]),
-                        inv_current_s_scale2
-                    )
-                );
-                s[i / 4] = static_cast<uint32_t>(s01)
-                    | (static_cast<uint32_t>(s23) << 16);
+                if (i < first_local_s_elems) {
+                    const uint16_t s01 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i], p[i + 1]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    const uint16_t s23 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i + 2], p[i + 3]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    s[i / 4] = static_cast<uint32_t>(s01)
+                        | (static_cast<uint32_t>(s23) << 16);
+                }
             }
-            li = fma(li, scale_for_old, cur_sum);
 
             // Warp 8 can keep consuming S(k-1) while WG0 publishes S(k) into
             // the other stage.  A stage is not reused until the preceding
@@ -417,13 +429,74 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             );
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 16) {
-                *reinterpret_cast<uint4*>(&sS(h, token_base + i)) = make_uint4(
-                    s[i / 4],
-                    s[i / 4 + 1],
-                    s[i / 4 + 2],
-                    s[i / 4 + 3]
-                );
+                if (i < first_local_s_elems) {
+                    *reinterpret_cast<uint4*>(&sS(h, token_base + i)) =
+                        make_uint4(
+                            s[i / 4],
+                            s[i / 4 + 1],
+                            s[i / 4 + 2],
+                            s[i / 4 + 3]
+                        );
+                }
             }
+            if (split_s_pipeline) {
+                fence_view_async_shared();
+                plan.bar_s_96_ready[k % NUM_S_BUFS].arrive();
+            }
+
+            if (split_s_pipeline && token_group != 0) {
+                CUTE_UNROLL
+                for (int i = NUM_ELEMS_PER_THREAD / 2;
+                     i < NUM_ELEMS_PER_THREAD;
+                     i += 2) {
+                    const float2 softmax_s = make_float2(
+                        exp2f(p[i + 0] - new_max),
+                        exp2f(p[i + 1] - new_max)
+                    );
+                    cur_sum += softmax_s.x + softmax_s.y;
+                    const float2 s_pair = ku::float2_mul(
+                        softmax_s,
+                        make_float2(
+                            kv_scale[i + 0],
+                            kv_scale[i + 1]
+                        )
+                    );
+                    p[i + 0] = s_pair.x;
+                    p[i + 1] = s_pair.y;
+                }
+                CUTE_UNROLL
+                for (int i = NUM_ELEMS_PER_THREAD / 2;
+                     i < NUM_ELEMS_PER_THREAD;
+                     i += 4) {
+                    const uint16_t s01 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i], p[i + 1]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    const uint16_t s23 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i + 2], p[i + 3]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    s[i / 4] = static_cast<uint32_t>(s01)
+                        | (static_cast<uint32_t>(s23) << 16);
+                }
+                CUTE_UNROLL
+                for (int i = NUM_ELEMS_PER_THREAD / 2;
+                     i < NUM_ELEMS_PER_THREAD;
+                     i += 16) {
+                    *reinterpret_cast<uint4*>(&sS(h, token_base + i)) =
+                        make_uint4(
+                            s[i / 4],
+                            s[i / 4 + 1],
+                            s[i / 4 + 2],
+                            s[i / 4 + 3]
+                        );
+                }
+            }
+            li = fma(li, scale_for_old, cur_sum);
             // S can be consumed as soon as its SMEM stores are visible. O
             // is independently handed off by WG3.
             fence_view_async_shared();
@@ -892,42 +965,103 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         SmemLayoutV{}
                     );
 
+                    const int s_stage = (k - 1) % NUM_S_BUFS;
+                    const int s_phase = ((k - 1) / NUM_S_BUFS) & 1;
+                    const bool is_final_sv_tile = k == num_k_blocks;
+
                     // S and the rescaled O accumulator are produced by
-                    // independent warpgroups.
-                    plan.bar_s_ready[(k - 1) % NUM_S_BUFS].wait(
-                        ((k - 1) / NUM_S_BUFS) & 1
-                    );
+                    // independent warpgroups. Non-final tiles can start
+                    // after S[0:96) is visible; final tiles retain the
+                    // whole-S handoff used by the overlapped epilogue.
+                    if (is_final_sv_tile) {
+                        plan.bar_s_ready[s_stage].wait(s_phase);
+                    } else {
+                        plan.bar_s_96_ready[s_stage].wait(s_phase);
+                    }
                     plan.bar_o_ready[cur_buf].wait(
                         ((k - 1) / NUM_MAIN_BUFS) & 1
                     );
                     ku::tcgen05_after_thread_sync();
 
-                    Tensor sV_divided = flat_divide(
-                        sV, Tile<Int<SV_M>, Int<B_TOPK>>{}
-                    )(_, _, _, _0{});
-
                     // Keep all four O stripes in TMEM.  Only the first
                     // TopK tile clears them; later tiles accumulate in place.
-                    CUTE_UNROLL
-                    for (int dv_block = 0;
-                         dv_block < NUM_SV_TMEM_BLOCKS;
-                         ++dv_block) {
-                        tO.data().get() = tmem_cols::O
-                            + dv_block * SV_TMEM_COLS_PER_BLOCK;
-                        ku::utcmma_ss(
-                            tiled_mma_O,
-                            sS,
-                            sV_divided(_, _, dv_block),
-                            tO,
-                            k == 1
-                        );
-                        if (k == num_k_blocks
-                            && dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
-                            ku::umma_arrive_noelect(
-                                plan.bar_sv_block_done[cur_buf][dv_block]
+                    if (is_final_sv_tile) {
+                        Tensor sV_divided = flat_divide(
+                            sV, Tile<Int<SV_M>, Int<B_TOPK>>{}
+                        )(_, _, _, _0{});
+                        CUTE_UNROLL
+                        for (int dv_block = 0;
+                             dv_block < NUM_SV_TMEM_BLOCKS;
+                             ++dv_block) {
+                            tO.data().get() = tmem_cols::O
+                                + dv_block * SV_TMEM_COLS_PER_BLOCK;
+                            ku::utcmma_ss(
+                                tiled_mma_O,
+                                sS,
+                                sV_divided(_, _, dv_block),
+                                tO,
+                                k == 1
                             );
-                        } else if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
-                            ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
+                            if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                                ku::umma_arrive_noelect(
+                                    plan.bar_sv_block_done[cur_buf][dv_block]
+                                );
+                            } else {
+                                ku::umma_arrive_noelect(
+                                    plan.bar_sv_done[cur_buf]
+                                );
+                            }
+                        }
+                    } else {
+                        Tensor sS_k32 = flat_divide(
+                            sS, Tile<Int<B_H>, Int<32>>{}
+                        )(_, _, _0{}, _);
+                        Tensor sV_k32 = flat_divide(
+                            sV, Tile<Int<SV_M>, Int<32>>{}
+                        );
+
+                        // Issue K slices [0, 96) while WG0 produces the
+                        // final 32 S columns.
+                        CUTE_UNROLL
+                        for (int dv_block = 0;
+                             dv_block < NUM_SV_TMEM_BLOCKS;
+                             ++dv_block) {
+                            tO.data().get() = tmem_cols::O
+                                + dv_block * SV_TMEM_COLS_PER_BLOCK;
+                            CUTE_UNROLL
+                            for (int k_part = 0; k_part < 3; ++k_part) {
+                                ku::utcmma_ss(
+                                    tiled_mma_O,
+                                    sS_k32(_, _, k_part),
+                                    sV_k32(_, _, dv_block, k_part),
+                                    tO,
+                                    k == 1 && k_part == 0
+                                );
+                            }
+                        }
+
+                        plan.bar_s_ready[s_stage].wait(s_phase);
+                        ku::tcgen05_after_thread_sync();
+
+                        // Complete the tile with K slice [96, 128).
+                        CUTE_UNROLL
+                        for (int dv_block = 0;
+                             dv_block < NUM_SV_TMEM_BLOCKS;
+                             ++dv_block) {
+                            tO.data().get() = tmem_cols::O
+                                + dv_block * SV_TMEM_COLS_PER_BLOCK;
+                            ku::utcmma_ss(
+                                tiled_mma_O,
+                                sS_k32(_, _, 3),
+                                sV_k32(_, _, dv_block, 3),
+                                tO,
+                                false
+                            );
+                            if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
+                                ku::umma_arrive_noelect(
+                                    plan.bar_sv_done[cur_buf]
+                                );
+                            }
                         }
                     }
                 }

@@ -17,6 +17,32 @@
 
 namespace sm100::decode::fp8_head64 {
 
+CUTE_DEVICE
+float ue8m0_bits_to_float(uint8_t bits) {
+    if (bits == 0) {
+        return __uint_as_float(0x00400000u);
+    }
+    return __uint_as_float(static_cast<uint32_t>(bits) << 23);
+}
+
+CUTE_DEVICE
+void rescale_o_tmem_stripe(
+    float scale,
+    uint32_t tmem_col
+) {
+    float2 o[SV_M / 4];
+    const float2 scale2 = make_float2(scale, scale);
+
+    ku::tmem_ld_32dp32bNx<SV_M / 2>(tmem_col, o);
+    cutlass::arch::fence_view_async_tmem_load();
+    CUTE_UNROLL
+    for (int i = 0; i < SV_M / 4; ++i) {
+        o[i] = ku::float2_mul(o[i], scale2);
+    }
+    ku::tmem_st_32dp32bNx<SV_M / 2>(tmem_col, o);
+    cutlass::arch::fence_view_async_tmem_store();
+}
+
 template<typename TmaParam>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(
@@ -53,10 +79,16 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 // WG2 contributes one arrival per thread: 32 threads issue
                 // gathers and the remaining threads complete the arrival set.
                 plan.bar_kv_ready[i].init(128);
+                // Warp 5 and warp 6 each publish one half of the token-scale
+                // tile for the corresponding KV stage.
+                plan.bar_kv_scale_ready[i].init(2);
                 plan.bar_qk_done[i].init(1);
                 plan.bar_so_ready[i].init(128);
                 plan.bar_sv_done[i].init(1);
+                plan.bar_o_ready[i].init(128);
             }
+            plan.bar_o_rescale_decision_ready.init(128);
+            plan.bar_o_rescale_decision_consumed.init(128);
             CUTE_UNROLL
             for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
                 // Warp 7 produces one four-index packet per lane.  WG0 and
@@ -167,8 +199,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
     RingState rs;
 
     if (warpgroup_idx == 0) {
-        // WG0 owns online softmax, O rescaling, and the output epilogue.
-        cutlass::arch::warpgroup_reg_alloc<224>();
+        // WG0 owns online softmax, S quantization, and the output epilogue;
+        // WG3 performs O rescaling after each max decision.
+        cutlass::arch::warpgroup_reg_alloc<200>();
 
         constexpr int B_EPI = 64;
         Tensor sO = make_tensor(
@@ -185,6 +218,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             ? -CUDART_INF_F
             : __ldg(params.attn_sink + idx_in_warpgroup % B_H) * CUDART_L2E_F;
 
+        // These phases span callbacks when the scheduler assigns multiple
+        // requests to one CTA.  Reset only the per-request online-softmax
+        // state inside the callback; keep the mbarrier phase across requests.
+        bool o_decision_phase = false;
+        bool have_previous_o_decision = false;
         run_main_loop([&](const MainLoopArgs &args) {
             cute::tma_store_wait<0>();
             plan.bar_last_store_done.arrive();
@@ -194,6 +232,21 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             float real_mi = -CUDART_INF_F;
             const int h = idx_in_warpgroup % B_H;
             const int token_base = (idx_in_warpgroup / B_H) * (B_TOPK / 2);
+            const uint8_t *q_scale_base =
+                reinterpret_cast<const uint8_t *>(params.q)
+                + static_cast<int64_t>(args.batch_idx)
+                    * params.stride_q_b
+                + static_cast<int64_t>(s_q_idx) * params.stride_q_s_q
+                + B_H * D_Q;
+            const float q_head_scale = ue8m0_bits_to_float(
+                __ldg(q_scale_base + h)
+            );
+            const float qk_base_scale =
+                q_head_scale * params.sm_scale_div_log2;
+            const float2 qk_base_scale2 = make_float2(
+                qk_base_scale,
+                qk_base_scale
+            );
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx;
@@ -213,21 +266,71 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 ku::tmem_ld_32dp32bNx<B_TOPK / 2>(tmem_cols::P, p);
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
+                plan.bar_kv_scale_ready[rs.buf_idx].wait(rs.bar_phase);
+
+                // Each WG0 lane initially owns four token scales.  Shuffles
+                // expose the complete half-tile to the thread that owns the
+                // corresponding P values, matching the prefill pipeline.
+                float lane_kv_scale[B_TOPK / 64];
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 64; ++i) {
+                    lane_kv_scale[i] = plan.kv_token_scale[rs.buf_idx][
+                        token_base + i * 32 + lane_idx
+                    ];
+                }
 
                 const uint64_t valid_mask = *(
                     reinterpret_cast<const uint64_t *>(
                         plan.is_token_valid[rs.index_buf_idx]
                     ) + idx_in_warpgroup / B_H
                 );
-                float cur_pi_max = -CUDART_INF_F;
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK / 2; ++i) {
-                    if ((valid_mask >> i) & 1ull) {
-                        p[i] *= params.sm_scale_div_log2;
-                        cur_pi_max = max(cur_pi_max, p[i]);
-                    } else {
+                    if (((valid_mask >> i) & 1ull) == 0) {
                         p[i] = -CUDART_INF_F;
                     }
+                }
+
+                // Keep both the token scale and complete QK scale in
+                // registers for the whole softmax + quant path.  This is
+                // the prefill arrangement: the S loop consumes these values
+                // directly and does not perform another shuffle.
+                float kv_scale[B_TOPK / 2];
+                float2 qk_scale[B_TOPK / 4];
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 4; ++i) {
+                    const int base = i * 2;
+                    const float2 token_scale = make_float2(
+                        __shfl_sync(
+                            0xffffffff,
+                            lane_kv_scale[(base + 0) / 32],
+                            (base + 0) % 32
+                        ),
+                        __shfl_sync(
+                            0xffffffff,
+                            lane_kv_scale[(base + 1) / 32],
+                            (base + 1) % 32
+                        )
+                    );
+                    kv_scale[base + 0] = token_scale.x;
+                    kv_scale[base + 1] = token_scale.y;
+                    qk_scale[i] = ku::float2_mul(
+                        qk_base_scale2,
+                        token_scale
+                    );
+                }
+
+                float cur_pi_max = -CUDART_INF_F;
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 2; i += 2) {
+                    const float2 scaled_p = ku::float2_mul(
+                        make_float2(p[i + 0], p[i + 1]),
+                        qk_scale[i / 2]
+                    );
+                    p[i + 0] = scaled_p.x;
+                    p[i + 1] = scaled_p.y;
+                    cur_pi_max = max(cur_pi_max, scaled_p.x);
+                    cur_pi_max = max(cur_pi_max, scaled_p.y);
                 }
 
                 plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
@@ -237,6 +340,12 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup ^ B_H]
                 );
                 real_mi = max(real_mi, cur_pi_max);
+
+                if (have_previous_o_decision) {
+                    plan.bar_o_rescale_decision_consumed.wait(
+                        o_decision_phase ^ true
+                    );
+                }
 
                 const bool should_scale_o = __any_sync(
                     0xffffffff, cur_pi_max - mi > 6.0f
@@ -249,43 +358,70 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     : 1.0f;
                 mi = new_max;
 
+                if (lane_idx == 0) {
+                    plan.o_rescale_warp_needed[warp_idx] =
+                        static_cast<uint32_t>(should_scale_o);
+                }
+                if (should_scale_o && idx_in_warpgroup < B_H) {
+                    plan.rowwise_max_buf[idx_in_warpgroup] = new_max;
+                }
+                fence_view_async_shared();
+                plan.bar_o_rescale_decision_ready.arrive();
+                have_previous_o_decision = true;
+                o_decision_phase ^= true;
+
                 float cur_sum = 0.0f;
                 CUTE_UNROLL
-                for (int i = 0; i < B_TOPK / 2; ++i) {
-                    const float s = exp2f(p[i] - new_max);
-                    cur_sum += s;
-                    // Use the E4M3 dynamic range for small softmax values;
-                    // the fixed reciprocal is restored in the O epilogue.
-                    sS(h, token_base + i) = e4m3(s * FP8_MAX);
+                for (int i = 0; i < B_TOPK / 2; i += 2) {
+                    const float2 softmax_s = make_float2(
+                        exp2f(p[i + 0] - new_max),
+                        exp2f(p[i + 1] - new_max)
+                    );
+                    cur_sum += softmax_s.x + softmax_s.y;
+                    const float2 s_pair = ku::float2_mul(
+                        softmax_s,
+                        make_float2(kv_scale[i + 0], kv_scale[i + 1])
+                    );
+                    p[i + 0] = s_pair.x;
+                    p[i + 1] = s_pair.y;
+                }
+
+                // Match prefill's FP32x2 quantization path: convert the
+                // scaled softmax values to packed E4M3 bits before writing S.
+                constexpr float inv_current_s_scale = FP8_MAX;
+                const float2 inv_current_s_scale2 = make_float2(
+                    inv_current_s_scale,
+                    inv_current_s_scale
+                );
+                uint32_t s[B_TOPK / 8];
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 2; i += 4) {
+                    const uint16_t s01 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i + 0], p[i + 1]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    const uint16_t s23 = ku::float2_to_e4m3x2_bits(
+                        ku::float2_mul(
+                            make_float2(p[i + 2], p[i + 3]),
+                            inv_current_s_scale2
+                        )
+                    );
+                    s[i / 4] = static_cast<uint32_t>(s01)
+                        | (static_cast<uint32_t>(s23) << 16);
+                }
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 2; i += 16) {
+                    *reinterpret_cast<uint4 *>(&sS(h, token_base + i)) =
+                        make_uint4(
+                            s[i / 4],
+                            s[i / 4 + 1],
+                            s[i / 4 + 2],
+                            s[i / 4 + 3]
+                        );
                 }
                 li = fma(li, scale_for_old, cur_sum);
-
-                if (block_idx != args.start_block_idx && should_scale_o) {
-                    const float2 old_scale = make_float2(
-                        scale_for_old, scale_for_old
-                    );
-                    ku::tcgen05_after_thread_sync();
-                    constexpr int CHUNK_SIZE = 64;
-                    float2 o[CHUNK_SIZE / 2];
-                    CUTE_UNROLL
-                    for (int chunk_idx = 0;
-                         chunk_idx < (D_V / 2) / CHUNK_SIZE;
-                         ++chunk_idx) {
-                        ku::tmem_ld_32dp32bNx<CHUNK_SIZE>(
-                            tmem_cols::O + chunk_idx * CHUNK_SIZE, o
-                        );
-                        cutlass::arch::fence_view_async_tmem_load();
-                        CUTE_UNROLL
-                        for (int i = 0; i < CHUNK_SIZE / 2; ++i) {
-                            o[i] = ku::float2_mul(o[i], old_scale);
-                        }
-                        ku::tmem_st_32dp32bNx<CHUNK_SIZE>(
-                            tmem_cols::O + chunk_idx * CHUNK_SIZE, o
-                        );
-                        cutlass::arch::fence_view_async_tmem_store();
-                    }
-                    ku::tcgen05_before_thread_sync();
-                }
 
                 fence_view_async_shared();
                 plan.bar_so_ready[rs.buf_idx].arrive();
@@ -338,8 +474,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                         ? li + exp2f(attn_sink - mi)
                         : li
                 );
-            const float2 o_scale2 = make_float2(o_scale, o_scale);
-
             if (args.is_no_split) {
                 Tensor tma_gO = flat_divide(
                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(
@@ -362,14 +496,22 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                             tmem_cols::O + c * 128 + k * B_EPI, o
                         );
                         cutlass::arch::fence_view_async_tmem_load();
-                        CUTE_UNROLL
-                        for (int j = 0; j < B_EPI / 2; ++j) {
-                            o[j] = ku::float2_mul(o[j], o_scale2);
-                            o_bf16[j] = __float22bfloat162_rn(o[j]);
-                        }
-
                         const int d_group = c * 4 + k * 2
                             + idx_in_warpgroup / B_H;
+                        const float output_dequant_scale = o_scale
+                            * ue8m0_bits_to_float(
+                                __ldg(params.kv_scale_w + d_group)
+                            );
+                        const float2 output_dequant_scale2 = make_float2(
+                            output_dequant_scale, output_dequant_scale
+                        );
+                        CUTE_UNROLL
+                        for (int j = 0; j < B_EPI / 2; ++j) {
+                            o[j] = ku::float2_mul(
+                                o[j], output_dequant_scale2
+                            );
+                            o_bf16[j] = __float22bfloat162_rn(o[j]);
+                        }
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 8; ++j) {
                             *reinterpret_cast<__int128_t *>(
@@ -412,13 +554,21 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                             tmem_cols::O + c * 128 + k * B_EPI, o
                         );
                         cutlass::arch::fence_view_async_tmem_load();
-                        CUTE_UNROLL
-                        for (int j = 0; j < B_EPI / 2; ++j) {
-                            o[j] = ku::float2_mul(o[j], o_scale2);
-                        }
-
                         const int d_group = c * 4 + k * 2
                             + idx_in_warpgroup / B_H;
+                        const float output_dequant_scale = o_scale
+                            * ue8m0_bits_to_float(
+                                __ldg(params.kv_scale_w + d_group)
+                            );
+                        const float2 output_dequant_scale2 = make_float2(
+                            output_dequant_scale, output_dequant_scale
+                        );
+                        CUTE_UNROLL
+                        for (int j = 0; j < B_EPI / 2; ++j) {
+                            o[j] = ku::float2_mul(
+                                o[j], output_dequant_scale2
+                            );
+                        }
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 4; ++j) {
                             *reinterpret_cast<__int128_t *>(
@@ -452,8 +602,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
         }
     } else if (warpgroup_idx == 1) {
         // Warp 4 remains the Q producer/MMA issuer and warp 7 remains the
-        // index-coordinate producer.  Warps 5 and 6 are deliberately idle.
-        cutlass::arch::warpgroup_reg_dealloc<72>();
+        // index-coordinate producer.  Warps 5 and 6 load the per-token KV
+        // scales in parallel with the gather path.
+        cutlass::arch::warpgroup_reg_dealloc<80>();
         const int local_warp_idx = cutlass::canonical_warp_idx_sync();
 
         if (local_warp_idx == 4 && elect_one_sync()) {
@@ -543,6 +694,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     ku::umma_arrive_noelect(plan.bar_qk_done[rs.buf_idx]);
 
                     plan.bar_so_ready[rs.buf_idx].wait(rs.bar_phase);
+                    plan.bar_o_ready[rs.buf_idx].wait(rs.bar_phase);
                     ku::tcgen05_after_thread_sync();
 
                     Tensor sS = make_tensor(
@@ -577,7 +729,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             // E4M3 operands.
             constexpr int TOKENS_PER_LANE = B_TOPK / 32;
             static_assert(TOKENS_PER_LANE == 4);
-            constexpr int TMA_COORDS_PER_TOKEN = D_K / TMA_K_STRIDE;
+            constexpr int TMA_COORDS_PER_TOKEN = 1;
             static_assert(TMA_COORDS_PER_TOKEN == 1);
             const int tma_coords_per_block = params.stride_kv_block / TMA_K_STRIDE;
             const int extra_tma_coords_per_block =
@@ -678,18 +830,110 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     process_one_block(block_idx, true);
                 }
             });
+        } else if (local_warp_idx == 5 || local_warp_idx == 6) {
+            const int scale_warp_idx = local_warp_idx - 5;
+            constexpr int TOKENS_PER_WARP = B_TOPK / 2;
+            constexpr int TOKENS_PER_LANE = TOKENS_PER_WARP / 32;
+            static_assert(TOKENS_PER_LANE == 2);
+
+            run_main_loop([&](const MainLoopArgs &args) {
+                const int token_base = scale_warp_idx * TOKENS_PER_WARP;
+                int *indices = params.indices
+                    + args.batch_idx * params.stride_indices_b
+                    + s_q_idx * params.stride_indices_s_q;
+                int *extra_indices = params.extra_topk > 0
+                    ? params.extra_indices
+                        + args.batch_idx * params.stride_extra_indices_b
+                        + s_q_idx * params.stride_extra_indices_s_q
+                    : nullptr;
+
+                auto process_one_block = [&](int block_idx, bool is_extra) {
+                    const int local_block_idx = is_extra
+                        ? block_idx - args.num_orig_kv_blocks
+                        : block_idx;
+                    const int current_block_size = is_extra
+                        ? params.extra_page_block_size
+                        : params.page_block_size;
+                    const int current_num_blocks = is_extra
+                        ? params.extra_num_blocks
+                        : params.num_blocks;
+                    const int current_topk_length = is_extra
+                        ? args.extra_topk_length
+                        : args.topk_length;
+                    const int current_stride_block = is_extra
+                        ? params.stride_extra_kv_block
+                        : params.stride_kv_block;
+                    const uint8_t *current_kv = reinterpret_cast<const uint8_t *>(
+                        is_extra ? params.extra_kv : params.kv
+                    );
+                    const int *current_indices = is_extra
+                        ? extra_indices
+                        : indices;
+                    const int block_token_base = local_block_idx * B_TOPK;
+
+                    // Wait until warp 7 has published this index packet and
+                    // until the previous consumer has released this stage.
+                    plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(
+                        rs.index_bar_phase
+                    );
+                    plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase ^ true);
+
+                    CUTE_UNROLL
+                    for (int i = 0; i < TOKENS_PER_LANE; ++i) {
+                        const int row = token_base + i * 32 + lane_idx;
+                        const int abs_pos = block_token_base + row;
+                        const int token_idx = __ldg(current_indices + abs_pos);
+                        const bool valid = token_idx >= 0
+                            && static_cast<int64_t>(token_idx)
+                                < static_cast<int64_t>(current_num_blocks)
+                                    * current_block_size
+                            && abs_pos < current_topk_length;
+                        float scale = 1.0f;
+                        if (valid) {
+                            const int page_idx = token_idx / current_block_size;
+                            const int idx_in_page = token_idx % current_block_size;
+                            const uint8_t *scale_ptr = current_kv
+                                + static_cast<int64_t>(page_idx)
+                                    * current_stride_block
+                                + static_cast<int64_t>(idx_in_page)
+                                    * KV_BYTES_PER_TOKEN
+                                + D_K;
+                            scale = ue8m0_bits_to_float(__ldg(scale_ptr));
+                        }
+                        plan.kv_token_scale[rs.buf_idx][row] = scale;
+                    }
+                    fence_view_async_shared();
+                    if (elect_one_sync()) {
+                        plan.bar_kv_scale_ready[rs.buf_idx].arrive();
+                    }
+                    rs.update();
+                };
+
+                CUTE_NO_UNROLL
+                for (int block_idx = args.start_block_idx;
+                     block_idx < min(args.num_orig_kv_blocks, args.end_block_idx);
+                     ++block_idx) {
+                    process_one_block(block_idx, false);
+                }
+                CUTE_NO_UNROLL
+                for (int block_idx = max(
+                        args.start_block_idx, args.num_orig_kv_blocks
+                    );
+                     block_idx < args.end_block_idx;
+                     ++block_idx) {
+                    process_one_block(block_idx, true);
+                }
+            });
         } else {
-            // Warps 5 and 6 intentionally remain available for a later
-            // scale-aware/cache-prefetch implementation.
             run_main_loop([&](const MainLoopArgs &) {});
         }
-    } else {
+    } else if (warpgroup_idx == 2) {
         // WG2 replaces the old dequant stage.  Thirty-two active threads own
         // four token rows each; every active thread issues the four 128-byte
         // gather4 chunks for its rows.  The other 96 threads only contribute
         // their transaction-barrier arrival, preserving the 128-thread WG2
         // handoff configured above.
-        cutlass::arch::warpgroup_reg_dealloc<72>();
+        cutlass::arch::warpgroup_reg_dealloc<80>();
         constexpr int ROWS_PER_LOADER = 4;
         constexpr int NUM_ACTIVE_LOADERS = B_TOPK / ROWS_PER_LOADER;
         static_assert(NUM_ACTIVE_LOADERS == 32);
@@ -742,6 +986,68 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 rs.update();
             }
         });
+    } else if (warpgroup_idx == 3) {
+        // Match prefill's dedicated O-rescale warpgroup.  Each WG3 warp
+        // follows one WG0 warp's row-max decision and rescales its TMEM rows
+        // before the next SV MMA is allowed to accumulate.
+        cutlass::arch::warpgroup_reg_alloc<152>();
+        const int local_warp_idx = warp_idx - 12;
+        bool o_decision_phase = false;
+        run_main_loop([&](const MainLoopArgs &args) {
+            float previous_max = MAX_INIT_VAL;
+
+            CUTE_NO_UNROLL
+            for (int block_idx = args.start_block_idx;
+                 block_idx < args.end_block_idx;
+                 ++block_idx) {
+                plan.bar_o_rescale_decision_ready.wait(o_decision_phase);
+                fence_view_async_shared();
+
+                const bool warp_needs_o_rescale =
+                    plan.o_rescale_warp_needed[local_warp_idx] != 0;
+                float current_max = previous_max;
+                float o_rescale = 1.0f;
+                if (warp_needs_o_rescale) {
+                    current_max = plan.rowwise_max_buf[
+                        idx_in_warpgroup % B_H
+                    ];
+                    o_rescale = exp2f(previous_max - current_max);
+                }
+                plan.bar_o_rescale_decision_consumed.arrive();
+
+                if (block_idx != args.start_block_idx
+                    && warp_needs_o_rescale) {
+                    const int prev_buf =
+                        (rs.buf_idx + NUM_BUFS - 1) % NUM_BUFS;
+                    const bool prev_phase = rs.buf_idx == 0
+                        ? rs.bar_phase ^ true
+                        : rs.bar_phase;
+                    plan.bar_sv_done[prev_buf].wait(prev_phase);
+
+                    ku::tcgen05_after_thread_sync();
+                    CUTE_UNROLL
+                    for (int dv_block = 0;
+                         dv_block < D_V / SV_M;
+                         ++dv_block) {
+                        rescale_o_tmem_stripe(
+                            o_rescale,
+                            tmem_cols::O + dv_block * (SV_M / 2)
+                        );
+                    }
+                    ku::tcgen05_before_thread_sync();
+                }
+
+                previous_max = current_max;
+                plan.bar_o_ready[rs.buf_idx].arrive();
+                o_decision_phase ^= true;
+                if (block_idx != args.end_block_idx - 1) {
+                    rs.update();
+                }
+            }
+            // WG0 advances once more after waiting for the final SV tile;
+            // keep WG3's ring state aligned for the next scheduled batch.
+            rs.update();
+        });
     }
 #else
     if (cute::thread0()) {
@@ -763,9 +1069,14 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
-    KU_ASSERT(params.stride_kv_row == D_K,
+    KU_ASSERT(params.kv_scale_w != nullptr);
+    KU_ASSERT(reinterpret_cast<uintptr_t>(params.kv_scale_w) % 8 == 0,
+        "kv_scale_w must be 8-byte aligned");
+    KU_ASSERT(params.stride_q_h_q == D_Q,
+        "FP8 Q head stride must equal the FP8 data width");
+    KU_ASSERT(params.stride_kv_row == KV_BYTES_PER_TOKEN,
         "FP8 KV rows must be contiguous (%d bytes), got %d",
-        D_K, params.stride_kv_row);
+        KV_BYTES_PER_TOKEN, params.stride_kv_row);
     KU_ASSERT(params.stride_kv_block % TMA_K_STRIDE == 0,
         "stride_kv_block (%d) must be a multiple of %d",
         params.stride_kv_block, TMA_K_STRIDE);
@@ -776,9 +1087,9 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(
     if (params.extra_topk > 0) {
         KU_ASSERT(params.extra_kv != nullptr);
         KU_ASSERT(params.extra_indices != nullptr);
-        KU_ASSERT(params.stride_extra_kv_row == D_K,
+        KU_ASSERT(params.stride_extra_kv_row == KV_BYTES_PER_TOKEN,
             "extra KV rows must be contiguous (%d bytes), got %d",
-            D_K, params.stride_extra_kv_row);
+            KV_BYTES_PER_TOKEN, params.stride_extra_kv_row);
         KU_ASSERT(params.stride_extra_kv_block % TMA_K_STRIDE == 0,
             "stride_extra_kv_block (%d) must be a multiple of %d",
             params.stride_extra_kv_block, TMA_K_STRIDE);

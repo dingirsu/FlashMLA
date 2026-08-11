@@ -110,8 +110,11 @@ struct SparseAttnFp8DecodeParams {
     int num_blocks, page_block_size, topk;
     ModelType model_type;
 
-    void* __restrict__ q;   // [b, s_q, h_q, d_qk]
-    void* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]
+    // Q token layout: [h_q * d_qk FP8 values][h_q UE8M0 head scales].
+    // KV token layout: [d_qk FP8 values][one UE8M0 token scale][padding].
+    void* __restrict__ q;   // [b, s_q, h_q * d_qk + h_q]
+    void* __restrict__ kv;  // [num_blocks, page_block_size, d_qk + 16]
+    uint8_t* __restrict__ kv_scale_w; // [d_v / 64] UE8M0 dimension scales
     int* __restrict__ indices;   // [b, s_q, topk]
     int* __restrict__ topk_length;  // [b], may be nullptr
     float* __restrict__ attn_sink;  // [h_q], may be nullptr

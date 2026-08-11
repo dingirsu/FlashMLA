@@ -33,7 +33,11 @@ static constexpr int D = 512;
 static constexpr int D_Q = D;
 static constexpr int D_K = D;
 static constexpr int D_V = D;
-static constexpr int TMA_K_STRIDE = D_K;
+static constexpr int KV_SCALE_SLOT_BYTES = 16;
+static constexpr int KV_BYTES_PER_TOKEN = D_K + KV_SCALE_SLOT_BYTES;
+// TMA loads only the first 512B of each 528B KV row.  The second tensor
+// coordinate advances by the complete physical row stride.
+static constexpr int TMA_K_STRIDE = KV_BYTES_PER_TOKEN;
 static constexpr int TMA_K_CHUNK_BYTES = 128;
 static constexpr int TMA_K_CHUNK_ELEMS = TMA_K_CHUNK_BYTES / sizeof(uint64_t);
 
@@ -43,7 +47,9 @@ static constexpr int SV_M = 128;
 static constexpr int NUM_MAIN_BUFS = 3;
 static constexpr int NUM_BUFS = NUM_MAIN_BUFS;
 static constexpr int NUM_INDEX_BUFS = NUM_MAIN_BUFS;
-static constexpr int NUM_THREADS = 3 * 128;
+// WG0: online softmax/S quant and epilogue, WG1: QK/SV and index/scale
+// producers, WG2: KV gather, WG3: O rescale.
+static constexpr int NUM_THREADS = 4 * 128;
 static constexpr int KV_SCALE_GROUPS = D_V / 64;
 static constexpr float MAX_INIT_VAL = -1e30f;
 static constexpr float FP8_MAX = 448.0f;
@@ -130,22 +136,26 @@ struct SharedMemoryPlan {
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK / 8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
 
-    // Reserved for the scaled-FP8 follow-up.  The raw E4M3 first version uses
-    // unit scales and therefore leaves these arrays untouched.
+    // Warp 5/6 publish one UE8M0 token scale for every gathered KV row.
     float kv_token_scale[NUM_MAIN_BUFS][B_TOPK];
-    float q_head_scale[B_H];
-    float kv_dim_scale[KV_SCALE_GROUPS];
 
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma;
     transac_bar_t bar_q_utccp;
     transac_bar_t bar_kv_ready[NUM_BUFS];
+    transac_bar_t bar_kv_scale_ready[NUM_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS];
     transac_bar_t bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS];
     transac_bar_t bar_so_ready[NUM_BUFS];
     transac_bar_t bar_sv_done[NUM_BUFS];
+    // WG0 publishes each online-softmax max decision to WG3.  WG3 returns a
+    // per-stage handoff only after the prior O tile has been rescaled.
+    transac_bar_t bar_o_rescale_decision_ready;
+    transac_bar_t bar_o_rescale_decision_consumed;
+    transac_bar_t bar_o_ready[NUM_BUFS];
+    uint32_t o_rescale_warp_needed[4];
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

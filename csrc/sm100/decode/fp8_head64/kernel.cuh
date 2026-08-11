@@ -76,8 +76,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             plan.bar_q_utccp.init(1);
             CUTE_UNROLL
             for (int i = 0; i < NUM_BUFS; ++i) {
-                // WG2 contributes one arrival per thread: 32 threads issue
-                // gathers and the remaining threads complete the arrival set.
+                // WG2 contributes one arrival per thread; all 128 threads
+                // issue one gather4 transaction for this KV stage.
                 plan.bar_kv_ready[i].init(128);
                 // Warp 5 and warp 6 each publish one half of the token-scale
                 // tile for the corresponding KV stage.
@@ -87,8 +87,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 plan.bar_sv_done[i].init(1);
                 plan.bar_o_ready[i].init(128);
             }
-            plan.bar_o_rescale_decision_ready.init(128);
-            plan.bar_o_rescale_decision_consumed.init(128);
             CUTE_UNROLL
             for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
                 // Warp 7 produces one four-index packet per lane.  WG0 and
@@ -199,9 +197,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
     RingState rs;
 
     if (warpgroup_idx == 0) {
-        // WG0 owns online softmax, S quantization, and the output epilogue;
-        // WG3 performs O rescaling after each max decision.
-        cutlass::arch::warpgroup_reg_alloc<200>();
+        // WG0 owns online softmax, S quantization, O rescaling, and the
+        // output epilogue.
+        cutlass::arch::warpgroup_reg_alloc<256>();
 
         constexpr int B_EPI = 64;
         Tensor sO = make_tensor(
@@ -218,11 +216,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             ? -CUDART_INF_F
             : __ldg(params.attn_sink + idx_in_warpgroup % B_H) * CUDART_L2E_F;
 
-        // These phases span callbacks when the scheduler assigns multiple
-        // requests to one CTA.  Reset only the per-request online-softmax
-        // state inside the callback; keep the mbarrier phase across requests.
-        bool o_decision_phase = false;
-        bool have_previous_o_decision = false;
         run_main_loop([&](const MainLoopArgs &args) {
             cute::tma_store_wait<0>();
             plan.bar_last_store_done.arrive();
@@ -341,12 +334,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 );
                 real_mi = max(real_mi, cur_pi_max);
 
-                if (have_previous_o_decision) {
-                    plan.bar_o_rescale_decision_consumed.wait(
-                        o_decision_phase ^ true
-                    );
-                }
-
                 const bool should_scale_o = __any_sync(
                     0xffffffff, cur_pi_max - mi > 6.0f
                 );
@@ -357,18 +344,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     ? exp2f(mi - new_max)
                     : 1.0f;
                 mi = new_max;
-
-                if (lane_idx == 0) {
-                    plan.o_rescale_warp_needed[warp_idx] =
-                        static_cast<uint32_t>(should_scale_o);
-                }
-                if (should_scale_o && idx_in_warpgroup < B_H) {
-                    plan.rowwise_max_buf[idx_in_warpgroup] = new_max;
-                }
-                fence_view_async_shared();
-                plan.bar_o_rescale_decision_ready.arrive();
-                have_previous_o_decision = true;
-                o_decision_phase ^= true;
 
                 float cur_sum = 0.0f;
                 CUTE_UNROLL
@@ -425,6 +400,31 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
 
                 fence_view_async_shared();
                 plan.bar_so_ready[rs.buf_idx].arrive();
+
+                // Rescale the accumulated O tile before WG1 issues this
+                // stage's SV MMA.  The branch is warp-uniform, matching the
+                // former WG3 path, while scale_for_old remains rowwise.
+                if (block_idx != args.start_block_idx && should_scale_o) {
+                    const int prev_buf =
+                        (rs.buf_idx + NUM_BUFS - 1) % NUM_BUFS;
+                    const bool prev_phase = rs.buf_idx == 0
+                        ? rs.bar_phase ^ true
+                        : rs.bar_phase;
+                    plan.bar_sv_done[prev_buf].wait(prev_phase);
+
+                    ku::tcgen05_after_thread_sync();
+                    CUTE_UNROLL
+                    for (int dv_block = 0;
+                         dv_block < D_V / SV_M;
+                         ++dv_block) {
+                        rescale_o_tmem_stripe(
+                            scale_for_old,
+                            tmem_cols::O + dv_block * (SV_M / 2)
+                        );
+                    }
+                    ku::tcgen05_before_thread_sync();
+                }
+                plan.bar_o_ready[rs.buf_idx].arrive();
 
                 if (block_idx != args.end_block_idx - 1) {
                     rs.update();
@@ -984,68 +984,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 rs.update();
             }
-        });
-    } else if (warpgroup_idx == 3) {
-        // Match prefill's dedicated O-rescale warpgroup.  Each WG3 warp
-        // follows one WG0 warp's row-max decision and rescales its TMEM rows
-        // before the next SV MMA is allowed to accumulate.
-        cutlass::arch::warpgroup_reg_alloc<152>();
-        const int local_warp_idx = warp_idx - 12;
-        bool o_decision_phase = false;
-        run_main_loop([&](const MainLoopArgs &args) {
-            float previous_max = MAX_INIT_VAL;
-
-            CUTE_NO_UNROLL
-            for (int block_idx = args.start_block_idx;
-                 block_idx < args.end_block_idx;
-                 ++block_idx) {
-                plan.bar_o_rescale_decision_ready.wait(o_decision_phase);
-                fence_view_async_shared();
-
-                const bool warp_needs_o_rescale =
-                    plan.o_rescale_warp_needed[local_warp_idx] != 0;
-                float current_max = previous_max;
-                float o_rescale = 1.0f;
-                if (warp_needs_o_rescale) {
-                    current_max = plan.rowwise_max_buf[
-                        idx_in_warpgroup % B_H
-                    ];
-                    o_rescale = exp2f(previous_max - current_max);
-                }
-                plan.bar_o_rescale_decision_consumed.arrive();
-
-                if (block_idx != args.start_block_idx
-                    && warp_needs_o_rescale) {
-                    const int prev_buf =
-                        (rs.buf_idx + NUM_BUFS - 1) % NUM_BUFS;
-                    const bool prev_phase = rs.buf_idx == 0
-                        ? rs.bar_phase ^ true
-                        : rs.bar_phase;
-                    plan.bar_sv_done[prev_buf].wait(prev_phase);
-
-                    ku::tcgen05_after_thread_sync();
-                    CUTE_UNROLL
-                    for (int dv_block = 0;
-                         dv_block < D_V / SV_M;
-                         ++dv_block) {
-                        rescale_o_tmem_stripe(
-                            o_rescale,
-                            tmem_cols::O + dv_block * (SV_M / 2)
-                        );
-                    }
-                    ku::tcgen05_before_thread_sync();
-                }
-
-                previous_max = current_max;
-                plan.bar_o_ready[rs.buf_idx].arrive();
-                o_decision_phase ^= true;
-                if (block_idx != args.end_block_idx - 1) {
-                    rs.update();
-                }
-            }
-            // WG0 advances once more after waiting for the final SV tile;
-            // keep WG3's ring state aligned for the next scheduled batch.
-            rs.update();
         });
     }
 #else

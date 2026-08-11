@@ -47,9 +47,9 @@ static constexpr int SV_M = 128;
 static constexpr int NUM_MAIN_BUFS = 3;
 static constexpr int NUM_BUFS = NUM_MAIN_BUFS;
 static constexpr int NUM_INDEX_BUFS = NUM_MAIN_BUFS;
-// WG0: online softmax/S quant and epilogue, WG1: QK/SV and index/scale
-// producers, WG2: KV gather, WG3: O rescale.
-static constexpr int NUM_THREADS = 4 * 128;
+// WG0: online softmax/S quant, O rescale, and epilogue; WG1: QK/SV and
+// index/scale producers; WG2: KV gather.
+static constexpr int NUM_THREADS = 3 * 128;
 static constexpr int KV_SCALE_GROUPS = D_V / 64;
 static constexpr float MAX_INIT_VAL = -1e30f;
 static constexpr float FP8_MAX = 448.0f;
@@ -150,12 +150,8 @@ struct SharedMemoryPlan {
     transac_bar_t bar_qk_done[NUM_BUFS];
     transac_bar_t bar_so_ready[NUM_BUFS];
     transac_bar_t bar_sv_done[NUM_BUFS];
-    // WG0 publishes each online-softmax max decision to WG3.  WG3 returns a
-    // per-stage handoff only after the prior O tile has been rescaled.
-    transac_bar_t bar_o_rescale_decision_ready;
-    transac_bar_t bar_o_rescale_decision_consumed;
+    // WG0 publishes a stage only after any required O rescale is complete.
     transac_bar_t bar_o_ready[NUM_BUFS];
-    uint32_t o_rescale_warp_needed[4];
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

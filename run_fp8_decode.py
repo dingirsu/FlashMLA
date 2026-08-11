@@ -17,7 +17,7 @@ import fp8_test_ext as ext  # noqa: E402
 
 
 BATCH = 64
-S_Q = 1
+S_Q = 4
 S_KV = 32768
 TOPK = 512
 PAGE_SIZE = 64

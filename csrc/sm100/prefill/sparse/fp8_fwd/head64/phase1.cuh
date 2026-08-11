@@ -165,9 +165,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             for (int i = 0; i < NUM_S_BUFS; ++i) {
                 plan.bar_s_ready[i].init(128);
             }
-            plan.bar_new_max_ready.init(128);
-            plan.bar_new_max_consumed.init(128);
-            plan.bar_o_ready.init(128);
+            plan.bar_o_rescale_decision_ready.init(128);
+            plan.bar_o_rescale_decision_consumed.init(128);
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
+                plan.bar_o_ready[i].init(128);
+            }
             fence_barrier_init();
         }
 
@@ -308,7 +311,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
 
             if (k > 0) {
-                plan.bar_new_max_consumed.wait((k - 1) & 1);
+                plan.bar_o_rescale_decision_consumed.wait((k - 1) & 1);
             }
             plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
             NamedBarrier::arrive_and_wait(
@@ -331,11 +334,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 scale_for_old = exp2f(mi - new_max);
             }
             mi = new_max;   // mi is still identical within each row
-            if (idx_in_warpgroup < B_H) {
+            if (lane_idx == 0) {
+                plan.o_rescale_warp_needed[warp_idx] =
+                    static_cast<uint32_t>(should_scale_o);
+            }
+            if (should_scale_o && idx_in_warpgroup < B_H) {
                 plan.rowwise_max_buf[idx_in_warpgroup] = new_max;
             }
             fence_view_async_shared();
-            plan.bar_new_max_ready.arrive();
+            plan.bar_o_rescale_decision_ready.arrive();
 
             // Absorb the token factor into S, then quantize each head row.
             uint32_t s[NUM_ELEMS_PER_THREAD / 4];
@@ -719,57 +726,42 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
     CUTE_NO_UNROLL
     for (int k = 0; k < num_k_blocks; ++k) {
-        plan.bar_new_max_ready.wait(k & 1);
+        plan.bar_o_rescale_decision_ready.wait(k & 1);
         fence_view_async_shared();
 
-        const float current_max =
-            plan.rowwise_max_buf[idx_in_warpgroup % B_H];
-        const float o_rescale = exp2f(previous_max - current_max);
-        const bool warp_needs_o_rescale = __any_sync(
-            0xffffffff, o_rescale != 1.0f
-        );
-        plan.bar_new_max_consumed.arrive();
+        const bool warp_needs_o_rescale =
+            plan.o_rescale_warp_needed[local_warp_idx] != 0;
+        float current_max = previous_max;
+        float o_rescale = 1.0f;
+        if (warp_needs_o_rescale) {
+            current_max = plan.rowwise_max_buf[
+                idx_in_warpgroup % B_H
+            ];
+            o_rescale = exp2f(previous_max - current_max);
+        }
+        plan.bar_o_rescale_decision_consumed.arrive();
 
-        if (k > 0) {
+        if (k > 0 && warp_needs_o_rescale) {
             const int prev_buf = (k - 1) % NUM_MAIN_BUFS;
             const int prev_phase = ((k - 1) / NUM_MAIN_BUFS) & 1;
             plan.bar_sv_done[prev_buf].wait(prev_phase);
 
-            if (lane_idx == 0) {
-                plan.o_rescale_warp_needed[local_warp_idx] =
-                    static_cast<uint32_t>(warp_needs_o_rescale);
-            }
-            fence_view_async_shared();
-            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg3_sync);
-
-            const bool wg3_needs_o_rescale =
-                plan.o_rescale_warp_needed[0]
-                || plan.o_rescale_warp_needed[1]
-                || plan.o_rescale_warp_needed[2]
-                || plan.o_rescale_warp_needed[3];
-            if (warp_needs_o_rescale) {
-                ku::tcgen05_after_thread_sync();
-                CUTE_UNROLL
-                for (int dv_block = 0;
-                     dv_block < NUM_SV_TMEM_BLOCKS;
-                     ++dv_block) {
-                    rescale_o_tmem_stripe(
-                        o_rescale,
-                        tmem_cols::O
-                            + dv_block * SV_TMEM_COLS_PER_BLOCK
-                    );
-                }
-                ku::tcgen05_before_thread_sync();
-            }
-            if (wg3_needs_o_rescale) {
-                NamedBarrier::arrive_and_wait(
-                    128, NamedBarriers::wg3_sync
+            ku::tcgen05_after_thread_sync();
+            CUTE_UNROLL
+            for (int dv_block = 0;
+                 dv_block < NUM_SV_TMEM_BLOCKS;
+                 ++dv_block) {
+                rescale_o_tmem_stripe(
+                    o_rescale,
+                    tmem_cols::O
+                        + dv_block * SV_TMEM_COLS_PER_BLOCK
                 );
             }
+            ku::tcgen05_before_thread_sync();
         }
 
         previous_max = current_max;
-        plan.bar_o_ready.arrive();
+        plan.bar_o_ready[k % NUM_MAIN_BUFS].arrive();
     }
 } else {
     cutlass::arch::warpgroup_reg_dealloc<80>();
@@ -905,7 +897,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     plan.bar_s_ready[(k - 1) % NUM_S_BUFS].wait(
                         ((k - 1) / NUM_S_BUFS) & 1
                     );
-                    plan.bar_o_ready.wait((k - 1) & 1);
+                    plan.bar_o_ready[cur_buf].wait(
+                        ((k - 1) / NUM_MAIN_BUFS) & 1
+                    );
                     ku::tcgen05_after_thread_sync();
 
                     Tensor sV_divided = flat_divide(

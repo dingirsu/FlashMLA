@@ -205,12 +205,14 @@ struct SharedMemoryPlanT {
     transac_bar_t bar_kv_tail_ready[NUM_QK_TAIL_BUFS];
     transac_bar_t bar_kv_scale_ready[NUM_MAIN_BUFS];
     transac_bar_t bar_p_free[NUM_P_BUFS];
-    // WG0 publishes S and new_max independently. WG3 consumes new_max,
-    // rescales O when needed, then lets the SV consumer proceed. new_max
-    // reuses rowwise_max_buf[0:B_H]; the consumed handoff prevents WG0's
-    // next row-max reduction from overwriting it early.
+    // WG0 publishes S and its per-warp O-rescale decision independently.
+    // Only warps that need a rescale publish new_max in
+    // rowwise_max_buf[0:B_H]. The consumed handoff prevents WG0's next
+    // row-max reduction from overwriting the decision or max too early.
     transac_bar_t bar_s_ready[NUM_S_BUFS];
-    transac_bar_t bar_new_max_ready, bar_new_max_consumed, bar_o_ready;
+    transac_bar_t bar_o_rescale_decision_ready;
+    transac_bar_t bar_o_rescale_decision_consumed;
+    transac_bar_t bar_o_ready[NUM_MAIN_BUFS];
     uint32_t o_rescale_warp_needed[4];
     array_aligned<uint32_t, 1> tmem_start_addr;
     float rowwise_max_buf[128], rowwise_li_buf[128];
@@ -230,7 +232,6 @@ enum NamedBarriers : int {
     wg0_warp02_sync = 1,
     wg0_warp13_sync = 2,
     pepi_sync = 3,
-    wg3_sync = 4,
 };
 
 using SharedMemoryPlan = SharedMemoryPlanT<false>;

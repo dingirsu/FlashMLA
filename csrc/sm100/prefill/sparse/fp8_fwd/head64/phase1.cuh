@@ -19,204 +19,8 @@ namespace sm100::fp8_fwd::head64 {
 
 using namespace cute;
 
-#if defined(FP8_FWD_BARRIER_TIMING)
-CUTE_DEVICE
-uint64_t fp8_timing_now_ns() {
-    uint64_t timestamp;
-    asm volatile(
-        "mov.u64 %0, %%globaltimer;"
-        : "=l"(timestamp)
-        :
-        : "memory"
-    );
-    return timestamp;
-}
-
-#define FP8_TIMED_WAIT(sample, destination, wait_expression)                    \
-    do {                                                                        \
-        uint64_t fp8_wait_begin_ns = 0;                                          \
-        if (sample) {                                                           \
-            fp8_wait_begin_ns = fp8_timing_now_ns();                            \
-        }                                                                       \
-        wait_expression;                                                        \
-        if (sample) {                                                           \
-            destination = fp8_timing_now_ns() - fp8_wait_begin_ns;              \
-        }                                                                       \
-    } while (0)
-#define FP8_TIMEPOINT(sample, destination)                                      \
-    do {                                                                        \
-        if (sample) {                                                           \
-            destination = fp8_timing_now_ns()                                   \
-                - plan.barrier_timing.origin_ns;                                \
-        }                                                                       \
-    } while (0)
-
-template<bool HAVE_QK_TAIL>
-CUTE_DEVICE
-void print_fp8_barrier_timing(
-    const SharedMemoryPlanT<HAVE_QK_TAIL>& plan,
-    int num_k_blocks
-) {
-    const auto& timing = plan.barrier_timing;
-    const int traced_tiles = min(num_k_blocks, FP8_TIMING_MAX_TILES);
-    cute::print(
-        "FP8_TIME header unit=ns tiles=%d traced=%d origin=%llu\n",
-        num_k_blocks,
-        traced_tiles,
-        static_cast<unsigned long long>(timing.origin_ns)
-    );
-    CUTE_UNROLL
-    for (int warp = 0; warp < 12; ++warp) {
-        cute::print(
-            "FP8_TIME branch warp=%d end=%llu\n",
-            warp,
-            static_cast<unsigned long long>(timing.branch_end_ns[warp])
-        );
-    }
-    CUTE_UNROLL
-    for (int warp = 0; warp < 4; ++warp) {
-        cute::print(
-            "FP8_TIME wg0_init warp=%d qw_wait=%llu final_sv_wait=%llu "
-            "final_sv_ready=%llu\n",
-            warp,
-            static_cast<unsigned long long>(timing.qw_scale_wait_ns[warp]),
-            static_cast<unsigned long long>(timing.final_sv_wait_ns[warp]),
-            static_cast<unsigned long long>(timing.final_sv_ready_ns[warp])
-        );
-    }
-    cute::print(
-        "FP8_TIME q_pipeline tma_wait=%llu tmem_commit=%llu\n",
-        static_cast<unsigned long long>(timing.q_tma_wait_ns),
-        static_cast<unsigned long long>(timing.q_tmem_committed_ns)
-    );
-    CUTE_UNROLL
-    for (int warp = 0; warp < 2; ++warp) {
-        cute::print(
-            "FP8_TIME scale_init warp=%d arrived=%llu\n",
-            warp + 10,
-            static_cast<unsigned long long>(timing.qw_scale_arrived_ns[warp])
-        );
-    }
-    for (int tile = 0; tile < traced_tiles; ++tile) {
-        CUTE_UNROLL
-        for (int warp = 0; warp < 4; ++warp) {
-            const auto& value = timing.wg0[warp][tile];
-            cute::print(
-                "FP8_TIME wg0 warp=%d tile=%d start=%llu pair_wait=%llu "
-                "qk_wait=%llu scale_mask_wait=%llu rowmax_wait=%llu "
-                "smax_wait=%llu waits_done=%llu p_released=%llu "
-                "p_scaled=%llu rowmax_ready=%llu softmax_exp_ready=%llu "
-                "softmax_ready=%llu sv_wait=%llu s_stored=%llu "
-                "o_rescaled=%llu s_arrived=%llu\n",
-                warp,
-                tile,
-                static_cast<unsigned long long>(value.tile_start_ns),
-                static_cast<unsigned long long>(value.pair_wait_ns),
-                static_cast<unsigned long long>(value.qk_wait_ns),
-                static_cast<unsigned long long>(value.scale_wait_ns),
-                static_cast<unsigned long long>(value.rowmax_wait_ns),
-                static_cast<unsigned long long>(value.smax_wait_ns),
-                static_cast<unsigned long long>(value.waits_done_ns),
-                static_cast<unsigned long long>(value.p_released_ns),
-                static_cast<unsigned long long>(value.p_scaled_ns),
-                static_cast<unsigned long long>(value.rowmax_ready_ns),
-                static_cast<unsigned long long>(value.softmax_exp_ready_ns),
-                static_cast<unsigned long long>(value.softmax_ready_ns),
-                static_cast<unsigned long long>(value.sv_wait_ns),
-                static_cast<unsigned long long>(value.s_stored_ns),
-                static_cast<unsigned long long>(value.o_rescaled_ns),
-                static_cast<unsigned long long>(value.s_arrived_ns)
-            );
-        }
-        CUTE_UNROLL
-        for (int warp = 0; warp < 4; ++warp) {
-            CUTE_UNROLL
-            for (int stripe = 0; stripe < NUM_SV_TMEM_BLOCKS; ++stripe) {
-                const auto& value = timing.o_rescale[warp][tile][stripe];
-                cute::print(
-                    "FP8_TIME rescale warp=%d tile=%d stripe=%d active=%llu "
-                    "start=%llu sv_wait=%llu sv_ready=%llu tmem_load=%llu "
-                    "fp32_mul=%llu tmem_store=%llu wg0_sync=%llu\n",
-                    warp,
-                    tile,
-                    stripe,
-                    static_cast<unsigned long long>(value.warp_rescale_active),
-                    static_cast<unsigned long long>(value.stripe_start_ns),
-                    static_cast<unsigned long long>(value.sv_wait_ns),
-                    static_cast<unsigned long long>(value.sv_ready_ns),
-                    static_cast<unsigned long long>(value.tmem_load_done_ns),
-                    static_cast<unsigned long long>(value.fp32_mul_done_ns),
-                    static_cast<unsigned long long>(value.tmem_store_done_ns),
-                    static_cast<unsigned long long>(value.wg0_sync_done_ns)
-                );
-            }
-        }
-        CUTE_UNROLL
-        for (int warp = 0; warp < 4; ++warp) {
-            const auto& value = timing.kv[warp][tile];
-            cute::print(
-                "FP8_TIME kv warp=%d tile=%d start=%llu indices_ready=%llu "
-                "q_reuse_wait=%llu sv_free_wait=%llu tma0_issued=%llu "
-                "tma1_issued=%llu\n",
-                warp + 4,
-                tile,
-                static_cast<unsigned long long>(value.tile_start_ns),
-                static_cast<unsigned long long>(value.indices_ready_ns),
-                static_cast<unsigned long long>(value.q_reuse_wait_ns),
-                static_cast<unsigned long long>(value.sv_free_wait_ns),
-                static_cast<unsigned long long>(value.tma_part0_issued_ns),
-                static_cast<unsigned long long>(value.tma_part1_issued_ns)
-            );
-        }
-        CUTE_UNROLL
-        for (int warp = 0; warp < 2; ++warp) {
-            const auto& scale = timing.scale[warp][tile];
-            cute::print(
-                "FP8_TIME scale_mask warp=%d tile=%d start=%llu free_wait=%llu "
-                "arrived=%llu\n",
-                warp + 10,
-                tile,
-                static_cast<unsigned long long>(scale.tile_start_ns),
-                static_cast<unsigned long long>(scale.buffer_free_wait_ns),
-                static_cast<unsigned long long>(scale.arrived_ns)
-            );
-        }
-    }
-    for (int iter = 0; iter <= traced_tiles; ++iter) {
-        const auto& value = timing.mma[iter];
-        cute::print(
-            "FP8_TIME mma warp=8 iter=%d start=%llu p_free_wait=%llu "
-            "q_copy_wait=%llu kv0_wait=%llu kv0_ready=%llu qk0_issued=%llu "
-            "kv1_wait=%llu kv1_ready=%llu qk1_issued=%llu qk_committed=%llu "
-            "s_ready_wait=%llu s_ready=%llu sv_committed=%llu\n",
-            iter,
-            static_cast<unsigned long long>(value.iter_start_ns),
-            static_cast<unsigned long long>(value.p_free_wait_ns),
-            static_cast<unsigned long long>(value.q_copy_wait_ns),
-            static_cast<unsigned long long>(value.kv_wait_ns[0]),
-            static_cast<unsigned long long>(value.kv_ready_ns[0]),
-            static_cast<unsigned long long>(value.qk_issued_ns[0]),
-            static_cast<unsigned long long>(value.kv_wait_ns[1]),
-            static_cast<unsigned long long>(value.kv_ready_ns[1]),
-            static_cast<unsigned long long>(value.qk_issued_ns[1]),
-            static_cast<unsigned long long>(value.qk_committed_ns),
-            static_cast<unsigned long long>(value.s_ready_wait_ns),
-            static_cast<unsigned long long>(value.s_ready_ns),
-            static_cast<unsigned long long>(value.sv_committed_ns)
-        );
-    }
-}
-#else
-#define FP8_TIMED_WAIT(sample, destination, wait_expression)                    \
-    do {                                                                        \
-        wait_expression;                                                        \
-    } while (0)
-#define FP8_TIMEPOINT(sample, destination) do { } while (0)
-#endif
-
 CUTE_DEVICE
 float ue8m0_bits_to_float(uint8_t bits) {
-    TRAP_ONLY_DEVICE_ASSERT(bits != 0xff);
     if (bits == 0) {
         return __uint_as_float(0x00400000u);
     }
@@ -227,57 +31,18 @@ CUTE_DEVICE
 void rescale_o_tmem_stripe(
     float scale,
     uint32_t tmem_col
-#if defined(FP8_FWD_BARRIER_TIMING)
-    , uint64_t timing_origin_ns,
-    Fp8ORescaleStripeTiming* stripe_timing
-#endif
 ) {
-#if !defined(FP8_BENCH_O_RESCALE_SKIP_TMEM) \
-    || !defined(FP8_BENCH_O_RESCALE_SKIP_MUL)
     float2 o[SV_TMEM_COLS_PER_BLOCK / 2];
     const float2 scale2 = make_float2(scale, scale);
-#endif
 
-#if defined(FP8_BENCH_O_RESCALE_SKIP_TMEM)
-#if !defined(FP8_BENCH_O_RESCALE_SKIP_MUL)
-    // Keep the FP32x2 instruction stream when measuring TMEM load/store cost.
-    CUTE_UNROLL
-    for (int i = 0; i < SV_TMEM_COLS_PER_BLOCK / 2; ++i) {
-        o[i] = scale2;
-    }
-#endif
-#else
     ku::tmem_ld_32dp32bNx<SV_TMEM_COLS_PER_BLOCK>(tmem_col, o);
     cutlass::arch::fence_view_async_tmem_load();
-#endif
-#if defined(FP8_FWD_BARRIER_TIMING)
-    if (stripe_timing != nullptr) {
-        stripe_timing->tmem_load_done_ns = fp8_timing_now_ns()
-            - timing_origin_ns;
-    }
-#endif
-#if !defined(FP8_BENCH_O_RESCALE_SKIP_MUL)
     CUTE_UNROLL
     for (int i = 0; i < SV_TMEM_COLS_PER_BLOCK / 2; ++i) {
         o[i] = ku::float2_mul(o[i], scale2);
     }
-#endif
-#if defined(FP8_FWD_BARRIER_TIMING)
-    if (stripe_timing != nullptr) {
-        stripe_timing->fp32_mul_done_ns = fp8_timing_now_ns()
-            - timing_origin_ns;
-    }
-#endif
-#if !defined(FP8_BENCH_O_RESCALE_SKIP_TMEM)
     ku::tmem_st_32dp32bNx<SV_TMEM_COLS_PER_BLOCK>(tmem_col, o);
     cutlass::arch::fence_view_async_tmem_store();
-#endif
-#if defined(FP8_FWD_BARRIER_TIMING)
-    if (stripe_timing != nullptr) {
-        stripe_timing->tmem_store_done_ns = fp8_timing_now_ns()
-            - timing_origin_ns;
-    }
-#endif
 }
 
 template<bool HAVE_QK_TAIL, typename TmaParams>
@@ -375,6 +140,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 #endif
             CUTE_UNROLL
             for (int i = 0; i < NUM_MAIN_BUFS; ++i) {
+                CUTE_UNROLL
+                for (int dv_block = 0;
+                     dv_block < NUM_SV_TMEM_BLOCKS - 1;
+                     ++dv_block) {
+                    plan.bar_sv_block_done[i][dv_block].init(1);
+                }
                 plan.bar_sv_done[i].init(1);
                 plan.bar_kv_ready[i].init(NUM_KV_PRODUCER_WARPS);
                 plan.bar_kv_scale_ready[i].init(2);
@@ -402,41 +173,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
         // Initialize TMEM
         cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
-        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
 
     __syncthreads();
-#if defined(FP8_FWD_BARRIER_TIMING)
-    if (s_q_idx == 0) {
-        static_assert(sizeof(Fp8BarrierTiming) % sizeof(uint64_t) == 0);
-        uint64_t* timing_words = reinterpret_cast<uint64_t*>(
-            &plan.barrier_timing
-        );
-        CUTE_UNROLL
-        for (
-            int i = threadIdx.x;
-            i < sizeof(Fp8BarrierTiming) / sizeof(uint64_t);
-            i += NUM_THREADS
-        ) {
-            timing_words[i] = 0;
-        }
-    }
-    __syncthreads();
-    if (s_q_idx == 0 && threadIdx.x == 0) {
-        plan.barrier_timing.origin_ns = fp8_timing_now_ns();
-    }
-    __syncthreads();
-#endif
 
     if (warpgroup_idx == 0) {
         cutlass::arch::warpgroup_reg_alloc<232>();
 #if !defined(FP8_FWD_QK576)
-        FP8_TIMED_WAIT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.qw_scale_wait_ns[warp_idx],
-            plan.bar_qw_scale_ready.wait(0)
-        );
+        plan.bar_qw_scale_ready.wait(0);
 #endif
 
         float mi = MAX_INIT_VAL;
@@ -467,14 +212,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
-#if defined(FP8_FWD_BARRIER_TIMING)
-            const bool trace_wg0_tile = s_q_idx == 0
-                && lane_idx == 0 && k < FP8_TIMING_MAX_TILES;
-#endif
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].tile_start_ns
-            );
             const int cur_buf = k % NUM_MAIN_BUFS;
             const int p_idx = k % NUM_P_BUFS;
             const int qk_tail_buf = k % NUM_QK_TAIL_BUFS;
@@ -482,11 +219,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             const int qk_bar_phase = HAVE_QK_TAIL
                 ? ((k / NUM_QK_TAIL_BUFS) & 1)
                 : ((k / NUM_P_BUFS) & 1);
-            FP8_TIMED_WAIT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].qk_wait_ns,
-                plan.bar_qk_done[qk_bar_idx].wait(qk_bar_phase)
-            );
+            plan.bar_qk_done[qk_bar_idx].wait(qk_bar_phase);
             float p[NUM_ELEMS_PER_THREAD];
             ku::tcgen05_after_thread_sync();
             const uint32_t p_tmem_col = p_idx == 0
@@ -496,14 +229,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             cutlass::arch::fence_view_async_tmem_load();
             ku::tcgen05_before_thread_sync();
             plan.bar_p_free[p_idx].arrive();
-            FP8_TIMED_WAIT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].scale_wait_ns,
-                plan.bar_kv_scale_ready[cur_buf].wait((k / NUM_MAIN_BUFS) & 1)
-            );
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].waits_done_ns
+            plan.bar_kv_scale_ready[cur_buf].wait(
+                (k / NUM_MAIN_BUFS) & 1
             );
 
             // Shuffles expose the token scales for this thread's half-tile.
@@ -565,11 +292,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     }
                 }
 
-                FP8_TIMEPOINT(
-                    trace_wg0_tile,
-                    plan.barrier_timing.wg0[warp_idx][k].p_released_ns
-                );
-
                 // P is already resident in registers; one max chain is
                 // cheaper than carrying four independent reductions on this
                 // path.
@@ -585,18 +307,10 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     cur_pi_max = max(cur_pi_max, scaled_p.y);
                 }
             }
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].p_scaled_ns
-            );
-            
+
             plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
-            FP8_TIMED_WAIT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].rowmax_wait_ns,
-                (NamedBarrier::arrive_and_wait(
-                    128, NamedBarriers::wg0_sync
-                ))
+            NamedBarrier::arrive_and_wait(
+                128, NamedBarriers::wg0_sync
             );
             cur_pi_max = max(
                 cur_pi_max,
@@ -615,11 +329,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 scale_for_old = exp2f(mi - new_max);
             }
             mi = new_max;   // mi is still identical within each row
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].rowmax_ready_ns
-            );
-
             // Absorb the token factor into S, then quantize each head row.
             uint32_t s[NUM_ELEMS_PER_THREAD / 4];
             float cur_sum = 0.0f;
@@ -640,11 +349,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 p[i + 0] = s_pair.x;
                 p[i + 1] = s_pair.y;
             }
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].softmax_exp_ready_ns
-            );
-
             // Reuse the otherwise-idle LSE exchange scratch to make the
             // no-rescale decision uniform across WG0.  The named barrier
             // below already orders this four-warp publication.
@@ -653,12 +357,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     should_scale_o
                 );
             }
-            FP8_TIMED_WAIT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].smax_wait_ns,
-                (NamedBarrier::arrive_and_wait(
-                    128, NamedBarriers::wg0_sync
-                ))
+            NamedBarrier::arrive_and_wait(
+                128, NamedBarriers::wg0_sync
             );
             bool wg0_needs_o_rescale = false;
             if (lane_idx == 0) {
@@ -706,10 +406,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     | (static_cast<uint32_t>(s23) << 16);
             }
             li = fma(li, scale_for_old, cur_sum);
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].softmax_ready_ns
-            );
 
             // Warp 8 can keep consuming S(k-1) while WG0 publishes S(k) into
             // the other stage.  A stage is not reused until the preceding
@@ -735,11 +431,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     s[i / 4 + 3]
                 );
             }
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].s_stored_ns
-            );
-
             // S can be consumed as soon as its SMEM stores are visible. O
             // reuse is guarded by the whole-O handoff below.
             fence_view_async_shared();
@@ -757,72 +448,23 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 // );
                 const float o_rescale = scale_for_old;
                 const bool warp_needs_o_rescale = should_scale_o;
-#if defined(FP8_FWD_BARRIER_TIMING)
-                auto* const first_stripe_timing = trace_wg0_tile
-                    ? &plan.barrier_timing.o_rescale[warp_idx][k][0]
-                    : nullptr;
-                FP8_TIMEPOINT(
-                    trace_wg0_tile,
-                    first_stripe_timing->stripe_start_ns
-                );
-                if (trace_wg0_tile) {
-                    first_stripe_timing->warp_rescale_active =
-                        static_cast<uint64_t>(warp_needs_o_rescale);
-                }
-#endif
-                FP8_TIMED_WAIT(
-                    trace_wg0_tile,
-                    first_stripe_timing->sv_wait_ns,
-                    plan.bar_sv_done[prev_buf].wait(prev_phase)
-                );
-#if defined(FP8_FWD_BARRIER_TIMING)
-                if (trace_wg0_tile) {
-                    plan.barrier_timing.wg0[warp_idx][k].sv_wait_ns =
-                        first_stripe_timing->sv_wait_ns;
-                }
-#endif
+                plan.bar_sv_done[prev_buf].wait(prev_phase);
                 CUTE_UNROLL
                 for (int dv_block = 0;
                      dv_block < NUM_SV_TMEM_BLOCKS;
                      ++dv_block) {
-#if defined(FP8_FWD_BARRIER_TIMING)
-                    auto* const stripe_timing = trace_wg0_tile
-                        ? &plan.barrier_timing.o_rescale[warp_idx][k][dv_block]
-                        : nullptr;
-                    FP8_TIMEPOINT(
-                        trace_wg0_tile,
-                        stripe_timing->stripe_start_ns
-                    );
-                    if (trace_wg0_tile) {
-                        stripe_timing->warp_rescale_active =
-                            static_cast<uint64_t>(warp_needs_o_rescale);
-                    }
-#endif
                     if (warp_needs_o_rescale) {
                         if (dv_block == 0) {
                             ku::tcgen05_after_thread_sync();
                         }
-#if defined(FP8_FWD_BARRIER_TIMING)
-                        rescale_o_tmem_stripe(
-                            o_rescale,
-                            tmem_cols::O + dv_block * SV_TMEM_COLS_PER_BLOCK,
-                            plan.barrier_timing.origin_ns,
-                            stripe_timing
-                        );
-#else
                         rescale_o_tmem_stripe(
                             o_rescale,
                             tmem_cols::O + dv_block * SV_TMEM_COLS_PER_BLOCK
                         );
-#endif
                         if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
                             ku::tcgen05_before_thread_sync();
                         }
                     }
-                    FP8_TIMEPOINT(
-                        trace_wg0_tile,
-                        stripe_timing->sv_ready_ns
-                    );
                 }
                 // The named barrier is still needed when any WG0 warp touched
                 // TMEM.  With no rescale, the single transaction-barrier
@@ -834,28 +476,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                 }
                 plan.bar_o_rescale_done[0].arrive();
-#if defined(FP8_FWD_BARRIER_TIMING)
-                CUTE_UNROLL
-                for (int dv_block = 0;
-                     dv_block < NUM_SV_TMEM_BLOCKS;
-                     ++dv_block) {
-                    FP8_TIMEPOINT(
-                        trace_wg0_tile,
-                        plan.barrier_timing.o_rescale[warp_idx][k][dv_block]
-                            .wg0_sync_done_ns
-                    );
-                }
-#endif
             }
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].o_rescaled_ns
-            );
             s_scale_for_o = current_s_scale;
-            FP8_TIMEPOINT(
-                trace_wg0_tile,
-                plan.barrier_timing.wg0[warp_idx][k].s_arrived_ns
-            );
         }
 
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -883,22 +505,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             params.lse[global_index] = cur_lse;
         }
 
-        // Wait for the last GEMM
-        
-        FP8_TIMED_WAIT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.final_sv_wait_ns[warp_idx],
-            plan.bar_sv_done[(num_k_blocks - 1) % NUM_MAIN_BUFS].wait(
-                ((num_k_blocks - 1) / NUM_MAIN_BUFS) & 1
-            )
-        );
-        FP8_TIMEPOINT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.final_sv_ready_ns[warp_idx]
-        );
-        
-        ku::tcgen05_after_thread_sync();
-
         // Fetch dO if necessary
 
         // Store O
@@ -915,7 +521,14 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 1.0f, li + exp2f(attn_sink - mi)
             );
         }
-        Tensor sO = make_tensor(make_smem_ptr(plan.qkvo.o.o.data()), SmemLayoutO{});
+        const int final_sv_buf = (num_k_blocks - 1) % NUM_MAIN_BUFS;
+        const int o_smem_buf = (final_sv_buf + 1) % NUM_MAIN_BUFS;
+        Tensor sO = make_tensor(
+            make_smem_ptr(
+                reinterpret_cast<bf16*>(plan.qkvo.kv[o_smem_buf].data())
+            ),
+            SmemLayoutO{}
+        );
         constexpr int B_EPI = 64;
         Tensor tma_gO = flat_divide(
             tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
@@ -947,9 +560,23 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             // Each tile: 64 x 256
             CUTE_UNROLL
             for (int k = 0; k < (D_V/4)/B_EPI; ++k) {
+                const int dv_block = c * 2 + k;
+                if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                    plan.bar_sv_block_done[final_sv_buf][dv_block].wait(0);
+                } else {
+                    plan.bar_sv_done[final_sv_buf].wait(
+                        ((num_k_blocks - 1) / NUM_MAIN_BUFS) & 1
+                    );
+                }
+                ku::tcgen05_after_thread_sync();
+
                 // Load O from tO
                 if (have_valid_indices) {
-                    ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
+                    ku::tmem_ld_32dp32bNx<B_EPI>(
+                        tmem_cols::O
+                            + dv_block * SV_TMEM_COLS_PER_BLOCK,
+                        o
+                    );
                     cutlass::arch::fence_view_async_tmem_load();
                 }
 
@@ -1021,14 +648,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         if (elect_one_sync()) {
             CUTE_NO_UNROLL
             for (int k = 0; k < num_k_blocks; ++k) {
-#if defined(FP8_FWD_BARRIER_TIMING)
-                const bool trace_kv_tile = s_q_idx == 0
-                    && lane_idx == 0 && k < FP8_TIMING_MAX_TILES;
-#endif
-                FP8_TIMEPOINT(
-                    trace_kv_tile,
-                    plan.barrier_timing.kv[warp_idx][k].tile_start_ns
-                );
                 int4 indices[NUM_LOCAL_ROWS_PER_WARP];
                 int max_indices = -1, min_indices = params.s_kv;
                 CUTE_UNROLL
@@ -1037,19 +656,12 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     max_indices = max(max_indices, int4_max(indices[local_row]));
                     min_indices = min(min_indices, int4_min(indices[local_row]));
                 }
-                FP8_TIMEPOINT(
-                    trace_kv_tile,
-                    plan.barrier_timing.kv[warp_idx][k].indices_ready_ns
-                );
                 bool is_all_rows_invalid = min_indices == params.s_kv || max_indices == -1;
                 bool should_skip_tma = is_all_rows_invalid && k >= NUM_MAIN_BUFS;
 
                 if (k == NUM_MAIN_BUFS - 1) {
-                    FP8_TIMED_WAIT(
-                        trace_kv_tile,
-                        plan.barrier_timing.kv[warp_idx][k].q_reuse_wait_ns,
-                        plan.bar_prologue_utccp.wait(0)
-                    );  // Q shares storage with the last main K stage.
+                    // Q shares storage with the last main K stage.
+                    plan.bar_prologue_utccp.wait(0);
                 }
 
                 // Copy NoPE
@@ -1065,10 +677,8 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         );
                     }
                 }
-                FP8_TIMED_WAIT(
-                    trace_kv_tile,
-                    plan.barrier_timing.kv[warp_idx][k].sv_free_wait_ns,
-                    plan.bar_sv_done[cur_buf].wait(((k / NUM_MAIN_BUFS) & 1) ^ 1)
+                plan.bar_sv_done[cur_buf].wait(
+                    ((k / NUM_MAIN_BUFS) & 1) ^ 1
                 );
 
                 e4m3* sK_base = plan.qkvo.kv[cur_buf].data()
@@ -1137,15 +747,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
                     );
                     load_kv_part(0);
-                    FP8_TIMEPOINT(
-                        trace_kv_tile,
-                        plan.barrier_timing.kv[warp_idx][k].tma_part0_issued_ns
-                    );
                     load_kv_part(1);
-                    FP8_TIMEPOINT(
-                        trace_kv_tile,
-                        plan.barrier_timing.kv[warp_idx][k].tma_part1_issued_ns
-                    );
                     load_kv_tail();
                     
                 } else {
@@ -1180,11 +782,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         plan.bar_prologue.arrive_and_expect_tx(
             B_H * (D_V + (HAVE_QK_TAIL ? 64 : 0)) * sizeof(e4m3)
         );
-        FP8_TIMED_WAIT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.q_tma_wait_ns,
-            plan.bar_prologue.wait(0)
-        );
+        plan.bar_prologue.wait(0);
         ku::tcgen05_after_thread_sync();
         CUTE_UNROLL
         for (int tile_idx = 0; tile_idx < D_Q / 128; ++tile_idx) {
@@ -1220,55 +818,26 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
         }
         ku::umma_arrive_noelect(plan.bar_prologue_utccp);
-        FP8_TIMEPOINT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.q_tmem_committed_ns
-        );
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks+1; ++k) {
-#if defined(FP8_FWD_BARRIER_TIMING)
-            const bool trace_mma_iter = s_q_idx == 0
-                && lane_idx == 0 && k <= FP8_TIMING_MAX_TILES;
-#endif
-            FP8_TIMEPOINT(
-                trace_mma_iter,
-                plan.barrier_timing.mma[k].iter_start_ns
-            );
             if (k < num_k_blocks) {
                 int cur_buf = k%NUM_MAIN_BUFS;
                 int p_stage = k%NUM_P_BUFS;
                 Tensor sK = make_tensor(make_smem_ptr(plan.qkvo.kv[cur_buf].data()), SmemLayoutK_TiledMMA{});
 
-                FP8_TIMED_WAIT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].p_free_wait_ns,
-                    plan.bar_p_free[p_stage].wait(
-                        ((k / NUM_P_BUFS) & 1) ^ 1
-                    )
+                plan.bar_p_free[p_stage].wait(
+                    ((k / NUM_P_BUFS) & 1) ^ 1
                 );
 
                 ku::tcgen05_after_thread_sync();
                 if (k == 0) {
-                    FP8_TIMED_WAIT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].q_copy_wait_ns,
-                        plan.bar_prologue_utccp.wait(0)
-                    );
-
+                    plan.bar_prologue_utccp.wait(0);
                 }
                 // Producers arm the full-KV transaction barrier before their
                 // gathers, so the MMA consumer only needs one wait.
-                FP8_TIMED_WAIT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].kv_wait_ns[0],
-                    plan.bar_kv_ready[cur_buf].wait(
-                        (k / NUM_MAIN_BUFS) & 1
-                    )
-                );
-                FP8_TIMEPOINT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].kv_ready_ns[0]
+                plan.bar_kv_ready[cur_buf].wait(
+                    (k / NUM_MAIN_BUFS) & 1
                 );
                 ku::tcgen05_after_thread_sync();
 
@@ -1277,14 +846,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 } else {
                     ku::utcmma_ts(tiled_mma_P, tQ, sK, tP1, true);
                 }
-                FP8_TIMEPOINT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].qk_issued_ns[0]
-                );
-                FP8_TIMEPOINT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].qk_issued_ns[1]
-                );
 
                 if constexpr (HAVE_QK_TAIL) {
                     // Commit the 512-dim product first.  The tail TS MMA is
@@ -1320,10 +881,6 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 } else {
                     ku::umma_arrive_noelect(plan.bar_qk_done[p_stage]);
                 }
-                FP8_TIMEPOINT(
-                    trace_mma_iter,
-                    plan.barrier_timing.mma[k].qk_committed_ns
-                );
             }
 
             if (k > 0) {
@@ -1340,15 +897,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
 
                     // S(i-1) is ready independently of the O accumulator.
-                    FP8_TIMED_WAIT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].s_ready_wait_ns,
-                        plan.bar_so_ready.wait((k - 1) & 1)
-                    );
-                    FP8_TIMEPOINT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].s_ready_ns
-                    );
+                    plan.bar_so_ready.wait((k - 1) & 1);
 
                     // The entire O accumulator is handed back at once; do
                     // not start any stripe until WG0 has finished the whole
@@ -1377,14 +926,15 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                             tO,
                             k == 1
                         );
-                        if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
+                        if (k == num_k_blocks
+                            && dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
+                            ku::umma_arrive_noelect(
+                                plan.bar_sv_block_done[cur_buf][dv_block]
+                            );
+                        } else if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
                             ku::umma_arrive_noelect(plan.bar_sv_done[cur_buf]);
                         }
                     }
-                    FP8_TIMEPOINT(
-                        trace_mma_iter,
-                        plan.barrier_timing.mma[k].sv_committed_ns
-                    );
                 }
         }
     } else if (warp_idx == 10 || warp_idx == 11) {
@@ -1408,30 +958,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         if (elect_one_sync()) {
             plan.bar_qw_scale_ready.arrive();
         }
-        FP8_TIMEPOINT(
-            s_q_idx == 0 && lane_idx == 0,
-            plan.barrier_timing.qw_scale_arrived_ns[scale_warp_idx]
-        );
 #endif
 
         CUTE_NO_UNROLL
         for (int k = 0; k < num_k_blocks; ++k) {
             const int cur_buf = k % NUM_MAIN_BUFS;
-#if defined(FP8_FWD_BARRIER_TIMING)
-            const bool trace_scale_tile = s_q_idx == 0
-                && lane_idx == 0 && k < FP8_TIMING_MAX_TILES;
-#endif
-            FP8_TIMEPOINT(
-                trace_scale_tile,
-                plan.barrier_timing.scale[scale_warp_idx][k].tile_start_ns
-            );
-            
-            FP8_TIMED_WAIT(
-                trace_scale_tile,
-                plan.barrier_timing.scale[scale_warp_idx][k].buffer_free_wait_ns,
-                plan.bar_sv_done[cur_buf].wait(
-                    ((k / NUM_MAIN_BUFS) & 1) ^ 1
-                )
+            plan.bar_sv_done[cur_buf].wait(
+                ((k / NUM_MAIN_BUFS) & 1) ^ 1
             );
             
 
@@ -1452,17 +985,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         + static_cast<int64_t>(src_idx)
                             * params.stride_kv_s_kv
                         + QK_DIM;
-#if defined(FP8_FWD_VECTOR_KV_SCALE_LOAD)
-                    // The trailing scale slot is 16-byte aligned. Keep this
-                    // opt-in because random top-k indices can change cache
-                    // behavior even when the extracted scale byte is identical.
-                    const uint4 packed_scale_slot = __ldg(
-                        reinterpret_cast<const uint4*>(kv_scale_ptr)
-                    );
-                    scale_bits = static_cast<uint8_t>(packed_scale_slot.x);
-#else
                     scale_bits = __ldg(kv_scale_ptr);
-#endif
 
                 }
                 plan.kv_token_scale[cur_buf][scale_row] =
@@ -1474,29 +997,10 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             if (elect_one_sync()) {
                 plan.bar_kv_scale_ready[cur_buf].arrive();
             }
-            FP8_TIMEPOINT(
-                trace_scale_tile,
-                plan.barrier_timing.scale[scale_warp_idx][k].arrived_ns
-            );
-            
         }
     }
 }
-
-#if defined(FP8_FWD_BARRIER_TIMING)
-    if (s_q_idx == 0 && lane_idx == 0) {
-        plan.barrier_timing.branch_end_ns[warp_idx] = fp8_timing_now_ns()
-            - plan.barrier_timing.origin_ns;
-    }
-    __syncthreads();
-    if (s_q_idx == 0 && threadIdx.x == 0) {
-        print_fp8_barrier_timing<HAVE_QK_TAIL>(plan, num_k_blocks);
-    }
-#endif
 }
-
-#undef FP8_TIMED_WAIT
-#undef FP8_TIMEPOINT
 
 template<int D_QK>
 void run_fp8_fwd_phase1_kernel(const Head64Fp8SparseAttnFwdParams& params) {

@@ -260,14 +260,7 @@ def phase1_token_tile_reference(
             li_halves = li_halves * scale_for_old.unsqueeze(-1) + cur_sum_halves
 
             s_for_sv = softmax_s * gathered_u.unsqueeze(0)
-            s_absmax = s_for_sv.abs().amax(dim=-1)
-            s_scale = round_up_ue8m0(
-                torch.where(
-                    s_absmax > 0,
-                    s_absmax / FP8_MAX,
-                    torch.ones_like(s_absmax),
-                )
-            ).float()
+            s_scale = torch.full_like(mi, 1.0 / FP8_MAX)
             s_fp8 = (s_for_sv / s_scale.unsqueeze(-1)).to(
                 torch.float8_e4m3fn
             )

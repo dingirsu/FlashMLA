@@ -87,34 +87,34 @@ if [[ "${FP8_FWD_VECTOR_KV_SCALE_LOAD:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_FWD_VECTOR_KV_SCALE_LOAD=1 )
 fi
 
-"$CXX" \
-    "${INCLUDES[@]}" \
-    -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \
-    -D_GLIBCXX_USE_CXX11_ABI=1 \
-    -DTORCH_EXTENSION_NAME=fp8_test_ext \
-    -fPIC -c \
-    "$ROOT/tests/fp8_test_ext.cpp" \
-    -o /tmp/fp8_api_pic.o
+# "$CXX" \
+#     "${INCLUDES[@]}" \
+#     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \
+#     -D_GLIBCXX_USE_CXX11_ABI=1 \
+#     -DTORCH_EXTENSION_NAME=fp8_test_ext \
+#     -fPIC -c \
+#     "$ROOT/tests/fp8_test_ext.cpp" \
+#     -o /tmp/fp8_api_pic.o
 
-"$NVCC" "${NVCC_FLAGS[@]}" \
-    "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu" \
-    -o /tmp/fp8_prefill_k512_pic.o
+# "$NVCC" "${NVCC_FLAGS[@]}" \
+#     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu" \
+#     -o /tmp/fp8_prefill_k512_pic.o
 
-"$NVCC" "${NVCC_FLAGS[@]}" \
-    "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
-    -o /tmp/fp8_prefill_k576_pic.o
+# "$NVCC" "${NVCC_FLAGS[@]}" \
+#     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
+#     -o /tmp/fp8_prefill_k576_pic.o
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/decode/fp8_head64/instantiations/model1.cu" \
     -o /tmp/fp8_decode_pic.o
 
-"$NVCC" "${NVCC_FLAGS[@]}" \
-    "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
-    -o /tmp/fp8_sched_pic.o
+# "$NVCC" "${NVCC_FLAGS[@]}" \
+#     "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
+#     -o /tmp/fp8_sched_pic.o
 
-"$NVCC" "${NVCC_FLAGS[@]}" \
-    "$ROOT/csrc/smxx/decode/combine/combine.cu" \
-    -o /tmp/fp8_combine_pic.o
+# "$NVCC" "${NVCC_FLAGS[@]}" \
+#     "$ROOT/csrc/smxx/decode/combine/combine.cu" \
+#     -o /tmp/fp8_combine_pic.o
 
 "$CXX" -shared \
     /tmp/fp8_api_pic.o \

@@ -838,38 +838,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
 
             run_main_loop([&](const MainLoopArgs &args) {
                 const int token_base = scale_warp_idx * TOKENS_PER_WARP;
-                int *indices = params.indices
-                    + args.batch_idx * params.stride_indices_b
-                    + s_q_idx * params.stride_indices_s_q;
-                int *extra_indices = params.extra_topk > 0
-                    ? params.extra_indices
-                        + args.batch_idx * params.stride_extra_indices_b
-                        + s_q_idx * params.stride_extra_indices_s_q
-                    : nullptr;
 
-                auto process_one_block = [&](int block_idx, bool is_extra) {
-                    const int local_block_idx = is_extra
-                        ? block_idx - args.num_orig_kv_blocks
-                        : block_idx;
-                    const int current_block_size = is_extra
-                        ? params.extra_page_block_size
-                        : params.page_block_size;
-                    const int current_num_blocks = is_extra
-                        ? params.extra_num_blocks
-                        : params.num_blocks;
-                    const int current_topk_length = is_extra
-                        ? args.extra_topk_length
-                        : args.topk_length;
-                    const int current_stride_block = is_extra
-                        ? params.stride_extra_kv_block
-                        : params.stride_kv_block;
+                auto process_one_block = [&](int, bool is_extra) {
                     const uint8_t *current_kv = reinterpret_cast<const uint8_t *>(
                         is_extra ? params.extra_kv : params.kv
                     );
-                    const int *current_indices = is_extra
-                        ? extra_indices
-                        : indices;
-                    const int block_token_base = local_block_idx * B_TOPK;
 
                     // Wait until warp 7 has published this index packet and
                     // until the previous consumer has released this stage.
@@ -878,25 +851,19 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     );
                     plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase ^ true);
 
+                    // Warp 7 writes -1 for invalid tokens and otherwise
+                    // publishes the flattened TMA row coordinate.  Reuse it
+                    // directly: coord * TMA_K_STRIDE points at the physical
+                    // 528-byte KV row containing the scale.
                     CUTE_UNROLL
                     for (int i = 0; i < TOKENS_PER_LANE; ++i) {
                         const int row = token_base + i * 32 + lane_idx;
-                        const int abs_pos = block_token_base + row;
-                        const int token_idx = __ldg(current_indices + abs_pos);
-                        const bool valid = token_idx >= 0
-                            && static_cast<int64_t>(token_idx)
-                                < static_cast<int64_t>(current_num_blocks)
-                                    * current_block_size
-                            && abs_pos < current_topk_length;
+                        const int coord =
+                            plan.tma_coord[rs.index_buf_idx][row];
                         float scale = 1.0f;
-                        if (valid) {
-                            const int page_idx = token_idx / current_block_size;
-                            const int idx_in_page = token_idx % current_block_size;
+                        if (coord >= 0) {
                             const uint8_t *scale_ptr = current_kv
-                                + static_cast<int64_t>(page_idx)
-                                    * current_stride_block
-                                + static_cast<int64_t>(idx_in_page)
-                                    * KV_BYTES_PER_TOKEN
+                                + static_cast<int64_t>(coord) * TMA_K_STRIDE
                                 + D_K;
                             scale = ue8m0_bits_to_float(__ldg(scale_ptr));
                         }

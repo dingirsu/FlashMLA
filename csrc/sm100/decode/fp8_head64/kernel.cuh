@@ -17,6 +17,119 @@
 
 namespace sm100::decode::fp8_head64 {
 
+// Instruction-family ablations mirror sparse prefill.  Each replacement keeps
+// a live data dependency into the existing memory/synchronization skeleton so
+// disabling one family does not let ptxas remove another family as dead code.
+CUTE_DEVICE
+float fp8_decode_exp2(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "ex2.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_decode_log(float value) {
+    float result;
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    result = __uint_as_float(bits);
+#else
+    asm volatile(
+        "lg2.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+#endif
+    return result * CUDART_LN2_F;
+}
+
+CUTE_DEVICE
+float fp8_decode_log2(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "lg2.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_decode_rcp(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "rcp.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result;
+#endif
+}
+
+CUTE_DEVICE
+uint32_t fp8_decode_exp2_quad_packed(float a, float b, float c, float d) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t packed = __float_as_uint(d);
+    asm volatile("mov.b32 %0, %0;" : "+r"(packed));
+    return packed;
+#else
+    uint32_t packed;
+    asm volatile(
+        "{\n"
+        "  .reg .f32 s0, s1, s2, s3;\n"
+        "  .reg .b32 b0, b1, b2, b3, ab, cd;\n"
+        "  ex2.approx.ftz.f32 s0, %1;\n"
+        "  ex2.approx.ftz.f32 s1, %2;\n"
+        "  ex2.approx.ftz.f32 s2, %3;\n"
+        "  ex2.approx.ftz.f32 s3, %4;\n"
+        "  mov.b32 b0, s0;\n"
+        "  mov.b32 b1, s1;\n"
+        "  mov.b32 b2, s2;\n"
+        "  mov.b32 b3, s3;\n"
+        "  prmt.b32 ab, b0, b1, 0x4040;\n"
+        "  prmt.b32 cd, b2, b3, 0x4040;\n"
+        "  prmt.b32 %0, ab, cd, 0x5410;\n"
+        "}"
+        : "=r"(packed)
+        : "f"(a), "f"(b), "f"(c), "f"(d)
+    );
+    return packed;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_decode_bit_passthrough(float value) {
+    uint32_t result;
+    asm volatile(
+        "prmt.b32 %0, %1, %1, 0x3210;"
+        : "=r"(result)
+        : "r"(__float_as_uint(value))
+    );
+    return __uint_as_float(result);
+}
+
 CUTE_DEVICE
 float ue8m0_bits_to_float(uint8_t bits) {
     if (bits == 0) {
@@ -37,8 +150,13 @@ void rescale_o_tmem_stripe(
     cutlass::arch::fence_view_async_tmem_load();
     CUTE_UNROLL
     for (int i = 0; i < SV_M / 4; ++i) {
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
         o[i] = ku::float2_mul(o[i], scale2);
+#endif
     }
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+    o[0].x = scale;
+#endif
     ku::tmem_st_32dp32bNx<SV_M / 2>(tmem_col, o);
     cutlass::arch::fence_view_async_tmem_store();
 }
@@ -234,8 +352,12 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
             const float q_head_scale = ue8m0_bits_to_float(
                 __ldg(q_scale_base + h)
             );
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            const float qk_base_scale = q_head_scale;
+#else
             const float qk_base_scale =
                 q_head_scale * params.sm_scale_div_log2;
+#endif
             const float2 qk_base_scale2 = make_float2(
                 qk_base_scale,
                 qk_base_scale
@@ -289,6 +411,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 // the prefill arrangement: the S loop consumes these values
                 // directly and does not perform another shuffle.
                 float kv_scale[B_TOPK / 2];
+                float cur_pi_max = -CUDART_INF_F;
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
                 float2 qk_scale[B_TOPK / 4];
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK / 4; ++i) {
@@ -313,7 +437,6 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     );
                 }
 
-                float cur_pi_max = -CUDART_INF_F;
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK / 2; i += 2) {
                     const float2 scaled_p = ku::float2_mul(
@@ -325,10 +448,22 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     cur_pi_max = max(cur_pi_max, scaled_p.x);
                     cur_pi_max = max(cur_pi_max, scaled_p.y);
                 }
+#else
+                // Retain the TMEM load, validity path, shared-memory
+                // handoffs, and SFU work while bypassing CUDA-core math.
+                cur_pi_max = p[0];
+#endif
 
                 plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                cur_pi_max = plan.rowwise_max_buf[idx_in_warpgroup ^ B_H];
+                real_mi = cur_pi_max;
+                const bool should_scale_o = true;
+                const float scale_for_old = fp8_decode_exp2(mi);
+                const float new_max = scale_for_old;
+#else
                 cur_pi_max = max(
                     cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup ^ B_H]
                 );
@@ -341,16 +476,28 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     ? max(cur_pi_max, mi)
                     : mi;
                 const float scale_for_old = should_scale_o
-                    ? exp2f(mi - new_max)
+                    ? fp8_decode_exp2(mi - new_max)
                     : 1.0f;
+#endif
                 mi = new_max;
 
                 float cur_sum = 0.0f;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                uint32_t s[B_TOPK / 8];
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK / 2; i += 4) {
+                    const uint32_t packed_s = fp8_decode_exp2_quad_packed(
+                        p[i + 0], p[i + 1], p[i + 2], p[i + 3]
+                    );
+                    s[i / 4] = packed_s;
+                    cur_sum = __uint_as_float(packed_s);
+                }
+#else
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK / 2; i += 2) {
                     const float2 softmax_s = make_float2(
-                        exp2f(p[i + 0] - new_max),
-                        exp2f(p[i + 1] - new_max)
+                        fp8_decode_exp2(p[i + 0] - new_max),
+                        fp8_decode_exp2(p[i + 1] - new_max)
                     );
                     cur_sum += softmax_s.x + softmax_s.y;
                     const float2 s_pair = ku::float2_mul(
@@ -386,6 +533,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     s[i / 4] = static_cast<uint32_t>(s01)
                         | (static_cast<uint32_t>(s23) << 16);
                 }
+#endif
                 CUTE_UNROLL
                 for (int i = 0; i < B_TOPK / 2; i += 16) {
                     *reinterpret_cast<uint4 *>(&sS(h, token_base + i)) =
@@ -396,7 +544,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                             s[i / 4 + 3]
                         );
                 }
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                li = cur_sum;
+#else
                 li = fma(li, scale_for_old, cur_sum);
+#endif
 
                 fence_view_async_shared();
                 plan.bar_so_ready[rs.buf_idx].arrive();
@@ -438,11 +590,19 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
 
             plan.rowwise_max_buf[idx_in_warpgroup] = li;
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            li = plan.rowwise_max_buf[idx_in_warpgroup ^ B_H];
+#else
             li += plan.rowwise_max_buf[idx_in_warpgroup ^ B_H];
+#endif
 
             if (idx_in_warpgroup < B_H) {
                 if (args.is_no_split) {
-                    float lse = fmaf(mi, CUDART_LN2_F, logf(li));
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                    float lse = fp8_decode_log(li);
+#else
+                    float lse = fmaf(mi, CUDART_LN2_F, fp8_decode_log(li));
+#endif
                     lse = lse == -CUDART_INF_F ? CUDART_INF_F : lse;
                     params.lse[
                         args.batch_idx * params.stride_lse_b
@@ -454,7 +614,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                         args.n_split_idx * params.stride_lse_accum_split
                         + s_q_idx * params.stride_lse_accum_s_q
                         + idx_in_warpgroup
-                    ] = log2f(li) + mi;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                    ] = fp8_decode_log2(li);
+#else
+                    ] = fp8_decode_log2(li) + mi;
+#endif
                 }
             }
 
@@ -466,14 +630,21 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                 cudaTriggerProgrammaticLaunchCompletion();
             }
 
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            const float o_scale = fp8_decode_rcp(
+                args.is_no_split
+                    ? fp8_decode_bit_passthrough(fp8_decode_exp2(attn_sink))
+                    : fp8_decode_bit_passthrough(li)
+            );
+#else
             const float o_scale = li == 0.0f
                 ? 0.0f
-                : __fdividef(
-                    S_FP8_SCALE,
+                : S_FP8_SCALE * fp8_decode_rcp(
                     args.is_no_split
-                        ? li + exp2f(attn_sink - mi)
+                        ? li + fp8_decode_exp2(attn_sink - mi)
                         : li
                 );
+#endif
             if (args.is_no_split) {
                 Tensor tma_gO = flat_divide(
                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(
@@ -498,25 +669,43 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                         cutlass::arch::fence_view_async_tmem_load();
                         const int d_group = c * 4 + k * 2
                             + idx_in_warpgroup / B_H;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                        const float output_dequant_scale = o_scale;
+#else
                         const float output_dequant_scale = o_scale
                             * ue8m0_bits_to_float(
                                 __ldg(params.kv_scale_w + d_group)
                             );
+#endif
                         const float2 output_dequant_scale2 = make_float2(
                             output_dequant_scale, output_dequant_scale
                         );
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 2; ++j) {
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
                             o[j] = ku::float2_mul(
                                 o[j], output_dequant_scale2
                             );
                             o_bf16[j] = __float22bfloat162_rn(o[j]);
+#endif
                         }
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 8; ++j) {
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                            const float4 o_bits = make_float4(
+                                output_dequant_scale,
+                                o[j * 4 + 0].y,
+                                o[j * 4 + 1].x,
+                                o[j * 4 + 1].y
+                            );
+                            *reinterpret_cast<__int128_t *>(
+                                sO_bases[j] + d_group * B_EPI * B_H
+                            ) = reinterpret_cast<const __int128_t &>(o_bits);
+#else
                             *reinterpret_cast<__int128_t *>(
                                 sO_bases[j] + d_group * B_EPI * B_H
                             ) = *reinterpret_cast<__int128_t *>(&o_bf16[j * 4]);
+#endif
                         }
 
                         fence_view_async_shared();
@@ -556,24 +745,42 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                         cutlass::arch::fence_view_async_tmem_load();
                         const int d_group = c * 4 + k * 2
                             + idx_in_warpgroup / B_H;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                        const float output_dequant_scale = o_scale;
+#else
                         const float output_dequant_scale = o_scale
                             * ue8m0_bits_to_float(
                                 __ldg(params.kv_scale_w + d_group)
                             );
+#endif
                         const float2 output_dequant_scale2 = make_float2(
                             output_dequant_scale, output_dequant_scale
                         );
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 2; ++j) {
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
                             o[j] = ku::float2_mul(
                                 o[j], output_dequant_scale2
                             );
+#endif
                         }
                         CUTE_UNROLL
                         for (int j = 0; j < B_EPI / 4; ++j) {
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                            const float4 o_bits = make_float4(
+                                output_dequant_scale,
+                                o[j * 2 + 0].y,
+                                o[j * 2 + 1].x,
+                                o[j * 2 + 1].y
+                            );
+                            *reinterpret_cast<__int128_t *>(
+                                &sO_accum(h, d_group * B_EPI + j * 4)
+                            ) = reinterpret_cast<const __int128_t &>(o_bits);
+#else
                             *reinterpret_cast<__int128_t *>(
                                 &sO_accum(h, d_group * B_EPI + j * 4)
                             ) = *reinterpret_cast<__int128_t *>(&o[j * 2]);
+#endif
                         }
                     }
                 }
@@ -690,7 +897,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                         make_smem_ptr(plan.qkvo.kv[rs.buf_idx].data()),
                         SmemLayoutKTiles_SW128<D_K / 64>{}
                     );
+#if !defined(FP8_FWD_DISABLE_GEMM)
                     ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, true);
+#endif
                     ku::umma_arrive_noelect(plan.bar_qk_done[rs.buf_idx]);
 
                     plan.bar_so_ready[rs.buf_idx].wait(rs.bar_phase);
@@ -711,6 +920,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                     for (int dv_block = 0; dv_block < D_V / SV_M; ++dv_block) {
                         tO.data().get() = tmem_cols::O
                             + dv_block * (SV_M / 2);
+#if !defined(FP8_FWD_DISABLE_GEMM)
                         ku::utcmma_ss(
                             tiled_mma_O,
                             sS,
@@ -718,6 +928,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(
                             tO,
                             block_idx == args.start_block_idx
                         );
+#endif
                     }
                     ku::umma_arrive_noelect(plan.bar_sv_done[rs.buf_idx]);
                     rs.update();

@@ -27,6 +27,83 @@ enum NamedBarriers : uint32_t {
     everyone_sync = 4
 };
 
+// Optional CTA-0 timeline tracing for the head64 decode kernel.  The trace is
+// deliberately kept out of the default build: defining
+// DECODE_HEAD64_BARRIER_TIMING adds a small shared-memory record for CTA-0
+// timeline sampling.  `%globaltimer` is used here, matching sparse-prefill.
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+static constexpr int DECODE_H64_TIMING_MAX_TILES = 8;
+
+struct DecodeH64Wg0Timing {
+    uint32_t tile_start_ns;
+    uint32_t qk_wait_ns;
+    uint32_t valid_wait_ns;
+    uint32_t waits_done_ns;
+    uint32_t p_loaded_ns;
+    uint32_t rowmax_ready_ns;
+    uint32_t softmax_ready_ns;
+    uint32_t sv_wait_ns;
+    uint32_t s_published_ns;
+    uint32_t o_rescale_done_ns;
+};
+
+struct DecodeH64MmaTiming {
+    uint32_t tile_start_ns;
+    uint32_t rope_wait_ns;
+    uint32_t nope_wait_ns;
+    uint32_t qk_issued_ns;
+    uint32_t qk_committed_ns;
+    uint32_t sv_wait_ns;
+    uint32_t sv_issued_ns;
+    uint32_t sv_committed_ns;
+};
+
+struct DecodeH64ProducerTiming {
+    uint32_t tile_start_ns;
+    uint32_t valid_wait_ns;
+    uint32_t raw_free_wait_ns;
+    uint32_t raw_issued_ns;
+    uint32_t rope_wait_ns;
+    uint32_t rope_issued_ns;
+    uint32_t published_ns;
+};
+
+struct DecodeH64IndexTiming {
+    uint32_t tile_start_ns;
+    uint32_t buffer_free_wait_ns;
+    uint32_t ready_ns;
+};
+
+struct DecodeH64DequantTiming {
+    uint32_t tile_start_ns;
+    uint32_t valid_wait_ns;
+    uint32_t raw_wait_ns;
+    uint32_t sv_wait_ns;
+    uint32_t converted_ns;
+    uint32_t published_ns;
+};
+
+struct DecodeH64Timing {
+    uint64_t origin_ns;
+    uint32_t num_tiles;
+    uint32_t branch_end_ns[12];
+    uint32_t q_tma_wait_ns;
+    uint32_t q_tmem_committed_ns;
+    uint32_t final_sv_wait_ns;
+    uint32_t final_sv_ready_ns;
+    uint32_t epilogue_start_ns;
+    uint32_t epilogue_tmem_done_ns;
+    uint32_t epilogue_smem_done_ns;
+    uint32_t epilogue_tma_done_ns;
+    DecodeH64Wg0Timing wg0[4][DECODE_H64_TIMING_MAX_TILES];
+    DecodeH64MmaTiming mma[DECODE_H64_TIMING_MAX_TILES];
+    DecodeH64ProducerTiming raw[DECODE_H64_TIMING_MAX_TILES];
+    DecodeH64ProducerTiming rope[DECODE_H64_TIMING_MAX_TILES];
+    DecodeH64IndexTiming index[DECODE_H64_TIMING_MAX_TILES];
+    DecodeH64DequantTiming dequant[DECODE_H64_TIMING_MAX_TILES];
+};
+#endif
+
 template<ModelType MODEL_TYPE>
 struct KernelTemplate {
 
@@ -191,6 +268,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_raw_ready[NUM_BUFS], bar_raw_free[NUM_BUFS];
     transac_bar_t bar_valid_coord_scale_ready[NUM_INDEX_BUFS], bar_valid_coord_scale_free[NUM_INDEX_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS], bar_sv_done[NUM_BUFS];
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+    DecodeH64Timing timing;
+#endif
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

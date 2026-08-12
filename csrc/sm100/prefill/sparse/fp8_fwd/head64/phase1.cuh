@@ -19,6 +19,102 @@ namespace sm100::fp8_fwd::head64 {
 
 using namespace cute;
 
+// Orthogonal instruction-family ablations for bottleneck isolation.  The
+// memory and synchronization skeleton intentionally stays live in every
+// variant so removing one family cannot dead-code-eliminate another one.
+CUTE_DEVICE
+float fp8_fwd_exp2(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "ex2.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_fwd_log(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "lg2.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result * CUDART_LN2_F;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_fwd_rcp(float value) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t bits = __float_as_uint(value);
+    asm volatile("mov.b32 %0, %0;" : "+r"(bits));
+    return __uint_as_float(bits);
+#else
+    float result;
+    asm volatile(
+        "rcp.approx.ftz.f32 %0, %1;"
+        : "=f"(result)
+        : "f"(value)
+    );
+    return result;
+#endif
+}
+
+CUTE_DEVICE
+uint32_t fp8_fwd_exp2_quad_packed(float a, float b, float c, float d) {
+#if defined(FP8_FWD_DISABLE_SFU)
+    uint32_t packed = __float_as_uint(d);
+    asm volatile("mov.b32 %0, %0;" : "+r"(packed));
+    return packed;
+#else
+    uint32_t packed;
+    asm volatile(
+        "{\n"
+        "  .reg .f32 s0, s1, s2, s3;\n"
+        "  .reg .b32 b0, b1, b2, b3, ab, cd;\n"
+        "  ex2.approx.ftz.f32 s0, %1;\n"
+        "  ex2.approx.ftz.f32 s1, %2;\n"
+        "  ex2.approx.ftz.f32 s2, %3;\n"
+        "  ex2.approx.ftz.f32 s3, %4;\n"
+        "  mov.b32 b0, s0;\n"
+        "  mov.b32 b1, s1;\n"
+        "  mov.b32 b2, s2;\n"
+        "  mov.b32 b3, s3;\n"
+        "  prmt.b32 ab, b0, b1, 0x4040;\n"
+        "  prmt.b32 cd, b2, b3, 0x4040;\n"
+        "  prmt.b32 %0, ab, cd, 0x5410;\n"
+        "}"
+        : "=r"(packed)
+        : "f"(a), "f"(b), "f"(c), "f"(d)
+    );
+    return packed;
+#endif
+}
+
+CUTE_DEVICE
+float fp8_fwd_bit_passthrough(float value) {
+    uint32_t result;
+    asm volatile(
+        "prmt.b32 %0, %1, %1, 0x3210;"
+        : "=r"(result)
+        : "r"(__float_as_uint(value))
+    );
+    return __uint_as_float(result);
+}
+
 CUTE_DEVICE
 float ue8m0_bits_to_float(uint8_t bits) {
     if (bits == 0) {
@@ -39,8 +135,13 @@ void rescale_o_tmem_stripe(
     cutlass::arch::fence_view_async_tmem_load();
     CUTE_UNROLL
     for (int i = 0; i < SV_TMEM_COLS_PER_BLOCK / 2; ++i) {
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
         o[i] = ku::float2_mul(o[i], scale2);
+#endif
     }
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+    o[0].x = scale;
+#endif
     ku::tmem_st_32dp32bNx<SV_TMEM_COLS_PER_BLOCK>(tmem_col, o);
     cutlass::arch::fence_view_async_tmem_store();
 }
@@ -110,7 +211,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 
             Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx);
             Tensor sQ = make_tensor(make_smem_ptr(plan.qkvo.q.q.data()), SmemLayoutQ{});
+#if !defined(FP8_FWD_DISABLE_Q_TMA_LOAD)
             ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_prologue, TMA::CacheHintSm90::EVICT_FIRST);
+#endif
             if constexpr (HAVE_QK_TAIL) {
                 Tensor gQ_tail = tma_params.tma_Q_tail.get_tma_tensor(
                     tma_params.shape_Q_tail
@@ -118,6 +221,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 Tensor sQ_tail = make_tensor(
                     make_smem_ptr(plan.qk_tail.q.data()), SmemLayoutQTail{}
                 );
+#if !defined(FP8_FWD_DISABLE_Q_TMA_LOAD)
                 ku::launch_tma_copy(
                     tma_params.tma_Q_tail,
                     gQ_tail,
@@ -125,6 +229,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     plan.bar_prologue,
                     TMA::CacheHintSm90::EVICT_FIRST
                 );
+#endif
             }
 
             cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
@@ -206,7 +311,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
 #else
         const float q_scale = plan.q_head_scale[h];
 #endif
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+        const float qk_base_scale = q_scale;
+#else
         const float qk_base_scale = q_scale * params.sm_scale_div_log2;
+#endif
         const float2 qk_base_scale2 = make_float2(
             qk_base_scale,
             qk_base_scale
@@ -251,6 +360,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             float kv_scale[NUM_ELEMS_PER_THREAD];
             float cur_pi_max = -CUDART_INF_F;
             {
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
                 float2 qk_scale[NUM_ELEMS_PER_THREAD / 2];
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD / 2; ++i) {
@@ -309,6 +419,25 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     cur_pi_max = max(cur_pi_max, scaled_p.x);
                     cur_pi_max = max(cur_pi_max, scaled_p.y);
                 }
+#else
+                // Keep the TMEM load, validity path, and all handoff barriers,
+                // but bypass CUDA-core scaling and reduction work.
+                const uint32_t* valid_masks = plan.is_k_valid[cur_buf]
+                    + token_base / 32;
+                const uint32_t valid0 = valid_masks[0];
+                uint32_t valid1 = 0;
+                if constexpr (NUM_ELEMS_PER_THREAD > 32) {
+                    valid1 = valid_masks[1];
+                }
+                CUTE_UNROLL
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                    const uint32_t mask = i < 32 ? valid0 : valid1;
+                    if (((mask >> (i & 31)) & 1u) == 0) {
+                        p[i] = -CUDART_INF_F;
+                    }
+                }
+                cur_pi_max = p[0];
+#endif
             }
 
             if (k > 0) {
@@ -318,22 +447,29 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             NamedBarrier::arrive_and_wait(
                 128, NamedBarriers::wg0_sync
             );
+            float new_max, scale_for_old;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            cur_pi_max = plan.rowwise_max_buf[idx_in_warpgroup ^ B_H];
+            real_mi = cur_pi_max;
+            const bool should_scale_o = true;
+            scale_for_old = fp8_fwd_exp2(mi);
+            new_max = scale_for_old;
+#else
             cur_pi_max = max(
                 cur_pi_max,
                 plan.rowwise_max_buf[idx_in_warpgroup ^ B_H]
             );
             real_mi = max(real_mi, cur_pi_max);
             bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
-
-            float new_max, scale_for_old;
             if (!should_scale_o) {
                 // Don't scale O
                 scale_for_old = 1.0f;
                 new_max = mi;
             } else {
                 new_max = max(cur_pi_max, mi);
-                scale_for_old = exp2f(mi - new_max);
+                scale_for_old = fp8_fwd_exp2(mi - new_max);
             }
+#endif
             mi = new_max;   // mi is still identical within each row
             if (lane_idx == 0) {
                 plan.o_rescale_warp_needed[warp_idx] =
@@ -356,12 +492,24 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 split_s_pipeline && token_group != 0
                     ? NUM_ELEMS_PER_THREAD / 2
                     : NUM_ELEMS_PER_THREAD;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
+                if (i < first_local_s_elems) {
+                    const uint32_t packed_s = fp8_fwd_exp2_quad_packed(
+                        p[i + 0], p[i + 1], p[i + 2], p[i + 3]
+                    );
+                    s[i / 4] = packed_s;
+                    cur_sum = __uint_as_float(packed_s);
+                }
+            }
+#else
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 2) {
                 if (i < first_local_s_elems) {
                     const float2 softmax_s = make_float2(
-                        exp2f(p[i + 0] - new_max),
-                        exp2f(p[i + 1] - new_max)
+                        fp8_fwd_exp2(p[i + 0] - new_max),
+                        fp8_fwd_exp2(p[i + 1] - new_max)
                     );
                     cur_sum += softmax_s.x + softmax_s.y;
                     const float2 s_pair = ku::float2_mul(
@@ -375,6 +523,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     p[i + 1] = s_pair.y;
                 }
             }
+#endif
             // const float s_max = max(
             //     local_s_max,
             //     plan.rowwise_li_buf[idx_in_warpgroup ^ B_H]
@@ -392,6 +541,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 inv_current_s_scale,
                 inv_current_s_scale
             );
+#if !defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
             CUTE_UNROLL
             for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 4) {
                 if (i < first_local_s_elems) {
@@ -411,6 +561,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         | (static_cast<uint32_t>(s23) << 16);
                 }
             }
+#endif
 
             // Warp 8 can keep consuming S(k-1) while WG0 publishes S(k) into
             // the other stage.  A stage is not reused until the preceding
@@ -445,13 +596,25 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             }
 
             if (split_s_pipeline && token_group != 0) {
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                CUTE_UNROLL
+                for (int i = NUM_ELEMS_PER_THREAD / 2;
+                     i < NUM_ELEMS_PER_THREAD;
+                     i += 4) {
+                    const uint32_t packed_s = fp8_fwd_exp2_quad_packed(
+                        p[i + 0], p[i + 1], p[i + 2], p[i + 3]
+                    );
+                    s[i / 4] = packed_s;
+                    cur_sum = __uint_as_float(packed_s);
+                }
+#else
                 CUTE_UNROLL
                 for (int i = NUM_ELEMS_PER_THREAD / 2;
                      i < NUM_ELEMS_PER_THREAD;
                      i += 2) {
                     const float2 softmax_s = make_float2(
-                        exp2f(p[i + 0] - new_max),
-                        exp2f(p[i + 1] - new_max)
+                        fp8_fwd_exp2(p[i + 0] - new_max),
+                        fp8_fwd_exp2(p[i + 1] - new_max)
                     );
                     cur_sum += softmax_s.x + softmax_s.y;
                     const float2 s_pair = ku::float2_mul(
@@ -483,6 +646,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     s[i / 4] = static_cast<uint32_t>(s01)
                         | (static_cast<uint32_t>(s23) << 16);
                 }
+#endif
                 CUTE_UNROLL
                 for (int i = NUM_ELEMS_PER_THREAD / 2;
                      i < NUM_ELEMS_PER_THREAD;
@@ -496,7 +660,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         );
                 }
             }
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            li = cur_sum;
+#else
             li = fma(li, scale_for_old, cur_sum);
+#endif
             // S can be consumed as soon as its SMEM stores are visible. O
             // is independently handed off by WG3.
             fence_view_async_shared();
@@ -515,34 +683,56 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         // Exchange li
         plan.rowwise_li_buf[idx_in_warpgroup] = li;
         NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+        li = plan.rowwise_li_buf[idx_in_warpgroup ^ B_H];
+#else
         li += plan.rowwise_li_buf[idx_in_warpgroup ^ B_H];
+#endif
 
         // Store mi and li
         if (idx_in_warpgroup < 64) {
             int global_index = s_q_idx*params.h_q + idx_in_warpgroup;
             float cur_lse = CUDART_INF_F;
             if (li != 0.0f) {
-                cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                cur_lse = fp8_fwd_log(li);
+#else
+                cur_lse = fmaf(mi, CUDART_LN2_F, fp8_fwd_log(li));
+#endif
             }
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            params.max_logits[global_index] = real_mi;
+#else
             params.max_logits[global_index] = real_mi * CUDART_LN2_F;
+#endif
             params.lse[global_index] = cur_lse;
         }
 
         // Fetch dO if necessary
 
         // Store O
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+        const bool have_valid_indices = true;
+#else
         const bool have_valid_indices = __any_sync(
             0xffffffff, li != 0.0f
         );
+#endif
         float output_scale = 1.0f;
         if (have_valid_indices) {
             const float attn_sink = params.attn_sink == nullptr
                 ? -CUDART_INF_F
                 : __ldg(params.attn_sink + (idx_in_warpgroup % 64))
                     * CUDART_L2E_F;
-            output_scale = __fdividef(
-                1.0f, li + exp2f(attn_sink - mi)
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            output_scale = fp8_fwd_rcp(
+                fp8_fwd_bit_passthrough(fp8_fwd_exp2(attn_sink))
             );
+#else
+            output_scale = fp8_fwd_rcp(
+                li + fp8_fwd_exp2(attn_sink - mi)
+            );
+#endif
         }
         const int final_sv_buf = (num_k_blocks - 1) % NUM_MAIN_BUFS;
         const int o_smem_buf = (final_sv_buf + 1) % NUM_MAIN_BUFS;
@@ -571,7 +761,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 o[i].x = o[i].y = 0.0f;
         }
         constexpr float FINAL_S_SCALE = 1.0f / 448.0f;
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+        const float output_base_scale = output_scale;
+#else
         const float output_base_scale = output_scale * FINAL_S_SCALE;
+#endif
 
         bf16* sO_addrs[8];
         CUTE_UNROLL
@@ -608,7 +802,9 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 // into the two TMEM row halves of its 64-column stripe.
                 const int d_group = c * 4 + k * 2
                     + idx_in_warpgroup / B_H;
-#if defined(FP8_FWD_QK576)
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                const float output_dequant_scale = output_base_scale;
+#elif defined(FP8_FWD_QK576)
                 const float output_dequant_scale = output_base_scale
                     * ue8m0_bits_to_float(
                         __ldg(params.kv_scale_w + d_group)
@@ -625,6 +821,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 // Convert and store
                 CUTE_UNROLL
                 for (int i = 0; i < B_EPI/8; ++i) {
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+                    float4 o_bits = make_float4(
+                        output_dequant_scale,
+                        o[i * 4 + 0].y,
+                        o[i * 4 + 1].x,
+                        o[i * 4 + 1].y
+                    );
+                    *reinterpret_cast<uint128_t*>(
+                        sO_addrs[i] + d_group * B_EPI * B_H
+                    ) = reinterpret_cast<uint128_t&>(o_bits);
+#else
                     nv_bfloat162 o_bf16[4];
                     CUTE_UNROLL
                     for (int j = 0; j < 4; ++j) {
@@ -634,12 +841,18 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
                     }
                     *(uint128_t*)(sO_addrs[i] + d_group * B_EPI * B_H) = *(uint128_t*)(o_bf16);
+#endif
                 }
 
                 // Sync
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
-                
+
+#if defined(FP8_FWD_DISABLE_O_TMA_STORE)
+                // Keep the epilogue SMEM stores observable to the compiler
+                // while removing only the asynchronous global store.
+                asm volatile("" : : "l"(sO_addrs[0]) : "memory");
+#else
                 if (warp_idx == 0 && elect_one_sync()) {
                     int epi_chunk_idx = c * 4 + k * 2;
                     cute::copy(
@@ -656,6 +869,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                         thr_tma.partition_D(tma_gO(_, _, epi_chunk_idx))
                     );
                 }
+#endif
             }
         }
         if (warp_idx == 0) {
@@ -770,10 +984,21 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(
                         B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
                     );
+#if defined(FP8_FWD_DISABLE_KV_TMA_GATHER)
+                    plan.bar_kv_ready[cur_buf].complete_transaction(
+                        B_TOPK * D_V / NUM_KV_PRODUCER_WARPS * sizeof(e4m3)
+                    );
+                    if constexpr (HAVE_QK_TAIL) {
+                        plan.bar_kv_tail_ready[tail_buf].complete_transaction(
+                            NUM_LOCAL_ROWS_PER_WARP * 4
+                                * TMA_K_TAIL_BYTES * sizeof(e4m3)
+                        );
+                    }
+#else
                     load_kv_part(0);
                     load_kv_part(1);
                     load_kv_tail();
-                    
+#endif
                 } else {
                     // NOTE See head128/phase1.cuh for this TMA skipping technique
                     plan.bar_kv_ready[cur_buf].arrive_and_expect_tx(
@@ -810,7 +1035,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
             current_max = plan.rowwise_max_buf[
                 idx_in_warpgroup % B_H
             ];
-            o_rescale = exp2f(previous_max - current_max);
+#if defined(FP8_FWD_DISABLE_NON_SFU_NON_GEMM)
+            o_rescale = fp8_fwd_exp2(current_max);
+#else
+            o_rescale = fp8_fwd_exp2(previous_max - current_max);
+#endif
         }
         plan.bar_o_rescale_decision_consumed.arrive();
 
@@ -851,6 +1080,11 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
         plan.bar_prologue.arrive_and_expect_tx(
             B_H * (D_V + (HAVE_QK_TAIL ? 64 : 0)) * sizeof(e4m3)
         );
+#if defined(FP8_FWD_DISABLE_Q_TMA_LOAD)
+        plan.bar_prologue.complete_transaction(
+            B_H * (D_V + (HAVE_QK_TAIL ? 64 : 0)) * sizeof(e4m3)
+        );
+#endif
         plan.bar_prologue.wait(0);
         ku::tcgen05_after_thread_sync();
         CUTE_UNROLL
@@ -911,9 +1145,13 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                 ku::tcgen05_after_thread_sync();
 
                 if (p_stage == 0) {
+#if !defined(FP8_FWD_DISABLE_GEMM)
                     ku::utcmma_ts(tiled_mma_P, tQ, sK, tP0, true);
+#endif
                 } else {
+#if !defined(FP8_FWD_DISABLE_GEMM)
                     ku::utcmma_ts(tiled_mma_P, tQ, sK, tP1, true);
+#endif
                 }
 
                 if constexpr (HAVE_QK_TAIL) {
@@ -938,13 +1176,17 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                     );
                     ku::tcgen05_after_thread_sync();
                     if (p_stage == 0) {
+#if !defined(FP8_FWD_DISABLE_GEMM)
                         ku::utcmma_ts(
                             tiled_mma_P, tQ_tail, sK_tail, tP0, false
                         );
+#endif
                     } else {
+#if !defined(FP8_FWD_DISABLE_GEMM)
                         ku::utcmma_ts(
                             tiled_mma_P, tQ_tail, sK_tail, tP1, false
                         );
+#endif
                     }
                     ku::umma_arrive_noelect(plan.bar_qk_done[tail_buf]);
                 } else {
@@ -995,6 +1237,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                              ++dv_block) {
                             tO.data().get() = tmem_cols::O
                                 + dv_block * SV_TMEM_COLS_PER_BLOCK;
+#if !defined(FP8_FWD_DISABLE_GEMM)
                             ku::utcmma_ss(
                                 tiled_mma_O,
                                 sS,
@@ -1002,6 +1245,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                                 tO,
                                 k == 1
                             );
+#endif
                             if (dv_block + 1 < NUM_SV_TMEM_BLOCKS) {
                                 ku::umma_arrive_noelect(
                                     plan.bar_sv_block_done[cur_buf][dv_block]
@@ -1030,6 +1274,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                                 + dv_block * SV_TMEM_COLS_PER_BLOCK;
                             CUTE_UNROLL
                             for (int k_part = 0; k_part < 3; ++k_part) {
+#if !defined(FP8_FWD_DISABLE_GEMM)
                                 ku::utcmma_ss(
                                     tiled_mma_O,
                                     sS_k32(_, _, k_part),
@@ -1037,6 +1282,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                                     tO,
                                     k == 1 && k_part == 0
                                 );
+#endif
                             }
                         }
 
@@ -1050,6 +1296,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                              ++dv_block) {
                             tO.data().get() = tmem_cols::O
                                 + dv_block * SV_TMEM_COLS_PER_BLOCK;
+#if !defined(FP8_FWD_DISABLE_GEMM)
                             ku::utcmma_ss(
                                 tiled_mma_O,
                                 sS_k32(_, _, 3),
@@ -1057,6 +1304,7 @@ sprase_fp8_attn_fwd_kernel(__grid_constant__ const Head64Fp8SparseAttnFwdParams 
                                 tO,
                                 false
                             );
+#endif
                             if (dv_block + 1 == NUM_SV_TMEM_BLOCKS) {
                                 ku::umma_arrive_noelect(
                                     plan.bar_sv_done[cur_buf]

@@ -16,6 +16,104 @@
 
 namespace sm100::decode::head64 {
 
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+CUTE_DEVICE
+uint64_t decode_h64_timing_now_ns() {
+    uint64_t timestamp;
+    asm volatile(
+        "mov.u64 %0, %%globaltimer;"
+        : "=l"(timestamp)
+        :
+        : "memory"
+    );
+    return timestamp;
+}
+
+#define DECODE_H64_TIMEPOINT(sample, destination)                              \
+    do {                                                                        \
+        if (sample) {                                                           \
+            (destination) = static_cast<uint32_t>(                            \
+                decode_h64_timing_now_ns() - plan.timing.origin_ns);           \
+        }                                                                       \
+    } while (0)
+
+#define DECODE_H64_TIMED_WAIT(sample, destination, wait_expression)             \
+    do {                                                                        \
+        uint64_t decode_h64_wait_begin_ns = 0;                                  \
+        if (sample) {                                                           \
+            decode_h64_wait_begin_ns = decode_h64_timing_now_ns();              \
+        }                                                                       \
+        wait_expression;                                                        \
+        if (sample) {                                                           \
+            (destination) = static_cast<uint32_t>(                              \
+                decode_h64_timing_now_ns() - decode_h64_wait_begin_ns);         \
+        }                                                                       \
+    } while (0)
+
+#if defined(DECODE_HEAD64_TIMING_PRINT)
+template <typename SharedMemoryPlanT>
+CUTE_DEVICE
+void print_decode_h64_timing(const SharedMemoryPlanT& plan, int num_tiles) {
+    const auto& timing = plan.timing;
+    const int traced_tiles = min(num_tiles, DECODE_H64_TIMING_MAX_TILES);
+    cute::print(
+        "DECODE_H64_TIME header unit=ns tiles=%d traced=%d origin=%llu\n",
+        num_tiles, traced_tiles, static_cast<unsigned long long>(timing.origin_ns));
+    CUTE_UNROLL
+    for (int warp = 0; warp < 12; ++warp) {
+        cute::print("DECODE_H64_TIME branch warp=%d end=%u\n", warp, timing.branch_end_ns[warp]);
+    }
+    cute::print(
+        "DECODE_H64_TIME q q_tma_wait=%u q_tmem_committed=%u final_sv_wait=%u "
+        "final_sv_ready=%u epilogue_start=%u epilogue_tmem=%u epilogue_smem=%u "
+        "epilogue_tma=%u\n",
+        timing.q_tma_wait_ns, timing.q_tmem_committed_ns, timing.final_sv_wait_ns,
+        timing.final_sv_ready_ns, timing.epilogue_start_ns, timing.epilogue_tmem_done_ns,
+        timing.epilogue_smem_done_ns, timing.epilogue_tma_done_ns);
+    for (int tile = 0; tile < traced_tiles; ++tile) {
+        const auto& m = timing.mma[tile];
+        const auto& r = timing.raw[tile];
+        const auto& p = timing.rope[tile];
+        const auto& i = timing.index[tile];
+        const auto& d = timing.dequant[tile];
+        CUTE_UNROLL
+        for (int warp = 0; warp < 4; ++warp) {
+            const auto& w = timing.wg0[warp][tile];
+            cute::print(
+                "DECODE_H64_TIME tile=%d wg0 warp=%d start=%u qk_wait=%u "
+                "valid_wait=%u waits_done=%u p_loaded=%u rowmax=%u softmax=%u "
+                "sv_wait=%u s_published=%u o_rescale=%u\n",
+                tile, warp, w.tile_start_ns, w.qk_wait_ns, w.valid_wait_ns,
+                w.waits_done_ns, w.p_loaded_ns, w.rowmax_ready_ns,
+                w.softmax_ready_ns, w.sv_wait_ns, w.s_published_ns,
+                w.o_rescale_done_ns);
+        }
+        cute::print(
+            "DECODE_H64_TIME tile=%d mma start=%u rope_wait=%u nope_wait=%u qk_issued=%u "
+            "qk_committed=%u sv_wait=%u sv_issued=%u sv_committed=%u\n",
+            tile, m.tile_start_ns, m.rope_wait_ns, m.nope_wait_ns, m.qk_issued_ns, m.qk_committed_ns,
+            m.sv_wait_ns, m.sv_issued_ns, m.sv_committed_ns);
+        cute::print(
+            "DECODE_H64_TIME tile=%d raw start=%u valid_wait=%u raw_free_wait=%u "
+            "raw_issued=%u published=%u rope start=%u valid_wait=%u rope_wait=%u "
+            "rope_issued=%u published=%u\n",
+            tile, r.tile_start_ns, r.valid_wait_ns, r.raw_free_wait_ns, r.raw_issued_ns,
+            r.published_ns, p.tile_start_ns, p.valid_wait_ns, p.rope_wait_ns,
+            p.rope_issued_ns, p.published_ns);
+        cute::print(
+            "DECODE_H64_TIME tile=%d index start=%u free_wait=%u ready=%u "
+            "dequant start=%u valid_wait=%u raw_wait=%u sv_wait=%u converted=%u "
+            "published=%u\n",
+            tile, i.tile_start_ns, i.buffer_free_wait_ns, i.ready_ns, d.tile_start_ns,
+            d.valid_wait_ns, d.raw_wait_ns, d.sv_wait_ns, d.converted_ns, d.published_ns);
+    }
+}
+#endif  // DECODE_HEAD64_TIMING_PRINT
+#else
+#define DECODE_H64_TIMEPOINT(sample, destination) do { } while (0)
+#define DECODE_H64_TIMED_WAIT(sample, destination, wait_expression) do { wait_expression; } while (0)
+#endif
+
 template<ModelType MODEL_TYPE>
 template<typename TmaParam>
 __device__ void
@@ -65,6 +163,21 @@ KernelTemplate<MODEL_TYPE>
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
     __syncthreads();
+
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+    if (s_q_idx == 0 && partition_idx == 0) {
+        uint32_t* timing_words = reinterpret_cast<uint32_t*>(&plan.timing);
+        CUTE_UNROLL
+        for (int i = threadIdx.x; i < sizeof(DecodeH64Timing) / sizeof(uint32_t); i += NUM_THREADS) {
+            timing_words[i] = 0;
+        }
+    }
+    __syncthreads();
+    if (s_q_idx == 0 && partition_idx == 0 && threadIdx.x == 0) {
+        plan.timing.origin_ns = decode_h64_timing_now_ns();
+    }
+    __syncthreads();
+#endif
 
     struct MainLoopArgs {
         int batch_idx, start_block_idx, end_block_idx;
@@ -158,9 +271,37 @@ KernelTemplate<MODEL_TYPE>
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+                [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                const bool trace_wg0_tile = s_q_idx == 0 && partition_idx == 0
+                    && args.batch_idx == 0
+                    && lane_idx == 0 && warp_idx < 4
+                    && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+                if (trace_wg0_tile && warp_idx == 0 && trace_tile_idx == 0) {
+                    plan.timing.num_tiles = static_cast<uint32_t>(min(
+                        args.end_block_idx - args.start_block_idx,
+                        DECODE_H64_TIMING_MAX_TILES));
+                }
+#endif
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].tile_start_ns
+                );
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);  // Make sure all intermediate buffers (including p_exchange_buf, rowwise max_buf) are free
-                plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);    // Put the barrier wait here for more code reordering space
-                plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase);
+                DECODE_H64_TIMED_WAIT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].valid_wait_ns,
+                    plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase)
+                );
+                DECODE_H64_TIMED_WAIT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].qk_wait_ns,
+                    plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase)
+                );
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].waits_done_ns
+                );
                 ku::tcgen05_after_thread_sync();
 
                 // Load P
@@ -174,6 +315,10 @@ KernelTemplate<MODEL_TYPE>
                 }
                 cutlass::arch::fence_view_async_tmem_load();
                 ku::tcgen05_before_thread_sync();
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].p_loaded_ns
+                );
 
                 // Reduce within shared mem
                 {
@@ -227,6 +372,10 @@ KernelTemplate<MODEL_TYPE>
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);    // This also separates "reading p_exchange_buf" and "writing S"
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                 cur_pi_max = max(cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup^64]);
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].rowmax_ready_ns
+                );
                 real_mi = max(real_mi, cur_pi_max);
                 bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
                 // By this point:
@@ -258,6 +407,10 @@ KernelTemplate<MODEL_TYPE>
                     s[i] = __float22bfloat162_rn(d);
                 }
                 li = fma(li, scale_for_old, (cur_sum.x + cur_sum.y));
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].softmax_ready_ns
+                );
 
                 // Write S
                 CUTE_UNROLL
@@ -289,9 +442,17 @@ KernelTemplate<MODEL_TYPE>
                     }
                     ku::tcgen05_before_thread_sync();
                 }
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].o_rescale_done_ns
+                );
                 
                 fence_view_async_shared();
                 plan.bar_so_ready[rs.buf_idx].arrive();
+                DECODE_H64_TIMEPOINT(
+                    trace_wg0_tile,
+                    plan.timing.wg0[warp_idx][trace_tile_idx].s_published_ns
+                );
 
                 if (block_idx != args.end_block_idx-1) {
                     rs.update();    // Don't update rs for the last round since we want to wait for the last SV gemm
@@ -324,9 +485,17 @@ KernelTemplate<MODEL_TYPE>
                 }
             }
         
-            plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase);
+            [[maybe_unused]] const bool trace_wg0_tail = s_q_idx == 0 && partition_idx == 0
+                && lane_idx == 0 && warp_idx == 0;
+            DECODE_H64_TIMED_WAIT(
+                trace_wg0_tail,
+                plan.timing.final_sv_wait_ns,
+                plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase)
+            );
             rs.update();
             ku::tcgen05_after_thread_sync();
+            DECODE_H64_TIMEPOINT(trace_wg0_tail, plan.timing.final_sv_ready_ns);
+            DECODE_H64_TIMEPOINT(trace_wg0_tail, plan.timing.epilogue_start_ns);
 
             if (args.is_last_batch) {
                 cudaTriggerProgrammaticLaunchCompletion();
@@ -352,6 +521,10 @@ KernelTemplate<MODEL_TYPE>
                     // Load
                     ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + i*B_EPI, o);
                     cutlass::arch::fence_view_async_tmem_load();
+                    DECODE_H64_TIMEPOINT(
+                        trace_wg0_tail && warp_idx == 0 && i == 0,
+                        plan.timing.epilogue_tmem_done_ns
+                    );
                     // Scale & Convert
                     CUTE_UNROLL
                     for (int j = 0; j < B_EPI/2; ++j) {
@@ -363,6 +536,10 @@ KernelTemplate<MODEL_TYPE>
                     CUTE_UNROLL
                     for (int j = 0; j < B_EPI / 8; ++j)
                         *(__int128_t*)(sO_bases[j] + col_base*B_H) = *(__int128_t*)(&o_bf16[j*4]);
+                    DECODE_H64_TIMEPOINT(
+                        trace_wg0_tail && warp_idx == 0 && i == (D_V/2) / B_EPI - 1,
+                        plan.timing.epilogue_smem_done_ns
+                    );
                     // Sync
                     fence_view_async_shared();
                     NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -381,6 +558,10 @@ KernelTemplate<MODEL_TYPE>
                             thr_tma.partition_D(tma_gO(_, _, col_base/64 + (D_V/4)/64))
                         );
                     }
+                    DECODE_H64_TIMEPOINT(
+                        trace_wg0_tail && warp_idx == 0 && i == (D_V/2) / B_EPI - 1,
+                        plan.timing.epilogue_tma_done_ns
+                    );
                 }
                 cute::tma_store_arrive();
             } else {
@@ -459,7 +640,11 @@ KernelTemplate<MODEL_TYPE>
                     );
                 }
                 plan.bar_q_tma.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
-                plan.bar_q_tma.wait(args.bar_phase_batch_rel);
+                DECODE_H64_TIMED_WAIT(
+                    s_q_idx == 0 && partition_idx == 0 && warp_idx == 4,
+                    plan.timing.q_tma_wait_ns,
+                    plan.bar_q_tma.wait(args.bar_phase_batch_rel)
+                );
                 ku::tcgen05_after_thread_sync();
                 // Issue Q (SW128) UTCCP
                 {
@@ -512,6 +697,10 @@ KernelTemplate<MODEL_TYPE>
                     }
                 }
                 ku::umma_arrive_noelect(plan.bar_q_utccp);
+                DECODE_H64_TIMEPOINT(
+                    s_q_idx == 0 && partition_idx == 0 && warp_idx == 4,
+                    plan.timing.q_tmem_committed_ns
+                );
 
                 // Allocate tmem tensors
                 TiledMMA tiled_mma_P = TiledMMA_P{};
@@ -529,10 +718,21 @@ KernelTemplate<MODEL_TYPE>
                 // Mainloop
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+                    [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                    const bool trace_mma_tile = s_q_idx == 0 && partition_idx == 0
+                        && args.batch_idx == 0
+                        && warp_idx == 4 && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+#endif
+                    DECODE_H64_TIMEPOINT(trace_mma_tile, plan.timing.mma[trace_tile_idx].tile_start_ns);
                     if constexpr (MODEL_TYPE == ModelType::V32) {
                         // V3.2: RoPE behaves like an extra block with size 64, so we can do RoPE first
                         // QK RoPE
-                        plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        DECODE_H64_TIMED_WAIT(
+                            trace_mma_tile,
+                            plan.timing.mma[trace_tile_idx].rope_wait_ns,
+                            plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase)
+                        );
                         ku::tcgen05_after_thread_sync();
                         Tensor tQ_rope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_ROPE/2>>{})
@@ -542,7 +742,11 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
                         // QK NoPE
-                        plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        DECODE_H64_TIMED_WAIT(
+                            trace_mma_tile,
+                            plan.timing.mma[trace_tile_idx].nope_wait_ns,
+                            plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase)
+                        );
                         ku::tcgen05_after_thread_sync();
                         Tensor tQ_nope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_NOPE/2>>{})
@@ -559,8 +763,16 @@ KernelTemplate<MODEL_TYPE>
                         // |1|3|5|7|
                         // 
                         // So we must wait for both the NoPE and the RoPE part, and then perform dual GEMM
-                        plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase);
-                        plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        DECODE_H64_TIMED_WAIT(
+                            trace_mma_tile,
+                            plan.timing.mma[trace_tile_idx].rope_wait_ns,
+                            plan.bar_rope_ready[rs.buf_idx].wait(rs.bar_phase)
+                        );
+                        DECODE_H64_TIMED_WAIT(
+                            trace_mma_tile,
+                            plan.timing.mma[trace_tile_idx].nope_wait_ns,
+                            plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase)
+                        );
                         ku::tcgen05_after_thread_sync();
 
                         Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
@@ -571,14 +783,22 @@ KernelTemplate<MODEL_TYPE>
                         ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, true);
                     }
                     ku::umma_arrive_noelect(plan.bar_qk_done[rs.buf_idx]);
+                    DECODE_H64_TIMEPOINT(trace_mma_tile, plan.timing.mma[trace_tile_idx].qk_issued_ns);
+                    DECODE_H64_TIMEPOINT(trace_mma_tile, plan.timing.mma[trace_tile_idx].qk_committed_ns);
 
                     // SV
-                    plan.bar_so_ready[rs.buf_idx].wait(rs.bar_phase);
+                    DECODE_H64_TIMED_WAIT(
+                        trace_mma_tile,
+                        plan.timing.mma[trace_tile_idx].sv_wait_ns,
+                        plan.bar_so_ready[rs.buf_idx].wait(rs.bar_phase)
+                    );
                     ku::tcgen05_after_thread_sync();
                     Tensor sS = make_tensor(make_smem_ptr(plan.s_p.s.data()), SmemLayoutS{});
                     Tensor sV = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].nope.data()), SmemLayoutKTilesTransposed_SW128<D_V/64>{});  // NOTE: For MODEL1, it "expands" to the RoPE part.
                     ku::utcmma_ss(tiled_mma_O, sS, sV, tO, block_idx == args.start_block_idx);
+                    DECODE_H64_TIMEPOINT(trace_mma_tile, plan.timing.mma[trace_tile_idx].sv_issued_ns);
                     ku::umma_arrive_noelect(plan.bar_sv_done[rs.buf_idx]);
+                    DECODE_H64_TIMEPOINT(trace_mma_tile, plan.timing.mma[trace_tile_idx].sv_committed_ns);
 
                     rs.update();
                 }
@@ -588,10 +808,22 @@ KernelTemplate<MODEL_TYPE>
             run_main_loop([&](const MainLoopArgs &args) {
                 plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
-                CUTE_NO_UNROLL
-                for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
-                    plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                    plan.bar_raw_free[rs.buf_idx].wait(rs.bar_phase^1);
+            CUTE_NO_UNROLL
+            for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+                [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                const bool trace_raw_tile = s_q_idx == 0 && partition_idx == 0
+                    && args.batch_idx == 0
+                    && warp_idx == 5 && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+#endif
+                DECODE_H64_TIMEPOINT(trace_raw_tile, plan.timing.raw[trace_tile_idx].tile_start_ns);
+                plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+                DECODE_H64_TIMEPOINT(trace_raw_tile, plan.timing.raw[trace_tile_idx].valid_wait_ns);
+                DECODE_H64_TIMED_WAIT(
+                    trace_raw_tile,
+                    plan.timing.raw[trace_tile_idx].raw_free_wait_ns,
+                    plan.bar_raw_free[rs.buf_idx].wait(rs.bar_phase^1)
+                );
                     int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
                     int4 nxt_cur_indices;
                     CUTE_UNROLL
@@ -608,9 +840,11 @@ KernelTemplate<MODEL_TYPE>
                         );
                         cur_indices = nxt_cur_indices;
                     }
+                    DECODE_H64_TIMEPOINT(trace_raw_tile, plan.timing.raw[trace_tile_idx].raw_issued_ns);
                     plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_NOPE*sizeof(e4m3));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
+                DECODE_H64_TIMEPOINT(trace_raw_tile, plan.timing.raw[trace_tile_idx].published_ns);
                 }
             });
         } else if (warp_idx == 6 && elect_one_sync()) {
@@ -620,11 +854,27 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+                    [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                    const bool trace_rope_tile = s_q_idx == 0 && partition_idx == 0
+                        && args.batch_idx == 0
+                        && warp_idx == 6 && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+#endif
+                    DECODE_H64_TIMEPOINT(trace_rope_tile, plan.timing.rope[trace_tile_idx].tile_start_ns);
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+                    DECODE_H64_TIMEPOINT(trace_rope_tile, plan.timing.rope[trace_tile_idx].valid_wait_ns);
                     if constexpr (MODEL_TYPE == ModelType::V32) {
-                        plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase^1);
+                        DECODE_H64_TIMED_WAIT(
+                            trace_rope_tile,
+                            plan.timing.rope[trace_tile_idx].rope_wait_ns,
+                            plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase^1)
+                        );
                     } else {
-                        plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
+                        DECODE_H64_TIMED_WAIT(
+                            trace_rope_tile,
+                            plan.timing.rope[trace_tile_idx].rope_wait_ns,
+                            plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1)
+                        );
                     }
                     int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
                     int4 nxt_cur_indices;
@@ -645,9 +895,11 @@ KernelTemplate<MODEL_TYPE>
                         }
                         cur_indices = nxt_cur_indices;
                     }
+                    DECODE_H64_TIMEPOINT(trace_rope_tile, plan.timing.rope[trace_tile_idx].rope_issued_ns);
                     plan.bar_rope_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_ROPE*sizeof(bf16));
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
                     rs.update();
+                    DECODE_H64_TIMEPOINT(trace_rope_tile, plan.timing.rope[trace_tile_idx].published_ns);
                 }
             });
         } else if (warp_idx == 7) {
@@ -673,6 +925,13 @@ KernelTemplate<MODEL_TYPE>
                 struct IsOrigBlock {};
                 struct IsExtraBlock {};
                 auto process_one_block = [&](int block_idx, auto is_extra_block_t) {
+                    [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                    const bool trace_index_tile = s_q_idx == 0 && partition_idx == 0
+                        && args.batch_idx == 0
+                        && lane_idx == 0 && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+#endif
+                    DECODE_H64_TIMEPOINT(trace_index_tile, plan.timing.index[trace_tile_idx].tile_start_ns);
                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
@@ -688,7 +947,11 @@ KernelTemplate<MODEL_TYPE>
                         abs_pos = (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2;
                         *(int2*)my_indices = __ldg((int2*)(extra_indices + abs_pos));
                     }
-                    plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
+                    DECODE_H64_TIMED_WAIT(
+                        trace_index_tile,
+                        plan.timing.index[trace_tile_idx].buffer_free_wait_ns,
+                        plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1)
+                    );
 
                     int tma_coords[2];
                     e8m0 scales[2*NUM_SCALES_EACH_TOKEN];
@@ -728,6 +991,7 @@ KernelTemplate<MODEL_TYPE>
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
                     
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].arrive();
+                    DECODE_H64_TIMEPOINT(trace_index_tile, plan.timing.index[trace_tile_idx].ready_ns);
                     rs.update();
                 };
 
@@ -763,9 +1027,28 @@ KernelTemplate<MODEL_TYPE>
 
             CUTE_NO_UNROLL
             for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
-                plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                plan.bar_raw_ready[rs.buf_idx].wait(rs.bar_phase);
-                plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
+                [[maybe_unused]] const int trace_tile_idx = block_idx - args.start_block_idx;
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+                const bool trace_dequant_tile = s_q_idx == 0 && partition_idx == 0
+                    && args.batch_idx == 0
+                    && idx_in_warpgroup == 0 && trace_tile_idx < DECODE_H64_TIMING_MAX_TILES;
+#endif
+                DECODE_H64_TIMEPOINT(trace_dequant_tile, plan.timing.dequant[trace_tile_idx].tile_start_ns);
+                DECODE_H64_TIMED_WAIT(
+                    trace_dequant_tile,
+                    plan.timing.dequant[trace_tile_idx].valid_wait_ns,
+                    plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase)
+                );
+                DECODE_H64_TIMED_WAIT(
+                    trace_dequant_tile,
+                    plan.timing.dequant[trace_tile_idx].raw_wait_ns,
+                    plan.bar_raw_ready[rs.buf_idx].wait(rs.bar_phase)
+                );
+                DECODE_H64_TIMED_WAIT(
+                    trace_dequant_tile,
+                    plan.timing.dequant[trace_tile_idx].sv_wait_ns,
+                    plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1)
+                );
                 uint32_t cur_nope_base_uint_addr = cute::cast_smem_ptr_to_uint(rs.buf_idx == 0 ? nope0_base : nope1_base);
                 e4m3* raw_nope_base = rs.buf_idx == 0 ? raw_nope0_base : raw_nope1_base;
                 auto st_128b = [&](int local_row_idx, int local_col_idx, __int128_t &data) {
@@ -833,14 +1116,30 @@ KernelTemplate<MODEL_TYPE>
                         }
                     }
                 }
+                DECODE_H64_TIMEPOINT(trace_dequant_tile, plan.timing.dequant[trace_tile_idx].converted_ns);
                 cutlass::arch::fence_view_async_shared();
                 plan.bar_nope_ready[rs.buf_idx].arrive();
                 plan.bar_raw_free[rs.buf_idx].arrive();
                 plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
+                DECODE_H64_TIMEPOINT(trace_dequant_tile, plan.timing.dequant[trace_tile_idx].published_ns);
                 rs.update();
             }
         });
     }
+#if defined(DECODE_HEAD64_BARRIER_TIMING)
+    if (s_q_idx == 0 && partition_idx == 0 && lane_idx == 0) {
+        plan.timing.branch_end_ns[warp_idx] = static_cast<uint32_t>(
+            decode_h64_timing_now_ns() - plan.timing.origin_ns);
+    }
+#if defined(DECODE_HEAD64_TIMING_PRINT) || defined(DECODE_HEAD64_TIMING_FINAL_SYNC)
+    __syncthreads();
+#endif
+#if defined(DECODE_HEAD64_TIMING_PRINT)
+    if (s_q_idx == 0 && partition_idx == 0 && threadIdx.x == 0) {
+        print_decode_h64_timing(plan, static_cast<int>(plan.timing.num_tiles));
+    }
+#endif
+#endif
 #else
     if (cute::thread0()) {
         CUTE_INVALID_CONTROL_PATH("This kernel only supports sm100 ~ sm119");

@@ -55,6 +55,14 @@ if [[ "${FP8_BARRIER_TIMING:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_FWD_BARRIER_TIMING=1 )
 fi
 
+if [[ "${FP8_TIMING_PRINT:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_BARRIER_TIMING=1 -DFP8_FWD_TIMING_PRINT=1 )
+fi
+
+if [[ "${FP8_TIMING_FINAL_SYNC:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_BARRIER_TIMING=1 -DFP8_FWD_TIMING_FINAL_SYNC=1 )
+fi
+
 # Diagnostic-only switches for separating KV global-memory costs from the
 # rest of the producer pipeline.  They default to the numerically-correct path.
 if [[ "${FP8_BENCH_KV_TOKEN_SCALE_CONST:-0}" == "1" ]]; then
@@ -87,6 +95,51 @@ if [[ "${FP8_FWD_VECTOR_KV_SCALE_LOAD:-0}" == "1" ]]; then
     NVCC_FLAGS+=( -DFP8_FWD_VECTOR_KV_SCALE_LOAD=1 )
 fi
 
+# Orthogonal instruction-family ablations.  These are benchmark-only and do
+# not preserve numerical results.
+if [[ "${FP8_DISABLE_GEMM:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_GEMM=1 )
+fi
+
+if [[ "${FP8_DISABLE_SFU:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_SFU=1 )
+fi
+
+if [[ "${FP8_DISABLE_NON_SFU_NON_GEMM:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_NON_SFU_NON_GEMM=1 )
+fi
+
+# Independent TMA ablations.  These are benchmark-only and do not preserve
+# numerical results.
+if [[ "${FP8_DISABLE_Q_TMA_LOAD:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_Q_TMA_LOAD=1 )
+fi
+
+if [[ "${FP8_DISABLE_KV_TMA_GATHER:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_KV_TMA_GATHER=1 )
+fi
+
+if [[ "${FP8_DISABLE_O_TMA_STORE:-0}" == "1" ]]; then
+    NVCC_FLAGS+=( -DFP8_FWD_DISABLE_O_TMA_STORE=1 )
+fi
+
+if [[ "${FP8_COMPILE_PREFILL_ONLY:-0}" == "1" ]]; then
+    FP8_PREFILL_OUT_DIR="${FP8_PREFILL_OUT_DIR:-/tmp}"
+    FP8_PREFILL_D_QK="${FP8_PREFILL_D_QK:-all}"
+    mkdir -p "$FP8_PREFILL_OUT_DIR"
+    if [[ "$FP8_PREFILL_D_QK" == "all" || "$FP8_PREFILL_D_QK" == "512" ]]; then
+        "$NVCC" "${NVCC_FLAGS[@]}" \
+            "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu" \
+            -o "$FP8_PREFILL_OUT_DIR/fp8_prefill_k512_pic.o"
+    fi
+    if [[ "$FP8_PREFILL_D_QK" == "all" || "$FP8_PREFILL_D_QK" == "576" ]]; then
+        "$NVCC" "${NVCC_FLAGS[@]}" \
+            "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
+            -o "$FP8_PREFILL_OUT_DIR/fp8_prefill_k576_pic.o"
+    fi
+    exit 0
+fi
+
 # "$CXX" \
 #     "${INCLUDES[@]}" \
 #     -O3 -std=c++20 -DNDEBUG -Wno-deprecated-declarations \
@@ -104,9 +157,14 @@ fi
 #     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
 #     -o /tmp/fp8_prefill_k576_pic.o
 
+FP8_DECODE_OBJECT="${FP8_DECODE_OBJECT:-/tmp/fp8_decode_pic.o}"
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/decode/fp8_head64/instantiations/model1.cu" \
-    -o /tmp/fp8_decode_pic.o
+    -o "$FP8_DECODE_OBJECT"
+
+if [[ "${FP8_COMPILE_DECODE_ONLY:-0}" == "1" ]]; then
+    exit 0
+fi
 
 # "$NVCC" "${NVCC_FLAGS[@]}" \
 #     "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
@@ -116,11 +174,12 @@ fi
 #     "$ROOT/csrc/smxx/decode/combine/combine.cu" \
 #     -o /tmp/fp8_combine_pic.o
 
+FP8_EXTENSION_OUTPUT="${FP8_EXTENSION_OUTPUT:-/tmp/fp8_test_ext.so}"
 "$CXX" -shared \
     /tmp/fp8_api_pic.o \
     /tmp/fp8_prefill_k512_pic.o \
     /tmp/fp8_prefill_k576_pic.o \
-    /tmp/fp8_decode_pic.o \
+    "$FP8_DECODE_OBJECT" \
     /tmp/fp8_sched_pic.o \
     /tmp/fp8_combine_pic.o \
     -L"$TORCH_LIB" \
@@ -134,4 +193,4 @@ fi
     -L"$CUDA_HOME/lib64" \
     -Wl,-rpath,"$CUDA_HOME/lib64" \
     -lcudart \
-    -o /tmp/fp8_test_ext.so
+    -o "$FP8_EXTENSION_OUTPUT"

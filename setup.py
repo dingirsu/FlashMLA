@@ -41,8 +41,8 @@ def get_arch_flags():
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    # if not DISABLE_SM90:
+    #     arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
 
 def get_nvcc_thread_args():

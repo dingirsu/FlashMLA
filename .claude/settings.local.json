@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rg --files /share/home/jintao/weijia/FlashMLA)",
+      "Bash(rg *)",
+      "Bash(python3 *)",
+      "Bash(git show *)",
+      "Read(//tmp/**)"
+    ]
+  }
+}

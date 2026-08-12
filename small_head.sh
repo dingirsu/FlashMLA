@@ -19,6 +19,9 @@ case "${1:-build}" in
         "$PYTHON" -m pytest -q \
             tests/test_sm100_sparse_small_topk_fwd.py -s
         ;;
+    bench)
+        "$PYTHON" run_small_topk_head64.py "${@:2}"
+        ;;
     bwd)
         "$PYTHON" -m pytest -q \
             tests/test_sm100_sparse_head_small_bwd.py -s
@@ -29,7 +32,7 @@ case "${1:-build}" in
             tests/test_sm100_sparse_head_small_bwd.py -s
         ;;
     *)
-        echo "usage: $0 [build|fwd|bwd|test]" >&2
+        echo "usage: $0 [build|fwd|bench|bwd|test]" >&2
         exit 2
         ;;
 esac

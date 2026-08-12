@@ -31,6 +31,7 @@ def get_extension():
         ROOT / "tests/small_head_test_ext.cpp",
         ROOT / "csrc/sm100/prefill/sparse/fwd/head_small/instantiations/phase1_k128.cu",
         ROOT / "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+        ROOT / "csrc/sm100/prefill/sparse/fwd_for_small_topk/head64/instantiations/phase1_prefill_head64_k512.cu",
         ROOT / "csrc/sm100/prefill/sparse/bwd/head_small/phase1.cu",
         ROOT / "csrc/sm100/prefill/sparse/bwd/head_small/convert.cu",
     ]

@@ -65,3 +65,47 @@ def test_sm100_sparse_fwd_for_small_topk_head128():
     torch.testing.assert_close(out.float(), ref_out, atol=2e-3, rtol=3e-2)
     torch.testing.assert_close(max_logits, ref_max_logits, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("topk", [64, 192])
+def test_sm100_sparse_fwd_for_small_topk_paired_head64(topk):
+    torch.manual_seed(5678 + topk)
+    device = torch.device("cuda")
+    s_q, s_kv, h_q, d_qk = 6, 211, 64, 512
+    sm_scale = d_qk**-0.5
+
+    q = (torch.randn(s_q, h_q, d_qk, device=device) * 0.25).to(torch.bfloat16)
+    kv = (torch.randn(s_kv, 1, d_qk, device=device) * 0.25).to(torch.bfloat16)
+    pair_indices = torch.randint(
+        0, s_kv, (s_q // 2, 1, topk), device=device, dtype=torch.int32
+    )
+    pair_indices[0, 0, 3] = -1
+    pair_indices[1, 0, 7] = s_kv + 5
+    pair_indices[2, 0, 8] = pair_indices[2, 0, 2]
+    pair_topk_length = torch.tensor(
+        [topk, max(topk - 17, 0), max(topk - 41, 0)],
+        device=device,
+        dtype=torch.int32,
+    )
+    attn_sink = torch.linspace(-1.0, 1.0, h_q, device=device, dtype=torch.float32)
+
+    out, max_logits, lse = get_extension().small_topk_head64_fwd(
+        q,
+        kv,
+        pair_indices,
+        sm_scale,
+        attn_sink,
+        pair_topk_length,
+    )
+
+    token_to_pair = torch.arange(s_q, device=device) // 2
+    token_indices = pair_indices.index_select(0, token_to_pair)
+    token_topk_length = pair_topk_length.index_select(0, token_to_pair)
+    ref_out, ref_max_logits, ref_lse = _reference(
+        q, kv, token_indices, sm_scale, attn_sink, token_topk_length
+    )
+
+    torch.testing.assert_close(out.float(), ref_out, atol=2e-3, rtol=3e-2)
+    torch.testing.assert_close(max_logits, ref_max_logits, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(lse, ref_lse, atol=2e-5, rtol=2e-5)

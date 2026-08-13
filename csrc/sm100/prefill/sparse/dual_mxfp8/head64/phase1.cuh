@@ -17,6 +17,7 @@
 namespace sm100::dual_mxfp8::head64 {
 
 using namespace cute;
+
 using FwdMode = SparseAttnFwdMode;
 
 template<class TiledMMA, class SmemScaleLayout>
@@ -101,10 +102,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
     if (warp_idx == 0 && elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_q);
+        if constexpr (IS_PREFILL) {
+            cute::prefetch_tma_descriptor(&tma_params.tensor_map_q_scale);
+            cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_scale);
+        }
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_o);
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv);
     } else if (warp_idx == 1 && elect_one_sync()) {
         smem.bar_sQ_full.init(1);
+        smem.bar_sQ_scale_full.init(1);
+        smem.bar_Q_scale_ready.init(1);
         smem.bar_tQ_empty.init(1);
         smem.bar_tQ_full.init(1);
         smem.bar_tOut_full.init(1);
@@ -129,6 +136,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         for (int i = 0; i < NUM_K_BUFS; ++i) {
             smem.bar_KV_full[i].init(IS_PREFILL ? 1 : (128/32)*2+1);
             smem.bar_KV_empty[i].init(1);
+            smem.bar_K_scale_raw_full[i].init(1);
+            smem.bar_K_scale_layout_ready[i].init(2);
         }
         CUTE_UNROLL
         for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
@@ -141,23 +150,15 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     ku::barrier_cluster_arrive_relaxed();
     ku::barrier_cluster_wait_acquire();
 
-    // Temporary bring-up path: Q/K/V MXFP8 block-scale factors are exactly
-    // one.  Materialize them in each CTA's SMEM, then use the same 2-CTA
-    // UTCCP SMEM -> TMEM path as CUTLASS's block-scaled mainloop.  S is
-    // initialized separately by the softmax warpgroup through registers.
-    for (int i = threadIdx.x; i < int(smem.mma_scales.size()); i += blockDim.x) {
-        reinterpret_cast<uint8_t*>(smem.mma_scales.data())[i] = UE8M0_ONE_BITS;
+    // V remains unit-scaled. Q/K are populated from their global scale
+    // regions below; S is initialized separately through registers -> TMEM.
+    for (int i = threadIdx.x; i < int(smem.v_scale_one.size()); i += blockDim.x) {
+        reinterpret_cast<uint8_t*>(smem.v_scale_one.data())[i] = UE8M0_ONE_BITS;
     }
     __syncthreads();
-    if (warp_idx == 3 && cta_idx == 0 && elect_one_sync()) {
-        copy_sfa_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleA>(
-            smem.mma_scales.data(), tmem_cols::Q_scale
-        );
-        copy_sfb_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleB>(
-            smem.mma_scales.data(), tmem_cols::K_scale
-        );
+    if (warp_idx == 3 && elect_one_sync()) {
         copy_sfb_smem_to_tmem<TiledMMA_O, SmemLayoutOScaleB>(
-            smem.mma_scales.data(), tmem_cols::V_scale
+            smem.v_scale_one.data(), tmem_cols::V_scale
         );
         ku::tcgen05_before_thread_sync();
     }
@@ -228,7 +229,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             while (next_job.is_valid) {
                 int s_q_idx = next_job.x / 2; // pair index for this head64 prefill kernel
                 int batch_idx = IS_PREFILL ? 0 : next_job.y;
-                int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + (IS_PREFILL?s_q_idx:batch_idx)) : params.topk;
+                int topk_length = params.topk_length != nullptr
+                    ? __ldg(params.topk_length + (IS_PREFILL ? s_q_idx : batch_idx))
+                    : params.topk;
 
                 if constexpr (IS_PREFILL) {
                     int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
@@ -438,9 +441,54 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     (IS_DECODE ? args.batch_idx*stride_q_b_div_stride_q_s_q : 0) + q_load_token_idx
                 );
 
+                if constexpr (IS_PREFILL) {
+                    // The 16 Q scale bytes sit directly after every 512-byte
+                    // head vector. Load them through their own TMA descriptor.
+                    // The descriptor's token coordinate is already the real
+                    // token index (the two CTAs supply adjacent tokens).
+                    SM90_TMA_LOAD_3D::copy(
+                        &tma_params.tensor_map_q_scale,
+                        (uint64_t*)&smem.bar_sQ_scale_full,
+                        (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
+                        smem.q_scale_raw,
+                        0,
+                        0,
+                        q_load_token_idx
+                    );
+                    smem.bar_sQ_scale_full.arrive_and_expect_tx(
+                        TOKEN_H_Q * Q_SCALE_BYTES * sizeof(fp8_e8m0)
+                    );
+
+                    smem.bar_sQ_scale_full.wait(args.outer_loop_phase);
+                    Tensor sQScale = make_tensor(
+                        make_smem_ptr(smem.q_scale_mma.data()),
+                        SmemLayoutPScaleA{}
+                    );
+                    CUTE_UNROLL
+                    for (int row = 0; row < TOKEN_H_Q; ++row) {
+                        CUTE_UNROLL
+                        for (int group = 0; group < Q_SCALE_BYTES; ++group) {
+                            // The padded 2-CTA scale layout aliases rows
+                            // 128..255 onto 0..127. CTA0/1 therefore place
+                            // their token in the lower/upper 64-row halves.
+                            int dst_row = cta_idx * TOKEN_H_Q + row;
+                            sQScale(
+                                dst_row,
+                                _0{},
+                                make_coord(group % 4, group / 4)
+                            ) = smem.q_scale_raw[row][group];
+                        }
+                    }
+                    fence_view_async_shared();
+                    // This entire branch is already guarded by the outer
+                    // elect_one_sync(). Calling it again with only one lane
+                    // active is illegal and can deadlock the elected lane.
+                    smem.bar_Q_scale_ready.arrive();
+                }
+
                 // Wait for sQ to be ready, and issue S -> T copy for Q
                 if (cta_idx == 0) {
-            smem.bar_sQ_full.arrive_and_expect_tx(H_Q*D_Q*sizeof(fp8_e4m3));
+                    smem.bar_sQ_full.arrive_and_expect_tx(H_Q*D_Q*sizeof(fp8_e4m3));
                     smem.bar_sQ_full.wait(args.outer_loop_phase);
 
                     smem.bar_tQ_empty.wait(args.outer_loop_phase^1);
@@ -522,6 +570,34 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         }
                         smem.bar_KV_empty[k_buf_idx].wait(k_bar_phase^1);
 
+                        // TMA requires the scale-plane row stride to be at
+                        // least 16B aligned.  Treat two adjacent 8B token
+                        // scale rows as one 16B row, gather token_idx / 2,
+                        // and remember token parity for SMEM extraction.
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < NUM_ROWS_PER_THREAD/4; local_row += 1) {
+                            int row = (warp_idx-4)*8 + (local_row/2)*(4*8) + (local_row%2)*4;
+                            int4 token_indices = *(int4*)(cur_indices+local_row*4);
+                            *(int4*)(&smem.k_scale_token_idx[k_buf_idx][row]) = token_indices;
+                            int4 scale_pair_indices = {
+                                token_indices.x >> 1,
+                                token_indices.y >> 1,
+                                token_indices.z >> 1,
+                                token_indices.w >> 1
+                            };
+                            // A CTA-local gather loads the complete 16B
+                            // token pair. Both CTAs need the pair because
+                            // arbitrary sparse indices can be even or odd.
+                            ku::tma_gather4(
+                                &tma_params.tensor_map_kv_scale,
+                                smem.bar_K_scale_raw_full[k_buf_idx],
+                                smem.k_scale_pair_raw[k_buf_idx][row / K_SCALE_GATHER_ROWS],
+                                0,
+                                scale_pair_indices,
+                                cache_hint
+                            );
+                        }
+
                         CUTE_UNROLL
                         for (int local_row = 0; local_row < NUM_ROWS_PER_THREAD/4; local_row += 1) {
                             int row = (warp_idx-4)*8 + (local_row/2)*(4*8) + (local_row%2)*4;
@@ -539,12 +615,18 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                                 );
                             }
                         }
+                        if (warp_idx == 4) {
+                            smem.bar_K_scale_raw_full[k_buf_idx].arrive_and_expect_tx(
+                                (B_TOPK / K_SCALE_GATHER_ROWS) * K_SCALE_TMA_BYTES * sizeof(fp8_e8m0)
+                            );
+                        }
                         rs.update();
                     }
                 });
             }
 
         } else {
+#if 0  // Decode-only legacy path; dual_mxfp8 currently instantiates prefill only.
             // 8 threads per token
             struct IsCTA0 {};
             struct IsCTA1 {};
@@ -623,6 +705,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             } else {
                 launch_dequant_wg(IsCTA1{});
             }
+#endif
         }
     } else if (warpgroup_idx == 2) {
         cutlass::arch::warpgroup_reg_dealloc<80>();
@@ -643,6 +726,12 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
             run_outer_loop([&](const OuterloopArgs &args) {
                 smem.bar_tQ_full.wait(args.outer_loop_phase);
+                ku::tcgen05_after_thread_sync();
+                smem.bar_Q_scale_ready.wait(args.outer_loop_phase);
+                copy_sfa_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleA>(
+                    smem.q_scale_mma.data(), tmem_cols::Q_scale
+                );
+                ku::tcgen05_before_thread_sync();
 
                 // Issue P = Q K^T
                 auto issue_P = [&](int k, int rs_offset) {
@@ -657,6 +746,28 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     }
                     smem.bar_KV_full[k_buf_idx].wait(k_bar_phase);
                     ku::tcgen05_after_thread_sync();
+
+                    smem.bar_K_scale_layout_ready[k_buf_idx].wait(k_bar_phase);
+                    Tensor sKScale = make_tensor(
+                        make_smem_ptr(smem.k_scale_mma.data()),
+                        SmemLayoutPScaleB{}
+                    );
+                    CUTE_UNROLL
+                    for (int row = 0; row < B_TOPK; ++row) {
+                        CUTE_UNROLL
+                        for (int group = 0; group < Q_SCALE_BYTES; ++group) {
+                            sKScale(
+                                row,
+                                _0{},
+                                make_coord(group % 4, group / 4)
+                            ) = smem.k_scale_expanded[row][group];
+                        }
+                    }
+                    fence_view_async_shared();
+                    copy_sfb_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleB>(
+                        smem.k_scale_mma.data(), tmem_cols::K_scale
+                    );
+                    ku::tcgen05_before_thread_sync();
                     Tensor sK = make_tensor(
                         make_smem_ptr(smem.K[k_buf_idx].data()),
                         ku::make_umma_canonical_k_major_layout<B_TOPK, D_K/2, 128, fp8_e4m3>()
@@ -716,7 +827,29 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_tOut_full, 1|2);
             });
         } else if (warp_idx == 8 && cta_idx == 1 && elect_one_sync()) {
-            // no rope need load
+            // Every cta_group::2 scale UTCCP must be issued by the elected
+            // thread in both CTAs, even though CTA0 is the only MMA issuer.
+            RingBufferState scale_copy_rs;
+            run_outer_loop([&](const OuterloopArgs &args) {
+                smem.bar_tQ_full.wait(args.outer_loop_phase);
+                ku::tcgen05_after_thread_sync();
+                smem.bar_Q_scale_ready.wait(args.outer_loop_phase);
+                copy_sfa_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleA>(
+                    smem.q_scale_mma.data(), tmem_cols::Q_scale
+                );
+                ku::tcgen05_before_thread_sync();
+
+                CUTE_NO_UNROLL
+                for (int k = args.start_block_idx; k < args.end_block_idx; ++k) {
+                    auto [k_buf_idx, k_bar_phase] = scale_copy_rs.get<NUM_K_BUFS>();
+                    smem.bar_K_scale_layout_ready[k_buf_idx].wait(k_bar_phase);
+                    copy_sfb_smem_to_tmem<TiledMMA_P, SmemLayoutPScaleB>(
+                        smem.k_scale_mma.data(), tmem_cols::K_scale
+                    );
+                    ku::tcgen05_before_thread_sync();
+                    scale_copy_rs.update();
+                }
+            });
         } else if (warp_idx == 9) {
             // KV validness loading warp (for prefill), Indices transformation warp (for decode, Responsible for generating: TMA coordinates, scale factors, and valid masks)
             if constexpr (IS_PREFILL) {
@@ -815,19 +948,55 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     }
                 });
             }
-        } else if (warp_idx >= 10 && elect_one_sync()) {
+        } else if (warp_idx == 10 || warp_idx == 11) {
             if constexpr (IS_PREFILL) {
-                if (warp_idx == 10) {
-                    // CLC Producer thread
-                    run_outer_loop([&](const OuterloopArgs &args) {
+                // Expand the 8 page-tail scale bytes (one per 64 K values)
+                // into 16 tcgen05 scale groups (one per 32 K values).
+                const int scale_warp = warp_idx - 10;
+                RingBufferState scale_rs;
+                run_outer_loop([&](const OuterloopArgs &args) {
+                    CUTE_NO_UNROLL
+                    for (int k = args.start_block_idx; k < args.end_block_idx; ++k) {
+                        auto [k_buf_idx, k_bar_phase] = scale_rs.get<NUM_K_BUFS>();
+                        smem.bar_K_scale_raw_full[k_buf_idx].wait(k_bar_phase);
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < B_TOPK / (2 * 32); ++local_row) {
+                            int row = scale_warp * (B_TOPK / 2) + local_row * 32 + lane_idx;
+                            const int token_idx = smem.k_scale_token_idx[k_buf_idx][row];
+                            const int scale_offset = (token_idx & 1) * K_SCALE_BYTES
+                                + cta_idx * (K_SCALE_BYTES / 2)
+                                + (row % K_SCALE_GATHER_ROWS) * K_SCALE_TMA_BYTES;
+                            uint32_t packed = *reinterpret_cast<const uint32_t*>(
+                                &smem.k_scale_pair_raw[k_buf_idx][row / K_SCALE_GATHER_ROWS][scale_offset]
+                            );
+                            fp8_e8m0* src = reinterpret_cast<fp8_e8m0*>(&packed);
+                            fp8_e8m0* dst = &smem.k_scale_expanded[row][cta_idx * K_SCALE_BYTES];
+                            CUTE_UNROLL
+                            for (int group = 0; group < K_SCALE_BYTES / 2; ++group) {
+                                dst[2 * group] = src[group];
+                                dst[2 * group + 1] = src[group];
+                            }
+                        }
+                        fence_view_async_shared();
+                        __syncwarp();
+                        if (elect_one_sync()) {
+                            smem.bar_K_scale_layout_ready[k_buf_idx].arrive();
+                        }
+                        scale_rs.update();
+                    }
+                    // The CLC producer must run inside this same outer-loop
+                    // body. A second run_outer_loop after scale expansion
+                    // would wait for the very query it is supposed to issue.
+                    if (warp_idx == 10 && elect_one_sync()) {
                         if (cta_idx == 0) {
                             smem.bar_clc_empty.wait(args.outer_loop_phase^1);
                             ku::issue_clc_query_multicast_cluster_all(smem.bar_clc_full, smem.clc_response_obj);
                         }
                         smem.bar_clc_full.arrive_and_expect_tx(sizeof(smem.clc_response_obj));
-                    });
-                }
+                    }
+                });
             } else {
+#if 0  // Decode-only legacy path; dual_mxfp8 currently instantiates prefill only.
                 // Raw KV NoPE Producer thread
                 run_outer_loop([&](const OuterloopArgs &args) {
                     CUTE_NO_UNROLL
@@ -859,6 +1028,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         rs.update();
                     }
                 });
+#endif
             }
         }
     } else {
@@ -1056,7 +1226,21 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     KU_ASSERT(params.d_qk == D_QK);
 
     static_assert(D_Q == 512);
+    if constexpr (IS_PREFILL) {
+        KU_ASSERT(params.stride_q_h_q == Q_BYTES_PER_HEAD,
+            "Q head stride must be 512 e4m3 bytes + 16 UE8M0 scale bytes");
+        KU_ASSERT(params.stride_kv_h_kv == KV_BYTES_PER_TOKEN,
+            "KV token envelope must be 512 e4m3 bytes + 8 page-tail scale bytes");
+        KU_ASSERT(params.stride_kv_s_kv == params.h_kv * KV_BYTES_PER_TOKEN,
+            "packed KV storage must be contiguous across logical token envelopes");
+        KU_ASSERT(params.s_kv % 2 == 0,
+            "page-tail K-scale TMA pairs require an even number of KV tokens");
+        KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0);
+        KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0);
+    }
+
     CUtensorMap tensor_map_q;
+    CUtensorMap tensor_map_q_scale = {};
     if constexpr (IS_DECODE) {
         KU_ASSERT(params.stride_q_b % params.stride_q_s_q == 0, "In decode mode for MODEL1 sparse fp8 decoding on sm100f, q.stride(0) (on the batch dimension) must be divisible by q.stride(1) (on the sequence dimension).");
         tensor_map_q = ku::make_tensor_map(
@@ -1078,12 +1262,24 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
             CU_TENSOR_MAP_SWIZZLE_128B,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         );  // We use this layout to group Q[0:64] and Q[256:256+64] together, for UTCCP for dual gemm
+
+        tensor_map_q_scale = ku::make_tensor_map(
+            {Q_SCALE_BYTES, TOKEN_H_Q, (unsigned long)params.s_q},
+            {(unsigned long)params.stride_q_h_q,
+             (unsigned long)params.stride_q_s_q},
+            {Q_SCALE_BYTES, TOKEN_H_Q, 1},
+            reinterpret_cast<uint8_t*>(params.q) + D_Q,
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+        );
     }
 
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_scale = {};
     CUtensorMap tensor_map_extra_kv = {};
     if constexpr (IS_DECODE) {
-        auto get_kv_tensormap = [&](bool is_extra, void* k_ptr, int num_blocks, int64_t stride_kv_block, int64_t stride_kv_row) -> std::pair<CUtensorMap, CUtensorMap> {
+        auto get_kv_tensormap = [&](bool is_extra, void* k_ptr, int num_blocks, int64_t stride_kv_block, int64_t stride_kv_row) -> CUtensorMap {
             KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
             KU_ASSERT(stride_kv_block % TMA_K_STRIDE_FOR_DECODING == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", stride_kv_block, TMA_K_STRIDE_FOR_DECODING);
             CUtensorMap tensor_map_kv = ku::make_tensor_map(
@@ -1095,20 +1291,34 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
                 CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
             ); 
-            return tensor_map_kv_nope;
+            return tensor_map_kv;
         };
         tensor_map_kv = get_kv_tensormap(false, params.kv, params.num_blocks, params.stride_kv_block, params.stride_kv_row);
         if (params.extra_topk > 0)
             tensor_map_extra_kv = get_kv_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block, params.stride_extra_kv_row);
     } else {
+        // The storage tensor is exposed as 520-byte logical envelopes, but
+        // inside the packed page all 512-byte E4M3 rows are contiguous and
+        // the 8-byte scale rows form a separate tail plane.
         tensor_map_kv = ku::make_tensor_map(
             {D_QK, (unsigned long)params.s_kv},
-            {(unsigned long)params.stride_kv_s_kv*sizeof(fp8_e4m3)},
+            {(unsigned long)D_K},
             {128, 1},
             params.kv,
             CU_TENSOR_MAP_DATA_TYPE_UINT8,
             CU_TENSOR_MAP_SWIZZLE_128B,
             CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+        );
+        tensor_map_kv_scale = ku::make_tensor_map(
+            {static_cast<uint64_t>(K_SCALE_TMA_BYTES / sizeof(uint64_t)),
+             static_cast<uint64_t>(cute::ceil_div(params.s_kv, 2))},
+            {static_cast<uint64_t>(K_SCALE_TMA_BYTES)},
+            {static_cast<uint32_t>(K_SCALE_TMA_BYTES / sizeof(uint64_t)), 1},
+            reinterpret_cast<uint8_t*>(params.kv)
+                + static_cast<int64_t>(params.s_kv) * params.h_kv * D_K,
+            CU_TENSOR_MAP_DATA_TYPE_INT64,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );
     }
 
@@ -1161,7 +1371,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     } else {
         tma_params = {
             tensor_map_q,
+            tensor_map_q_scale,
             tensor_map_kv,
+            tensor_map_kv_scale,
             tensor_map_o
         };
     }
@@ -1174,6 +1386,8 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     if constexpr (IS_DECODE) {
         grid_shape = dim3(2*cute::ceil_div(params.s_q, 2), params.num_sm_parts, 1);
     } else {
+        // grid_shape counts CTAs, while each logical query pair is one
+        // two-CTA cluster.
         grid_shape = dim3(params.s_q, 1, 1);
     }
 
@@ -1190,7 +1404,12 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
 }
 
 template<FwdMode FWD_MODE, int D_QK>
-void run_dual_mxfp8_phase1_kernel(const SparseFwdArgT<FWD_MODE>& params) {
+void run_dual_mxfp8_phase1_kernel(
+        const std::conditional_t<
+            is_decode_v<FWD_MODE>,
+            SparseAttnDecodeParams,
+            MxFp8SparseAttnFwdParams
+        >& params) {
     using Kernel = KernelTemplate<FWD_MODE, D_QK>;
     Kernel::run(params);
 }

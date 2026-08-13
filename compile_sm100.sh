@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build the standalone SM100 test extensions.
-# Usage: ./compile_sm100.sh [all|bf16|dual|decode_head64]
+# Usage: ./compile_sm100.sh [all|bf16|dual|dual_mxfp8|decode_head64]
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -75,6 +75,17 @@ build_dual() {
     echo "built $output"
 }
 
+build_dual_mxfp8() {
+    local dir="$BUILD_ROOT/dual_mxfp8"
+    local output="${DUAL_MXFP8_EXTENSION_PATH:-$BUILD_ROOT/dual_mxfp8_test_ext.so}"
+    mkdir -p "$dir"
+    "$CXX" "${INCLUDES[@]}" -O3 -std=c++20 -DNDEBUG -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-deprecated-declarations -DTORCH_EXTENSION_NAME=dual_mxfp8_test_ext -fPIC -c "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/binding.cpp" -o "$dir/binding.o"
+    local nvcc_flags=("${COMMON[@]}" -c --ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage -lineinfo -gencode arch=compute_100f,code=sm_100f --threads "${NVCC_THREADS:-16}")
+    "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/instantiations/phase1_k512.cu" -o "$dir/phase1_k512.o"
+    link_extension "$output" "$dir/binding.o" "$dir/phase1_k512.o"
+    echo "built $output"
+}
+
 build_decode_head64() {
     local dir="$BUILD_ROOT/head64_decode"
     local output="${HEAD64_DECODE_EXT:-$BUILD_ROOT/head64_decode_test_ext.so}"
@@ -90,9 +101,10 @@ build_decode_head64() {
 }
 
 case "${1:-all}" in
-    all) build_bf16; build_dual; build_decode_head64 ;;
+    all) build_bf16; build_dual; build_dual_mxfp8; build_decode_head64 ;;
     bf16) build_bf16 ;;
     dual) build_dual ;;
+    dual_mxfp8) build_dual_mxfp8 ;;
     decode_head64) build_decode_head64 ;;
-    *) echo "usage: $0 [all|bf16|dual|decode_head64]" >&2; exit 2 ;;
+    *) echo "usage: $0 [all|bf16|dual|dual_mxfp8|decode_head64]" >&2; exit 2 ;;
 esac

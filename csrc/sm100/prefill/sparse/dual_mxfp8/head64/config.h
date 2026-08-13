@@ -17,15 +17,21 @@ using namespace cute;
 template<SparseAttnFwdMode FWD_MODE, int D_QK>
 struct KernelTemplate {
 
-using ArgT = SparseFwdArgT<FWD_MODE>;
 static constexpr bool IS_DECODE = is_decode_v<FWD_MODE>;
 static constexpr bool IS_PREFILL = !IS_DECODE;
+using ArgT = std::conditional_t<
+    IS_DECODE,
+    SparseAttnDecodeParams,
+    MxFp8SparseAttnFwdParams
+>;
 using fp8_e4m3 = cutlass::float_e4m3_t;
 using fp8_e8m0 = cutlass::float_ue8m0_t;
 
 struct TmaParamsForPrefill {
     CUtensorMap tensor_map_q;
+    CUtensorMap tensor_map_q_scale;
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_kv_scale;
     CUtensorMap tensor_map_o;
 };
 
@@ -56,7 +62,13 @@ static constexpr int TOKEN_H_Q = 64;
 static constexpr int H_Q = 2*TOKEN_H_Q;
 static constexpr int B_TOPK = 64; // For 2 CTAs
 static constexpr int NUM_THREADS = 128*4;
-static constexpr int NUM_WORKER_THREADS = IS_PREFILL ? (128 + 4 + (B_TOPK/8) + 1 + 128)*2 + 1 : (128 + 128 + 1 + 32 + 2 + 128)*2;
+// Prefill run_outer_loop participants per CTA:
+// WG0=128, KV producer elected lanes=4, validity lanes=8, K-scale
+// warps=64, and softmax WG=128. Both CTA0/CTA1 warp8 scale-copy workers
+// participate as well. Warp10 folds the CLC query into its K-scale loop.
+static constexpr int NUM_WORKER_THREADS = IS_PREFILL
+    ? (128 + 4 + (B_TOPK/8) + 64 + 128)*2 + 2
+    : (128 + 128 + 1 + 32 + 2 + 128)*2;
 
 // For non-decode mode, we have 4 (half-)KV buffers
 // For decode mode, we have 3 (half-)KV buffers with two raw KV buffers
@@ -67,7 +79,20 @@ static constexpr int D_NOPE = 448;
 static constexpr int D_ROPE = 64;
 static constexpr int TMA_K_STRIDE_FOR_DECODING = D_QK;
 static constexpr int NUM_SCALES_EACH_TOKEN = 8; // 7 scales + 1 padding
+static constexpr int MXFP8_SCALE_VEC_SIZE = 32;
+static constexpr int Q_SCALE_BYTES = D_Q / MXFP8_SCALE_VEC_SIZE;
+static constexpr int K_QUANT_GROUP_SIZE = 64;
+static constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
+static constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
+static constexpr int K_SCALE_TMA_BYTES = 16;
+static constexpr int K_SCALE_GATHER_ROWS = 4;
+static constexpr int K_SCALE_GATHER_SMEM_STRIDE = 128;
+static constexpr int Q_BYTES_PER_HEAD = D_Q + Q_SCALE_BYTES;
+static constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
 static constexpr uint8_t UE8M0_ONE_BITS = 0x7f;
+static_assert(Q_SCALE_BYTES == 16);
+static_assert(K_SCALE_BYTES == 8);
+static_assert(K_SCALE_DUP == 2);
 
 static constexpr int B_EPI = 64;                // Epilogue block size for normal case (i.e. prefill or non-splitkv decoding)
 static constexpr int B_EPI_SPLITKV = 32;        // Epilogue block size for splitkv decoding
@@ -93,7 +118,20 @@ struct SharedMemoryPlan {
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
-    array_aligned<fp8_e8m0, 8192> mma_scales;
+    // Q scales are loaded once per adjacent-token pair.  K scales are
+    // double-buffered with K data and expanded from 64-value groups to the
+    // 32-value groups consumed by tcgen05.
+    CUTE_ALIGNAS(16) fp8_e8m0 q_scale_raw[TOKEN_H_Q][Q_SCALE_BYTES];
+    array_aligned<fp8_e8m0, 8192> q_scale_mma;
+    // A gather4 destination must be 128B aligned for cta_group::2. Each
+    // issued copy writes four 16B token-pair rows into the first 64B.
+    CUTE_ALIGNAS(128) fp8_e8m0
+        k_scale_pair_raw[NUM_K_BUFS][B_TOPK / K_SCALE_GATHER_ROWS][K_SCALE_GATHER_SMEM_STRIDE];
+    CUTE_ALIGNAS(16) int k_scale_token_idx[NUM_K_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) fp8_e8m0 k_scale_expanded[B_TOPK][Q_SCALE_BYTES];
+    array_aligned<fp8_e8m0, 8192> k_scale_mma;
+    // V remains unit-scaled and uses the CUTLASS SMEM -> TMEM scale path.
+    array_aligned<fp8_e8m0, 8192> v_scale_one;
     float P_exchange[4][(H_Q/2/2)*(B_TOPK/2)];
     float rowwise_max_buf[128], rowwise_li_buf[128];
 
@@ -101,9 +139,13 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) fp8_e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN/2];
     
-    transac_bar_t bar_sQ_full, bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_sQ_full, bar_sQ_scale_full;
+    transac_bar_t bar_Q_scale_ready;
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
     transac_bar_t bar_tOut_full, bar_tOut_empty;
     transac_bar_t bar_KV_full[NUM_K_BUFS], bar_KV_empty[NUM_K_BUFS];
+    transac_bar_t bar_K_scale_raw_full[NUM_K_BUFS];
+    transac_bar_t bar_K_scale_layout_ready[NUM_K_BUFS];
     transac_bar_t bar_P_empty;
     transac_bar_t bar_QK_done, bar_SV_done;
     transac_bar_t bar_S_O_full;

@@ -12,13 +12,13 @@ from typing import Optional
 
 import torch
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_PATH = Path(os.environ.get("DUAL_EXTENSION_PATH", ROOT / "build/dual_head64_test_ext.so"))
 
 
 def load_extension():
     if not EXTENSION_PATH.exists():
-        raise RuntimeError(f"{EXTENSION_PATH} does not exist; run ./compile_dual.sh")
+        raise RuntimeError(f"{EXTENSION_PATH} does not exist; run ./compile_sm100.sh dual")
     spec = importlib.util.spec_from_file_location("dual_head64_test_ext", EXTENSION_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {EXTENSION_PATH}")

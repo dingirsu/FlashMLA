@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import torch
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_PATH = Path(os.environ.get("MXFP8_EXTENSION_OUTPUT", ROOT / "build/mxfp8_test_ext.so"))
 
 

@@ -5,11 +5,11 @@ import os
 from pathlib import Path
 import torch
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 EXT = Path(os.environ.get("HEAD64_DECODE_EXT", ROOT / "build/head64_decode_test_ext.so"))
 spec = importlib.util.spec_from_file_location("head64_decode_test_ext", EXT)
 if spec is None or spec.loader is None:
-    raise RuntimeError(f"missing {EXT}; run DECODE_HEAD64_BARRIER_TIMING=1 ./compile_decode_head64.sh")
+    raise RuntimeError(f"missing {EXT}; run DECODE_HEAD64_BARRIER_TIMING=1 ./compile_sm100.sh decode_head64")
 ext = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ext)
 

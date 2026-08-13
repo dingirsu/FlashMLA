@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
 from small_head_test_utils import get_extension  # noqa: E402

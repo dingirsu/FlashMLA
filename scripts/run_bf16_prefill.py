@@ -11,13 +11,13 @@ from typing import Optional
 
 import torch
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 EXTENSION_PATH = Path(os.environ.get("BF16_EXTENSION_OUTPUT", ROOT / "build/bf16_test_ext.so"))
 
 
 def _load_extension():
     if not EXTENSION_PATH.exists():
-        raise RuntimeError(f"{EXTENSION_PATH} does not exist; run ./compile_bf16.sh")
+        raise RuntimeError(f"{EXTENSION_PATH} does not exist; run ./compile_sm100.sh bf16")
     spec = importlib.util.spec_from_file_location("bf16_test_ext", EXTENSION_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {EXTENSION_PATH}")
@@ -63,7 +63,7 @@ def _make_inputs(args: argparse.Namespace):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--s-q", type=int, default=4096)
+    parser.add_argument("--s-q", type=int, default=32768)
     parser.add_argument("--s-kv", type=int, default=32768)
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument("--active-topk", type=int)

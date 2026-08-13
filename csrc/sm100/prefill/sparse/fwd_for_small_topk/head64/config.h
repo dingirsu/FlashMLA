@@ -19,7 +19,6 @@ struct KernelTemplate {
 using ArgT = SparseFwdArgT<FWD_MODE>;
 static constexpr bool IS_DECODE = is_decode_v<FWD_MODE>;
 static constexpr bool IS_PREFILL = !IS_DECODE;
-static_assert(IS_PREFILL, "paired-token head64 small-topk only supports prefill");
 using fp8_e4m3 = cutlass::float_e4m3_t;
 using fp8_e8m0 = __nv_fp8_e8m0;
 

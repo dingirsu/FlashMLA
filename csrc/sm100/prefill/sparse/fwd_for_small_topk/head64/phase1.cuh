@@ -23,8 +23,9 @@ template<FwdMode FWD_MODE, int D_QK>
 __device__ void
 KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
 #ifdef KERUTILS_ENABLE_SM100A
-    // Grid shape: [s_q, 1, 1]. Each 2-CTA cluster handles one adjacent
-    // query-token pair, and each CTA owns one native [64, D_Q] tile.
+    // Each 2-CTA cluster handles one adjacent query-token pair, and each CTA
+    // owns one native [64, D_Q] tile.  For an odd decode s_q, CTA 1 in the
+    // final cluster uses the last real Q as a dummy operand and skips stores.
     // Cluster shape: [2, 1, 1]
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
@@ -102,7 +103,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     auto run_outer_loop = [&](auto loop_body) -> bool {
         int outer_loop_phase = false;
         if constexpr (FWD_MODE == FwdMode::DecodeWithSplitKV) {
-            int s_q_idx = blockIdx.x / 2;
+            int s_q_idx = blockIdx.x / 2; // adjacent-token pair index
             DecodingSchedMeta sched_meta;
             KU_LDG_256(
                 params.tile_scheduler_metadata_ptr + blockIdx.y,
@@ -254,14 +255,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
-                if (warp_idx == 0 && elect_one_sync()) {
+                int q_token_idx = 2*args.s_q_idx + cta_idx;
+                bool is_real_q_token = q_token_idx < params.s_q;
+                if (warp_idx == 0 && elect_one_sync() && is_real_q_token) {
                     SM90_TMA_STORE_5D::copy(
                         &tma_params.tensor_map_o, 
                         smem.Q.data(),
                         0,
-                        IS_PREFILL ? 0 : cta_idx*(H_Q/2),
                         0,
-                        IS_PREFILL ? 2*args.s_q_idx + cta_idx : args.s_q_idx,
+                        0,
+                        q_token_idx,
                         IS_DECODE ? args.batch_idx : 0
                     );
                     cute::tma_store_arrive();
@@ -302,18 +305,20 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
                     if constexpr (IS_DECODE) {  // Otherwise nvcc complains about `tma_params` doesn't have `tensor_map_o_accum`
                         float* cur_buf_base = (float*)smem.Q.data() + cur_buf_idx*((H_Q/2)*B_EPI_SPLITKV*2);
-                        if (warp_idx == 0 && elect_one_sync()) {
+                        int q_token_idx = 2*args.s_q_idx + cta_idx;
+                        bool is_real_q_token = q_token_idx < params.s_q;
+                        if (warp_idx == 0 && elect_one_sync() && is_real_q_token) {
                             SM90_TMA_STORE_5D::copy(
                                 &tma_params.tensor_map_o_accum, 
                                 cur_buf_base,
-                                0, cta_idx*(H_Q/2), k*(B_EPI_SPLITKV/32), args.s_q_idx, args.n_split_idx
+                                0, 0, k*(B_EPI_SPLITKV/32), q_token_idx, args.n_split_idx
                             );
                             cute::tma_store_arrive();
-                        } else if (warp_idx == 1 && elect_one_sync()) {
+                        } else if (warp_idx == 1 && elect_one_sync() && is_real_q_token) {
                             SM90_TMA_STORE_5D::copy(
                                 &tma_params.tensor_map_o_accum, 
                                 cur_buf_base + (H_Q/2)*B_EPI_SPLITKV,
-                                0, cta_idx*(H_Q/2), k*(B_EPI_SPLITKV/32) + (D_V/2)/32, args.s_q_idx, args.n_split_idx
+                                0, 0, k*(B_EPI_SPLITKV/32) + (D_V/2)/32, q_token_idx, args.n_split_idx
                             );
                             cute::tma_store_arrive();
                         }
@@ -341,16 +346,21 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 if constexpr (IS_DECODE) {
                     stride_q_b_div_stride_q_s_q = params.stride_q_b / params.stride_q_s_q;
                 }
+                int q_token_idx = 2*args.s_q_idx + cta_idx;
+                // A 2-SM operation cannot drop the second CTA.  Clamp the odd
+                // tail CTA to the final real token so it receives a valid Q
+                // tile and can participate in every transaction and barrier.
+                int q_load_token_idx = min(q_token_idx, params.s_q - 1);
                 SM100_TMA_2SM_LOAD_5D_NOSPLIT::copy(
                     &tma_params.tensor_map_q,
                     (uint64_t*)&smem.bar_sQ_full,
                     (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
                     smem.Q.data(),
                     0,
-                    IS_PREFILL ? 0 : cta_idx*(H_Q/2),
                     0,
                     0,
-                    IS_PREFILL ? 2*args.s_q_idx + cta_idx : args.batch_idx*stride_q_b_div_stride_q_s_q + args.s_q_idx
+                    0,
+                    (IS_DECODE ? args.batch_idx*stride_q_b_div_stride_q_s_q : 0) + q_load_token_idx
                 );
 
                 // Wait for sQ to be ready, and issue S -> T copy for Q
@@ -899,7 +909,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
             if (idx_in_warpgroup < H_Q/2) {
                 // Calculate output_scale and save
-                int head_idx = IS_PREFILL ? idx_in_warpgroup : cta_idx*(H_Q/2) + idx_in_warpgroup;
+                int head_idx = idx_in_warpgroup;
                 float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + head_idx);
                 float output_scale;
                 if (FWD_MODE != FwdMode::DecodeWithSplitKV || args.is_no_split) {
@@ -918,11 +928,14 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     params.max_logits[global_index] = real_mi*CUDART_LN2_F;
                     params.lse[global_index] = cur_lse;
                 } else {
-                    if (FWD_MODE != FwdMode::DecodeWithSplitKV || args.is_no_split) {
-                        params.lse[args.batch_idx*params.stride_lse_b + args.s_q_idx*params.stride_lse_s_q + head_idx] = cur_lse;
-                    } else {
-                        float cur_lse_2base = log2f(li) + mi;
-                        params.lse_accum[args.n_split_idx*params.stride_lse_accum_split + args.s_q_idx*params.stride_lse_accum_s_q + head_idx] = cur_lse_2base;
+                    int q_token_idx = 2*args.s_q_idx + cta_idx;
+                    if (q_token_idx < params.s_q) {
+                        if (FWD_MODE != FwdMode::DecodeWithSplitKV || args.is_no_split) {
+                            params.lse[args.batch_idx*params.stride_lse_b + q_token_idx*params.stride_lse_s_q + head_idx] = cur_lse;
+                        } else {
+                            float cur_lse_2base = log2f(li) + mi;
+                            params.lse_accum[args.n_split_idx*params.stride_lse_accum_split + q_token_idx*params.stride_lse_accum_s_q + head_idx] = cur_lse_2base;
+                        }
                     }
                 }
 
@@ -961,7 +974,10 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.h_q == TOKEN_H_Q);
-    KU_ASSERT(params.s_q > 0 && params.s_q % 2 == 0);
+    KU_ASSERT(params.s_q > 0);
+    if constexpr (IS_PREFILL) {
+        KU_ASSERT(params.s_q % 2 == 0);
+    }
     KU_ASSERT(params.d_qk == D_QK);
 
     static_assert(D_Q == 512);
@@ -969,9 +985,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     if constexpr (IS_DECODE) {
         KU_ASSERT(params.stride_q_b % params.stride_q_s_q == 0, "In decode mode for MODEL1 sparse fp8 decoding on sm100f, q.stride(0) (on the batch dimension) must be divisible by q.stride(1) (on the sequence dimension).");
         tensor_map_q = ku::make_tensor_map(
-            {64ul, H_Q, 2ul, (D_Q/64ul)/2ul, (unsigned long)params.b * (params.stride_q_b / params.stride_q_s_q)},
+            {64ul, TOKEN_H_Q, 2ul, (D_Q/64ul)/2ul, (unsigned long)params.b * (params.stride_q_b / params.stride_q_s_q)},
             ku::make_stride_helper<int>({params.stride_q_h_q, D_Q/2, 64, params.stride_q_s_q}, sizeof(bf16)),
-            {64, H_Q/2, 2, (D_Q/64)/2, 1},
+            {64, TOKEN_H_Q, 2, (D_Q/64)/2, 1},
             params.q,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             CU_TENSOR_MAP_SWIZZLE_128B,
@@ -1033,9 +1049,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     CUtensorMap tensor_map_o;
     if constexpr (IS_DECODE) {
         tensor_map_o = ku::make_tensor_map(
-            {64, H_Q, D_V/64, (unsigned long)params.s_q, (unsigned long)params.b},
+            {64, TOKEN_H_Q, D_V/64, (unsigned long)params.s_q, (unsigned long)params.b},
             ku::make_stride_helper<int>({params.stride_o_h_q, 64, params.stride_o_s_q, params.stride_o_b}, sizeof(bf16)),
-            {64, H_Q/2, D_V/64, 1, 1},
+            {64, TOKEN_H_Q, D_V/64, 1, 1},
             params.out,
             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             CU_TENSOR_MAP_SWIZZLE_128B,
@@ -1057,9 +1073,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     CUtensorMap tensor_map_o_accum = {};
     if constexpr (FWD_MODE == FwdMode::DecodeWithSplitKV) {
         tensor_map_o_accum = ku::make_tensor_map(
-            {32, H_Q, D_V/32, (unsigned long)params.s_q, (unsigned long)params.num_sm_parts + params.b},
+            {32, TOKEN_H_Q, D_V/32, (unsigned long)params.s_q, (unsigned long)params.num_sm_parts + params.b},
             ku::make_stride_helper<int>({params.stride_o_accum_h_q, 32, params.stride_o_accum_s_q, params.stride_o_accum_split}, sizeof(float)),
-            {32, H_Q/2, B_EPI_SPLITKV/32, 1, 1},
+            {32, TOKEN_H_Q, B_EPI_SPLITKV/32, 1, 1},
             params.o_accum,
             CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
             CU_TENSOR_MAP_SWIZZLE_128B,
@@ -1092,7 +1108,7 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
 
     dim3 grid_shape;
     if constexpr (IS_DECODE) {
-        grid_shape = dim3(2*params.s_q, FWD_MODE == FwdMode::DecodeWithSplitKV ? params.num_sm_parts : params.b, 1);
+        grid_shape = dim3(2*cute::ceil_div(params.s_q, 2), params.num_sm_parts, 1);
     } else {
         grid_shape = dim3(params.s_q, 1, 1);
     }

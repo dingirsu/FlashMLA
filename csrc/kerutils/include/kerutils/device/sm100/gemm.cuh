@@ -1097,7 +1097,7 @@ template <class a_type, class b_type, class c_type, class sf_type,
           UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
 struct SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT
 {
-  static_assert(M == 256, "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT M-mode size should be 128 or 256 for 2 CTA cluster MMA.");
+  static_assert(M == 256 || M == 128, "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT M-mode size should be 256 or 128 for 2 CTA cluster MMA.");
   static_assert((N % 16 == 0) && (16 <= N) && (N <= 256), "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT N-mode size should be a multiple of 16 between 16 and 256.");
 
   using DRegisters = void;
@@ -1228,7 +1228,7 @@ template <class a_type, class b_type, class c_type, class sf_type,
           UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
 struct SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT
 {
-  static_assert(M == 256, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT M-mode size should be 256 for 2 CTA cluster MMA.");
+  static_assert(M == 256 || M == 128, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT M-mode size should be 256 or 128 for 2 CTA cluster MMA.");
   static_assert((N % 16 == 0) && (16 <= N) && (N <= 256), "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT N-mode size should be a multiple of 16 between 16 and 256.");
   static_assert(a_major == UMMA::Major::K, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT requires A major == K.");
 

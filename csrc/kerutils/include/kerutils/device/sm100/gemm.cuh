@@ -1091,4 +1091,279 @@ struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
   }
 };
 
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
+struct SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT
+{
+  static_assert(M == 256, "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT M-mode size should be 128 or 256 for 2 CTA cluster MMA.");
+  static_assert((N % 16 == 0) && (16 <= N) && (N <= 256), "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT N-mode size should be a multiple of 16 between 16 and 256.");
+
+  using DRegisters = void;
+  using ARegisters = uint64_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  fma(uint64_t const& desc_a,
+      uint64_t const& desc_b,
+      uint32_t const& tmem_c,
+      uint32_t const& scaleC,
+      uint64_t const& idescE,
+      uint32_t const& tsfa_addr,
+      uint32_t const& tsfb_addr)
+  {
+#if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
+    
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+      "}\n"
+      :
+      : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
+        "r"(tsfa_addr), "r"(tsfb_addr));
+    
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT without CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
+#endif
+  }
+};
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<a_type, b_type, c_type, sf_type,
+                                      M, N, a_major, b_major,
+                                      a_neg, b_neg>>
+{
+  using ValTypeD   = c_type;
+  using ValTypeA   = a_type;
+  using ValTypeB   = b_type;
+  using ValTypeC   = c_type;
+  using ValTypeSFA = sf_type;
+  using ValTypeSFB = sf_type;
+  static_assert(cute::sizeof_bits_v<a_type> <= 8 && cute::sizeof_bits_v<b_type> <= 8, "SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT supports types with leq 8bit types");
+
+  using FrgTypeA   = UMMA::smem_desc<a_major>;
+  using FrgTypeB   = UMMA::smem_desc<b_major>;
+  using FrgTypeC   = UMMA::tmem_frg_2sm<c_type>;
+
+  // Logical shape-K is always 256bits, transform to units of elements
+  constexpr static int K = 32;
+  constexpr static int SFVecSize = 32;
+
+  constexpr static UMMA::TmemAllocMode TmemAlloc = M == 128 ?
+      UMMA::TmemAllocMode::ScaleFactorDuplicated2by2 : UMMA::TmemAllocMode::ScaleFactorDuplicated4by1;
+  using FrgTypeSFA = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2,  true, TmemAlloc>;
+  using FrgTypeSFB = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2, false, TmemAlloc>;
+
+  static_assert(sizeof_bits_v<ValTypeA> <= sizeof_bits_v<uint8_t> &&
+                sizeof_bits_v<ValTypeB> <= sizeof_bits_v<uint8_t>);
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using MMA_ScaleFactor = SM100_MMA_MXF8F6F4_SS<a_type, b_type, c_type, sf_type,
+                                (M/2 > 64 ? M/2 : M), (round_up(N, 128)), a_major, b_major,
+                                a_neg, b_neg>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+  uint32_t tsfa_addr_ = 0;
+  uint32_t tsfb_addr_ = 0;
+
+  UMMA::InstrDescriptorBlockScaled idesc_ = UMMA::make_instr_desc_block_scaled<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major, a_neg, b_neg>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t desc_a = A[0];
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(traits.idesc_, traits.tsfa_addr_, traits.tsfb_addr_);
+
+    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<a_type, b_type, c_type, sf_type,
+                          M, N,
+                          a_major, b_major,
+                          a_neg, b_neg>::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc, traits.tsfa_addr_, traits.tsfb_addr_);
+  }
+
+  // Construct an executable MMA_traits with sp into set.
+  template <class TSFA, class TSFALayout, class TSFB, class TSFBLayout>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<a_type, b_type, c_type, sf_type,
+                                M, N, a_major, b_major, a_neg, b_neg>>
+  with(UMMA::ScaleOut accumulate, Tensor<TSFA, TSFALayout> const& SFA, Tensor<TSFB, TSFBLayout> const& SFB) const {
+    uint32_t tmem_sfa_addr = raw_pointer_cast(SFA.data());
+    uint32_t tmem_sfb_addr = raw_pointer_cast(SFB.data());
+    return {accumulate, tmem_sfa_addr, tmem_sfb_addr, idesc_};
+  }
+};
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
+struct SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT
+{
+  static_assert(M == 256, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT M-mode size should be 256 for 2 CTA cluster MMA.");
+  static_assert((N % 16 == 0) && (16 <= N) && (N <= 256), "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT N-mode size should be a multiple of 16 between 16 and 256.");
+  static_assert(a_major == UMMA::Major::K, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT requires A major == K.");
+
+
+  using DRegisters = void;
+  using ARegisters = uint32_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[1];
+
+
+  CUTE_HOST_DEVICE static void
+  fma(uint32_t const& tmem_a,
+      uint64_t const& desc_b,
+      uint32_t const& tmem_c,
+      uint32_t const& scaleC,
+      uint64_t const& idescE,
+      uint32_t const& tsfa_addr,
+      uint32_t const& tsfb_addr)
+  {
+#if defined(CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED)
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [%0], [%1], %2, %3, [%5], [%6], p; \n\t"
+      "}\n"
+      :
+      : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
+        "r"(tsfa_addr), "r"(tsfb_addr));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT without CUTE_ARCH_TCGEN05_MXF8F6F4_MMA_ENABLED");
+#endif
+  }
+};
+
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf_type,
+                                      M, N, a_major, b_major,
+                                      a_neg, b_neg>>
+{
+  using ValTypeD   = c_type;
+  using ValTypeA   = a_type;
+  using ValTypeB   = b_type;
+  using ValTypeC   = c_type;
+  using ValTypeSFA = sf_type;
+  using ValTypeSFB = sf_type;
+  static_assert(cute::sizeof_bits_v<a_type> <= 8 && cute::sizeof_bits_v<b_type> <= 8, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT supports types with leq 8bit types");
+  static_assert(a_major == UMMA::Major::K, "SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT requires A major == K.");
+
+
+  using AStorageType = cute::conditional_t<(cute::sizeof_bits_v<a_type> < 8), uint8_t, a_type>;
+  using FrgTypeA   = UMMA::tmem_frg_2sm<a_type, AStorageType, UMMA::TmemAllocMode::Duplicated>;
+  using FrgTypeB   = UMMA::smem_desc<b_major>;
+  using FrgTypeC   = UMMA::tmem_frg_2sm<c_type>;
+
+
+  constexpr static int K = 32;
+  constexpr static int SFVecSize = 32;
+
+
+  constexpr static UMMA::TmemAllocMode TmemAlloc = M == 128 ?
+      UMMA::TmemAllocMode::ScaleFactorDuplicated2by2 : UMMA::TmemAllocMode::ScaleFactorDuplicated4by1;
+  using FrgTypeSFA = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2,  true, TmemAlloc>;
+  using FrgTypeSFB = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2, false, TmemAlloc>;
+
+
+  static_assert(sizeof_bits_v<ValTypeA> <= sizeof_bits_v<uint8_t> &&
+                sizeof_bits_v<ValTypeB> <= sizeof_bits_v<uint8_t>);
+
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using MMA_ScaleFactor = SM100_MMA_MXF8F6F4_SS<a_type, b_type, c_type, sf_type,
+                                (M/2 > 64 ? M/2 : M), (round_up(N, 128)), a_major, b_major,
+                                a_neg, b_neg>;
+
+
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+  uint32_t tsfa_addr_ = 0;
+  uint32_t tsfb_addr_ = 0;
+
+
+  UMMA::InstrDescriptorBlockScaled idesc_ = UMMA::make_instr_desc_block_scaled<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major, a_neg, b_neg>();
+
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+
+    uint32_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(traits.idesc_, traits.tsfa_addr_, traits.tsfb_addr_);
+
+
+    SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf_type,
+                          M, N,
+                          a_major, b_major,
+                          a_neg, b_neg>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc, traits.tsfa_addr_, traits.tsfb_addr_);
+  }
+
+
+  template <class TSFA, class TSFALayout, class TSFB, class TSFBLayout>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf_type,
+                                M, N, a_major, b_major, a_neg, b_neg>>
+  with(UMMA::ScaleOut accumulate, Tensor<TSFA, TSFALayout> const& SFA, Tensor<TSFB, TSFBLayout> const& SFB) const {
+    uint32_t tmem_sfa_addr = raw_pointer_cast(SFA.data());
+    uint32_t tmem_sfb_addr = raw_pointer_cast(SFB.data());
+    return {accumulate, tmem_sfa_addr, tmem_sfb_addr, idesc_};
+  }
+};
+
 }

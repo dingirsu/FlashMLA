@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
@@ -9,7 +10,8 @@ import torch
 import flash_mla
 
 
-EXTENSION_PATH = Path("/tmp/fp8_test_ext.so")
+ROOT = Path(__file__).resolve().parent
+EXTENSION_PATH = Path(os.environ.get("FP8_EXTENSION_OUTPUT", ROOT / "build/fp8_test_ext.so"))
 if not EXTENSION_PATH.exists():
     raise ImportError(f"{EXTENSION_PATH} does not exist; run ./compile_fp8.sh first")
 sys.path.insert(0, str(EXTENSION_PATH.parent))

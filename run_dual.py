@@ -12,7 +12,8 @@ from typing import Optional
 
 import torch
 
-EXTENSION_PATH = Path(os.environ.get("DUAL_EXTENSION_PATH", "/tmp/dual_head64_test_ext.so"))
+ROOT = Path(__file__).resolve().parent
+EXTENSION_PATH = Path(os.environ.get("DUAL_EXTENSION_PATH", ROOT / "build/dual_head64_test_ext.so"))
 
 
 def load_extension():

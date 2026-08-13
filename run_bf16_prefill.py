@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 from typing import Optional
 
 import torch
 
-EXTENSION_PATH = Path("/tmp/bf16_test_ext.so")
+ROOT = Path(__file__).resolve().parent
+EXTENSION_PATH = Path(os.environ.get("BF16_EXTENSION_OUTPUT", ROOT / "build/bf16_test_ext.so"))
 
 
 def _load_extension():

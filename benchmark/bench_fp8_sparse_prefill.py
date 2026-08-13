@@ -2,6 +2,7 @@
 import argparse
 import dataclasses
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Callable, Sequence
@@ -10,7 +11,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FP8_EXTENSION = Path("/tmp/fp8_test_ext.so")
+FP8_EXTENSION = Path(os.environ.get("FP8_EXTENSION_OUTPUT", ROOT / "build/fp8_test_ext.so"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 

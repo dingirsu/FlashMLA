@@ -9,6 +9,9 @@ PYTHON_INCLUDE="$($PYTHON -c 'import sysconfig; print(sysconfig.get_path("includ
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=${CXX:-c++}
+BUILD_DIR=${HEAD64_DECODE_BUILD_DIR:-"$ROOT/build"}
+
+mkdir -p "$BUILD_DIR"
 
 INCLUDES=(
     -I"$ROOT/csrc" -I"$ROOT/csrc/kerutils/include" -I"$ROOT/csrc/sm100"
@@ -36,11 +39,11 @@ fi
 
 "$CXX" "${INCLUDES[@]}" -O3 -std=c++20 -DNDEBUG -D_GLIBCXX_USE_CXX11_ABI=1 \
     -DTORCH_EXTENSION_NAME=head64_decode_test_ext -fPIC -c \
-    "$ROOT/tests/head64_decode_test_ext.cpp" -o /tmp/head64_decode_api.o
-"$NVCC" "${NVCC_FLAGS[@]}" "$ROOT/csrc/sm100/decode/head64/instantiations/model1.cu" -o /tmp/head64_decode_kernel.o
+    "$ROOT/tests/head64_decode_test_ext.cpp" -o "$BUILD_DIR/head64_decode_api.o"
+"$NVCC" "${NVCC_FLAGS[@]}" "$ROOT/csrc/sm100/decode/head64/instantiations/model1.cu" -o "$BUILD_DIR/head64_decode_kernel.o"
 
-"$CXX" -shared /tmp/head64_decode_api.o /tmp/head64_decode_kernel.o \
+"$CXX" -shared "$BUILD_DIR/head64_decode_api.o" "$BUILD_DIR/head64_decode_kernel.o" \
     -L"$TORCH_LIB" -Wl,-rpath,"$TORCH_LIB" -ltorch_python -ltorch_cuda -ltorch_cpu -ltorch \
     -lc10_cuda -lc10 -L"$CUDA_HOME/lib64" -Wl,-rpath,"$CUDA_HOME/lib64" -lcudart \
-    -o /tmp/head64_decode_test_ext.so
-echo "built /tmp/head64_decode_test_ext.so"
+    -o "${HEAD64_DECODE_EXT:-$BUILD_DIR/head64_decode_test_ext.so}"
+echo "built ${HEAD64_DECODE_EXT:-$BUILD_DIR/head64_decode_test_ext.so}"

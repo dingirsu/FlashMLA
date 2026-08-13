@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -6,7 +7,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parent
-EXTENSION_PATH = Path("/tmp/mxfp8_test_ext.so")
+EXTENSION_PATH = Path(os.environ.get("MXFP8_EXTENSION_OUTPUT", ROOT / "build/mxfp8_test_ext.so"))
 
 
 def _load_extension():

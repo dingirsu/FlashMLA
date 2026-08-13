@@ -9,8 +9,8 @@ PYTHON_INCLUDE=${PYTHON_INCLUDE:-$("$PYTHON" -c 'import sysconfig; print(sysconf
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=${CXX:-c++}
-BUILD_DIR=${DUAL_BUILD_DIR:-/tmp/flash_mla_dual_head64}
-OUTPUT=${DUAL_EXTENSION_PATH:-/tmp/dual_head64_test_ext.so}
+BUILD_DIR=${DUAL_BUILD_DIR:-"$ROOT/build/dual_head64"}
+OUTPUT=${DUAL_EXTENSION_PATH:-"$ROOT/build/dual_head64_test_ext.so"}
 
 mkdir -p "$BUILD_DIR"
 

@@ -9,6 +9,9 @@ PYTHON_INCLUDE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("incl
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=c++
+BUILD_DIR=${MXFP8_BUILD_DIR:-"$ROOT/build"}
+
+mkdir -p "$BUILD_DIR"
 
 INCLUDES=(
     -I"$ROOT/csrc"
@@ -54,31 +57,31 @@ NVCC_FLAGS=(
     -DTORCH_EXTENSION_NAME=mxfp8_test_ext \
     -fPIC -c \
     "$ROOT/tests/mxfp8_test_ext.cpp" \
-    -o /tmp/mxfp8_api_pic.o
+    -o "$BUILD_DIR/mxfp8_api_pic.o"
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/decode/mxfp8_head64/instantiations/model1.cu" \
-    -o /tmp/mxfp8_decode_pic.o
+    -o "$BUILD_DIR/mxfp8_decode_pic.o"
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     -DMXFP8_PREFILL_LOAD_KV=1 \
     "$ROOT/csrc/sm100/prefill/sparse/mxfp8_fwd/head64/instantiations/phase1_k512.cu" \
-    -o /tmp/mxfp8_prefill_pic.o
+    -o "$BUILD_DIR/mxfp8_prefill_pic.o"
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
-    -o /tmp/mxfp8_sched_pic.o
+    -o "$BUILD_DIR/mxfp8_sched_pic.o"
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/smxx/decode/combine/combine.cu" \
-    -o /tmp/mxfp8_combine_pic.o
+    -o "$BUILD_DIR/mxfp8_combine_pic.o"
 
 "$CXX" -shared \
-    /tmp/mxfp8_api_pic.o \
-    /tmp/mxfp8_decode_pic.o \
-    /tmp/mxfp8_prefill_pic.o \
-    /tmp/mxfp8_sched_pic.o \
-    /tmp/mxfp8_combine_pic.o \
+    "$BUILD_DIR/mxfp8_api_pic.o" \
+    "$BUILD_DIR/mxfp8_decode_pic.o" \
+    "$BUILD_DIR/mxfp8_prefill_pic.o" \
+    "$BUILD_DIR/mxfp8_sched_pic.o" \
+    "$BUILD_DIR/mxfp8_combine_pic.o" \
     -L"$TORCH_LIB" \
     -Wl,-rpath,"$TORCH_LIB" \
     -ltorch_python \
@@ -90,4 +93,4 @@ NVCC_FLAGS=(
     -L"$CUDA_HOME/lib64" \
     -Wl,-rpath,"$CUDA_HOME/lib64" \
     -lcudart \
-    -o /tmp/mxfp8_test_ext.so
+    -o "${MXFP8_EXTENSION_OUTPUT:-$BUILD_DIR/mxfp8_test_ext.so}"

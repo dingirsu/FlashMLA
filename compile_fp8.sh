@@ -9,6 +9,9 @@ PYTHON_INCLUDE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("incl
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=c++
+BUILD_DIR=${FP8_BUILD_DIR:-"$ROOT/build"}
+
+mkdir -p "$BUILD_DIR"
 
 INCLUDES=(
     -I"$ROOT/csrc"
@@ -124,7 +127,7 @@ if [[ "${FP8_DISABLE_O_TMA_STORE:-0}" == "1" ]]; then
 fi
 
 if [[ "${FP8_COMPILE_PREFILL_ONLY:-0}" == "1" ]]; then
-    FP8_PREFILL_OUT_DIR="${FP8_PREFILL_OUT_DIR:-/tmp}"
+    FP8_PREFILL_OUT_DIR="${FP8_PREFILL_OUT_DIR:-$BUILD_DIR}"
     FP8_PREFILL_D_QK="${FP8_PREFILL_D_QK:-all}"
     mkdir -p "$FP8_PREFILL_OUT_DIR"
     if [[ "$FP8_PREFILL_D_QK" == "all" || "$FP8_PREFILL_D_QK" == "512" ]]; then
@@ -147,17 +150,17 @@ fi
 #     -DTORCH_EXTENSION_NAME=fp8_test_ext \
 #     -fPIC -c \
 #     "$ROOT/tests/fp8_test_ext.cpp" \
-#     -o /tmp/fp8_api_pic.o
+#     -o "$BUILD_DIR/fp8_api_pic.o"
 
 # "$NVCC" "${NVCC_FLAGS[@]}" \
 #     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k512.cu" \
-#     -o /tmp/fp8_prefill_k512_pic.o
+#     -o "$BUILD_DIR/fp8_prefill_k512_pic.o"
 
 # "$NVCC" "${NVCC_FLAGS[@]}" \
 #     "$ROOT/csrc/sm100/prefill/sparse/fp8_fwd/head64/instantiations/phase1_k576.cu" \
-#     -o /tmp/fp8_prefill_k576_pic.o
+#     -o "$BUILD_DIR/fp8_prefill_k576_pic.o"
 
-FP8_DECODE_OBJECT="${FP8_DECODE_OBJECT:-/tmp/fp8_decode_pic.o}"
+FP8_DECODE_OBJECT="${FP8_DECODE_OBJECT:-$BUILD_DIR/fp8_decode_pic.o}"
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/decode/fp8_head64/instantiations/model1.cu" \
     -o "$FP8_DECODE_OBJECT"
@@ -168,20 +171,20 @@ fi
 
 # "$NVCC" "${NVCC_FLAGS[@]}" \
 #     "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" \
-#     -o /tmp/fp8_sched_pic.o
+#     -o "$BUILD_DIR/fp8_sched_pic.o"
 
 # "$NVCC" "${NVCC_FLAGS[@]}" \
 #     "$ROOT/csrc/smxx/decode/combine/combine.cu" \
-#     -o /tmp/fp8_combine_pic.o
+#     -o "$BUILD_DIR/fp8_combine_pic.o"
 
-FP8_EXTENSION_OUTPUT="${FP8_EXTENSION_OUTPUT:-/tmp/fp8_test_ext.so}"
+FP8_EXTENSION_OUTPUT="${FP8_EXTENSION_OUTPUT:-$BUILD_DIR/fp8_test_ext.so}"
 "$CXX" -shared \
-    /tmp/fp8_api_pic.o \
-    /tmp/fp8_prefill_k512_pic.o \
-    /tmp/fp8_prefill_k576_pic.o \
+    "$BUILD_DIR/fp8_api_pic.o" \
+    "$BUILD_DIR/fp8_prefill_k512_pic.o" \
+    "$BUILD_DIR/fp8_prefill_k576_pic.o" \
     "$FP8_DECODE_OBJECT" \
-    /tmp/fp8_sched_pic.o \
-    /tmp/fp8_combine_pic.o \
+    "$BUILD_DIR/fp8_sched_pic.o" \
+    "$BUILD_DIR/fp8_combine_pic.o" \
     -L"$TORCH_LIB" \
     -Wl,-rpath,"$TORCH_LIB" \
     -ltorch_python \

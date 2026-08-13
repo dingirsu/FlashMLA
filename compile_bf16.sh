@@ -9,6 +9,9 @@ PYTHON_INCLUDE=${PYTHON_INCLUDE:-$("$PYTHON" -c 'import sysconfig; print(sysconf
 TORCH_LIB="$TORCH_ROOT/lib"
 NVCC="$CUDA_HOME/bin/nvcc"
 CXX=${CXX:-c++}
+BUILD_DIR=${BF16_BUILD_DIR:-"$ROOT/build"}
+
+mkdir -p "$BUILD_DIR"
 
 INCLUDES=(
     -I"$ROOT/csrc"
@@ -58,15 +61,15 @@ fi
     -DTORCH_EXTENSION_NAME=bf16_test_ext \
     -fPIC -c \
     "$ROOT/tests/bf16_test_ext.cpp" \
-    -o /tmp/bf16_api_pic.o
+    -o "$BUILD_DIR/bf16_api_pic.o"
 
 "$NVCC" "${NVCC_FLAGS[@]}" \
     "$ROOT/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu" \
-    -o /tmp/bf16_prefill_pic.o
+    -o "$BUILD_DIR/bf16_prefill_pic.o"
 
 "$CXX" -shared \
-    /tmp/bf16_api_pic.o \
-    /tmp/bf16_prefill_pic.o \
+    "$BUILD_DIR/bf16_api_pic.o" \
+    "$BUILD_DIR/bf16_prefill_pic.o" \
     -L"$TORCH_LIB" \
     -Wl,-rpath,"$TORCH_LIB" \
     -ltorch_python \
@@ -78,4 +81,4 @@ fi
     -L"$CUDA_HOME/lib64" \
     -Wl,-rpath,"$CUDA_HOME/lib64" \
     -lcudart \
-    -o /tmp/bf16_test_ext.so
+    -o "${BF16_EXTENSION_OUTPUT:-$BUILD_DIR/bf16_test_ext.so}"

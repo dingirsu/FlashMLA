@@ -19,7 +19,7 @@ from small_head_test_utils import get_extension  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--s-q", type=int, default=4096)
+    parser.add_argument("--s-q", type=int, default=32768)
     parser.add_argument("--s-kv", type=int, default=32768)
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument("--active-topk", type=int)

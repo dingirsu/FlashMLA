@@ -39,13 +39,57 @@ def _quantize_groups(
     )
 
 
-def pack_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    data, scales, dequantized = _quantize_groups(q, Q_GROUP_SIZE)
+def pack_q(
+    q: torch.Tensor, group_size: int = Q_GROUP_SIZE, scale_slot_bytes: int = 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    data, scales, dequantized = _quantize_groups(q, group_size)
+    num_scale_bytes = D_HEAD // group_size
+    if scale_slot_bytes == 0:
+        scale_slot_bytes = num_scale_bytes
+    assert scale_slot_bytes >= num_scale_bytes
+    q_bytes_per_token = D_HEAD + scale_slot_bytes
     packed = torch.empty(
-        (*q.shape[:-1], Q_BYTES_PER_TOKEN), dtype=torch.uint8, device=q.device
+        (*q.shape[:-1], q_bytes_per_token), dtype=torch.uint8, device=q.device
     )
     packed[..., :D_HEAD] = data
-    packed[..., D_HEAD:] = scales
+    packed[..., D_HEAD : D_HEAD + num_scale_bytes] = scales
+    packed[..., D_HEAD + num_scale_bytes :] = 0
+    return packed, dequantized
+
+
+def pack_dual_q64(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack Q with one scale for corresponding 32-D chunks in both halves."""
+    assert q.shape[-1] == D_HEAD
+    paired = (
+        q.float()
+        .reshape(*q.shape[:-1], 2, D_HEAD // 64, 32)
+        .transpose(-3, -2)
+        .reshape(*q.shape[:-1], D_HEAD // 64, 64)
+    )
+    scale = paired.abs().amax(dim=-1) / FP8_MAX
+    scale = torch.pow(2.0, torch.ceil(torch.log2(scale.clamp_min(2.0**-126))))
+    scale_e8m0 = scale.to(torch.float8_e8m0fnu)
+    scale_fp32 = scale_e8m0.float()
+    quantized = (paired / scale_fp32.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
+    quantized = quantized.to(torch.float8_e4m3fn)
+    data = quantized.view(torch.uint8)
+    scales = scale_e8m0.view(torch.uint8)
+    dequantized = quantized.float() * scale_fp32.unsqueeze(-1)
+    data = (
+        data.reshape(*q.shape[:-1], D_HEAD // 64, 2, 32)
+        .transpose(-3, -2)
+        .reshape_as(q)
+    )
+    dequantized = (
+        dequantized.reshape(*q.shape[:-1], D_HEAD // 64, 2, 32)
+        .transpose(-3, -2)
+        .reshape_as(q.float())
+    )
+    packed = torch.empty(
+        (*q.shape[:-1], D_HEAD + 16), dtype=torch.uint8, device=q.device
+    )
+    packed[..., :D_HEAD] = data
+    packed[..., D_HEAD:] = torch.cat((scales, scales), dim=-1)
     return packed, dequantized
 
 

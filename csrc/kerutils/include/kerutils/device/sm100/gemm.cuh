@@ -1318,6 +1318,8 @@ struct MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf
   UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
   uint32_t tsfa_addr_ = 0;
   uint32_t tsfb_addr_ = 0;
+  uint32_t a_sf_id_ = 0;
+  uint32_t b_sf_id_ = 0;
 
 
   UMMA::InstrDescriptorBlockScaled idesc_ = UMMA::make_instr_desc_block_scaled<
@@ -1345,7 +1347,13 @@ struct MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf
     uint32_t tmem_a = raw_pointer_cast(A.data());
     uint64_t desc_b = B[0];
     uint32_t tmem_c = raw_pointer_cast(D.data());
-    uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(traits.idesc_, traits.tsfa_addr_, traits.tsfb_addr_);
+    // Match DeepGEMM's block-scaled issue path: the TMEM operands carry the
+    // scale-factor word addresses, while the byte selectors are written into
+    // the instruction descriptor immediately before issuing tcgen05.mma.
+    auto idesc_fields = traits.idesc_;
+    idesc_fields.a_sf_id_ = traits.a_sf_id_;
+    idesc_fields.b_sf_id_ = traits.b_sf_id_;
+    uint64_t idesc = uint64_t(uint32_t(idesc_fields)) << 32;
 
 
     SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf_type,
@@ -1362,7 +1370,28 @@ struct MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf
   with(UMMA::ScaleOut accumulate, Tensor<TSFA, TSFALayout> const& SFA, Tensor<TSFB, TSFBLayout> const& SFB) const {
     uint32_t tmem_sfa_addr = raw_pointer_cast(SFA.data());
     uint32_t tmem_sfb_addr = raw_pointer_cast(SFB.data());
-    return {accumulate, tmem_sfa_addr, tmem_sfb_addr, idesc_};
+    auto result = *this;
+    result.accumulate_ = accumulate;
+    result.tsfa_addr_ = tmem_sfa_addr & 0x3fffffffu;
+    result.tsfb_addr_ = tmem_sfb_addr & 0x3fffffffu;
+    result.a_sf_id_ = (tmem_sfa_addr >> 30) & 0x3;
+    result.b_sf_id_ = (tmem_sfb_addr >> 30) & 0x3;
+    return result;
+  }
+
+  template <class TSFA, class TSFALayout, class TSFB, class TSFBLayout>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<a_type, b_type, c_type, sf_type,
+                                M, N, a_major, b_major, a_neg, b_neg>>
+  with(UMMA::ScaleOut accumulate, Tensor<TSFA, TSFALayout> const& SFA,
+       Tensor<TSFB, TSFBLayout> const& SFB, uint32_t a_sf_id, uint32_t b_sf_id) const {
+    auto result = *this;
+    result.accumulate_ = accumulate;
+    result.tsfa_addr_ = raw_pointer_cast(SFA.data()) & 0x3fffffffu;
+    result.tsfb_addr_ = raw_pointer_cast(SFB.data()) & 0x3fffffffu;
+    result.a_sf_id_ = a_sf_id;
+    result.b_sf_id_ = b_sf_id;
+    return result;
   }
 };
 

@@ -36,7 +36,7 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     const int num_q_pairs = s_q / 2;
     constexpr int d_qk = 512;
     constexpr int d_v = 512;
-    constexpr int q_bytes_per_head = d_qk + d_qk / 32;
+    constexpr int q_bytes_per_head = d_qk + 16;
     constexpr int kv_bytes_per_token = d_qk + d_qk / 64;
 
     TORCH_CHECK(s_q > 0 && s_q % 2 == 0,
@@ -44,7 +44,7 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     TORCH_CHECK(h_q == 64, "q must have shape [s_q, 64, 528]");
     TORCH_CHECK(h_kv == 1, "kv must have shape [s_kv, 1, 520]");
     TORCH_CHECK(q.size(2) == q_bytes_per_head,
-                "q must store 512 E4M3 bytes followed by 16 UE8M0 scale bytes per head");
+                "q must store 512 E4M3 bytes followed by 8 UE8M0 scale bytes and 8 padding bytes per head");
     TORCH_CHECK(kv.size(2) == kv_bytes_per_token,
                 "kv must provide a 520-byte envelope per token for page-tail scales");
     TORCH_CHECK(topk > 0 && topk % 64 == 0,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Precision checks for the two-token, 2-SM MXFP8 head64 prefill kernel.
 
-Q uses one real UE8M0 scale per 32 values and K uses one per 64 values.
-The kernel duplicates each K scale for tcgen05's 32-value scale vectors.
+Q and K use one real UE8M0 scale per 64 values. The kernel duplicates each
+scale for tcgen05's 32-value scale vectors.
 S is converted directly to E4M3 and both S and V use unit UE8M0 scales.
 """
 
@@ -24,9 +24,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 from mxfp8_test_utils import (  # noqa: E402
     D_HEAD,
     KV_GROUP_SIZE,
-    Q_GROUP_SIZE,
+    pack_dual_q64,
     pack_prefill_kv,
-    pack_q,
 )
 
 
@@ -40,6 +39,7 @@ MMA_K = 32
 LOG2_E = math.log2(math.e)
 MAX_INIT_VAL = -1.0e30
 UE8M0_ONE_BITS = 0x7F
+Q_GROUP_SIZE = 64
 
 
 def load_extension():
@@ -68,7 +68,7 @@ def unpack_v_with_unit_scale(packed_kv: torch.Tensor) -> torch.Tensor:
 
 
 def scale_bits(packed_q: torch.Tensor, packed_kv: torch.Tensor):
-    q_scales = packed_q[..., D_HEAD:]
+    q_scales = packed_q[..., D_HEAD : D_HEAD + D_HEAD // Q_GROUP_SIZE]
     num_tokens = packed_kv.shape[0] * packed_kv.shape[1]
     k_scales = packed_kv.reshape(-1)[num_tokens * D_HEAD :]
     k_scales = k_scales.reshape(*packed_kv.shape[:-1], D_HEAD // KV_GROUP_SIZE)
@@ -219,16 +219,17 @@ def run_case(
     torch.manual_seed(20260813 + s_q + s_kv + topk)
     device = torch.device("cuda")
 
-    q_group_gain = torch.exp2(
+    q_half_gain = torch.exp2(
         torch.linspace(-3.0, 3.0, D_HEAD // Q_GROUP_SIZE, device=device)
-    ).repeat_interleave(Q_GROUP_SIZE)
+    ).repeat_interleave(32)
+    q_group_gain = torch.cat((q_half_gain, q_half_gain))
     k_group_gain = torch.exp2(
         torch.tensor([-4, 1, -2, 3, 0, -3, 2, -1], device=device).float()
     ).repeat_interleave(KV_GROUP_SIZE)
     q = torch.randn(s_q, 64, D_HEAD, device=device) * 0.08 * q_group_gain
     kv = torch.randn(s_kv, 1, D_HEAD, device=device) * 0.08 * k_group_gain
 
-    packed_q, dequantized_q = pack_q(q)
+    packed_q, dequantized_q = pack_dual_q64(q)
     packed_kv, dequantized_k = pack_prefill_kv(kv)
     v_unit_scaled = unpack_v_with_unit_scale(packed_kv)
     q_scale_bits, k_scale_bits = scale_bits(packed_q, packed_kv)
@@ -321,6 +322,14 @@ def main() -> None:
             topk=128,
             use_sink=True,
             use_lengths=True,
+        ),
+        dict(
+            name="five-tile-wrap",
+            s_q=2,
+            s_kv=386,
+            topk=320,
+            use_sink=True,
+            use_lengths=False,
         ),
     ]
     for case in cases:

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Precision checks for the two-token, 2-SM MXFP8 head64 prefill kernel.
 
-Q and K use one real UE8M0 scale per 64 values. The kernel duplicates each
-scale for tcgen05's 32-value scale vectors.
-S is converted directly to E4M3 and both S and V use unit UE8M0 scales.
+Q and K use one real UE8M0 scale per 64 values. Their eight scale bytes are
+replicated into 16-byte input slots. K reuses each scale for two K=32 MMAs by
+selecting the tcgen05 scale-factor ID explicitly.
+S is multiplied by each token's first K UE8M0 scale before conversion to
+E4M3. V uses eight 64-D UE8M0 scales packed into the w1/w2 float arguments.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import argparse
 import importlib.util
 import math
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Optional
@@ -25,7 +28,7 @@ from mxfp8_test_utils import (  # noqa: E402
     D_HEAD,
     KV_GROUP_SIZE,
     pack_dual_q64,
-    pack_prefill_kv,
+    pack_dual_prefill_kv64,
 )
 
 
@@ -40,6 +43,13 @@ LOG2_E = math.log2(math.e)
 MAX_INIT_VAL = -1.0e30
 UE8M0_ONE_BITS = 0x7F
 Q_GROUP_SIZE = 64
+K_SCALE_SLOT_BYTES = 16
+V_SCALE_EXPONENTS = (0, 1, 2, 3, -1, -2, -3, -4)
+
+
+def pack_e8m0x4_as_float(scale_bits: tuple[int, int, int, int]) -> float:
+    """Bit-pack four little-endian UE8M0 bytes into one float argument."""
+    return struct.unpack("<f", bytes(scale_bits))[0]
 
 
 def load_extension():
@@ -58,8 +68,8 @@ def load_extension():
     return module
 
 
-def unpack_v_with_unit_scale(packed_kv: torch.Tensor) -> torch.Tensor:
-    """Read only E4M3 data; V's UE8M0 scale is exactly one in the kernel."""
+def unpack_v_e4m3(packed_kv: torch.Tensor) -> torch.Tensor:
+    """Read the raw E4M3 V operand before applying w1/w2 dimension scales."""
     num_tokens = packed_kv.shape[0] * packed_kv.shape[1]
     data = packed_kv.reshape(-1)[: num_tokens * D_HEAD]
     return data.contiguous().view(torch.float8_e4m3fn).float().reshape(
@@ -70,8 +80,14 @@ def unpack_v_with_unit_scale(packed_kv: torch.Tensor) -> torch.Tensor:
 def scale_bits(packed_q: torch.Tensor, packed_kv: torch.Tensor):
     q_scales = packed_q[..., D_HEAD : D_HEAD + D_HEAD // Q_GROUP_SIZE]
     num_tokens = packed_kv.shape[0] * packed_kv.shape[1]
-    k_scales = packed_kv.reshape(-1)[num_tokens * D_HEAD :]
-    k_scales = k_scales.reshape(*packed_kv.shape[:-1], D_HEAD // KV_GROUP_SIZE)
+    k_scale_slots = packed_kv.reshape(-1)[num_tokens * D_HEAD :]
+    k_scale_slots = k_scale_slots.reshape(
+        *packed_kv.shape[:-1], K_SCALE_SLOT_BYTES
+    )
+    k_scales = k_scale_slots[..., : D_HEAD // KV_GROUP_SIZE]
+    torch.testing.assert_close(
+        k_scale_slots[..., D_HEAD // KV_GROUP_SIZE :], k_scales
+    )
     return q_scales, k_scales
 
 
@@ -105,17 +121,21 @@ def sv_mma_reference(
 def tiled_reference(
     q: torch.Tensor,
     k: torch.Tensor,
-    v_unit_scaled: torch.Tensor,
+    v_e4m3: torch.Tensor,
+    v_token_scale: torch.Tensor,
+    v_scale_w: torch.Tensor,
     pair_indices: torch.Tensor,
     sm_scale: float,
     attn_sink: Optional[torch.Tensor],
     pair_topk_length: Optional[torch.Tensor],
 ):
-    """Emulate Q/K block scales, online softmax, and unit-scaled S/V MMA."""
+    """Emulate Q/K block scales, online softmax, and token-scaled S/V MMA."""
     s_q, h_q, _ = q.shape
     topk = pair_indices.shape[-1]
     k = k[:, 0].float()
-    v_unit_scaled = v_unit_scaled[:, 0].float()
+    v_e4m3 = v_e4m3[:, 0].float()
+    v_token_scale = v_token_scale[:, 0].float()
+    v_scale_per_d = v_scale_w.float().repeat_interleave(KV_GROUP_SIZE)
     pair_indices = pair_indices[:, 0]
 
     out_rows = []
@@ -149,7 +169,8 @@ def tiled_reference(
             )
             safe_indices = tile_indices.clamp(0, k.shape[0] - 1).long()
             gathered_k = k.index_select(0, safe_indices)
-            gathered_v = v_unit_scaled.index_select(0, safe_indices)
+            gathered_v = v_e4m3.index_select(0, safe_indices)
+            gathered_v_token_scale = v_token_scale.index_select(0, safe_indices)
 
             p = qk_mma_reference(q[q_idx].float(), gathered_k)
             p.mul_(sm_scale * LOG2_E)
@@ -172,9 +193,14 @@ def tiled_reference(
             if tile_idx > 0:
                 out.mul_(old_out_scale.unsqueeze(-1))
 
-            # The requested S path is registers -> E4M3 with scale=1.
-            s_e4m3 = s.to(torch.float8_e4m3fn).float()
-            sv_mma_reference(out, s_e4m3, gathered_v)
+            # Match the kernel: apply K token scale[0] to every H element in
+            # the corresponding S column before the direct E4M3 cast. S's
+            # GEMM scale remains one; V uses the w1/w2 dimension scales.
+            s_for_sv = s * gathered_v_token_scale.unsqueeze(0)
+            s_e4m3 = s_for_sv.to(torch.float8_e4m3fn).float()
+            sv_mma_reference(
+                out, s_e4m3, gathered_v * v_scale_per_d.unsqueeze(0)
+            )
             mi = new_mi
 
         all_invalid = torch.isneginf(real_mi)
@@ -230,8 +256,8 @@ def run_case(
     kv = torch.randn(s_kv, 1, D_HEAD, device=device) * 0.08 * k_group_gain
 
     packed_q, dequantized_q = pack_dual_q64(q)
-    packed_kv, dequantized_k = pack_prefill_kv(kv)
-    v_unit_scaled = unpack_v_with_unit_scale(packed_kv)
+    packed_kv, dequantized_k = pack_dual_prefill_kv64(kv)
+    v_e4m3 = unpack_v_e4m3(packed_kv)
     q_scale_bits, k_scale_bits = scale_bits(packed_q, packed_kv)
     assert torch.unique(q_scale_bits).numel() > 1
     assert torch.unique(k_scale_bits).numel() > 1
@@ -255,19 +281,29 @@ def run_case(
         else None
     )
     sm_scale = D_HEAD**-0.5
+    v_scale_bits = tuple(exponent + 127 for exponent in V_SCALE_EXPONENTS)
+    w1 = pack_e8m0x4_as_float(v_scale_bits[:4])
+    w2 = pack_e8m0x4_as_float(v_scale_bits[4:])
+    v_scale_w = torch.exp2(
+        torch.tensor(V_SCALE_EXPONENTS, device=device, dtype=torch.float32)
+    )
 
     actual = extension.dual_mxfp8_head64_sparse_prefill_fwd(
         packed_q,
         packed_kv,
         pair_indices,
         sm_scale,
+        w1,
+        w2,
         attn_sink,
         pair_topk_length,
     )
     expected = tiled_reference(
         dequantized_q,
         dequantized_k,
-        v_unit_scaled,
+        v_e4m3,
+        k_scale_bits[..., 0].contiguous().view(torch.float8_e8m0fnu),
+        v_scale_w,
         pair_indices,
         sm_scale,
         attn_sink,
@@ -285,7 +321,7 @@ def run_case(
     )
     torch.testing.assert_close(
         actual[0].float(), expected[0], atol=5.0e-1, rtol=4.0e-2,
-        msg=lambda msg: f"{name}: unit-scaled S/V path mismatch\n{msg}",
+        msg=lambda msg: f"{name}: token-scaled S/V path mismatch\n{msg}",
     )
     print(
         f"PASS {name:14s} q_scales={torch.unique(q_scale_bits).numel():2d} "

@@ -253,6 +253,7 @@ struct SparseAttnFwdParams {
 
     int num_sm;
     cudaStream_t stream;
+
 };
 
 struct SparseAttnBwdParams {
@@ -299,10 +300,10 @@ struct MxFp8SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
 
-    // Q uses 32-value groups with per-token scales. KV uses 64-value groups
-    // and stores the scale plane after all e4m3 rows in the packed page.
+    // Q and K use 64-value groups. Their 8 UE8M0 scales are replicated to
+    // 16-byte slots. K stores the scale-slot plane after all E4M3 rows.
     void* __restrict__ q;          // [s_q, h_q, 512 e4m3 + 16 UE8M0]
-    void* __restrict__ kv;         // packed [s_kv*h_kv*512 data][s_kv*h_kv*8 scales]
+    void* __restrict__ kv;         // packed [s_kv*h_kv*512 data][s_kv*h_kv*16 scale slots]
     uint8_t* __restrict__ kv_scale_w; // [8] UE8M0 W(g), anchor group is 0
     int* __restrict__ indices;     // [s_q, h_kv, topk]
     float* __restrict__ attn_sink; // [h_q], may be nullptr
@@ -319,6 +320,10 @@ struct MxFp8SparseAttnFwdParams {
 
     int num_sm;
     cudaStream_t stream;
+
+    // Dual-MXFP8 V dimension scales. Each float carries four packed UE8M0
+    // bytes in its raw 32-bit representation: w1=[g0..g3], w2=[g4..g7].
+    float w1, w2;
 };
 
 struct Head64Fp8SparseAttnFwdParams {

@@ -93,6 +93,21 @@ def pack_dual_q64(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return packed, dequantized
 
 
+def pack_dual_prefill_kv64(kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack dual-MXFP8 KV with replicated 16B scale slots in the tail plane."""
+    assert kv.ndim == 3
+    data, scales, dequantized = _quantize_groups(kv, KV_GROUP_SIZE)
+    scale_slots = torch.cat((scales, scales), dim=-1)
+    num_tokens = kv.shape[0] * kv.shape[1]
+    bytes_per_token = D_HEAD + scale_slots.shape[-1]
+    storage = torch.empty(
+        num_tokens * bytes_per_token, dtype=torch.uint8, device=kv.device
+    )
+    storage[: num_tokens * D_HEAD] = data.reshape(-1)
+    storage[num_tokens * D_HEAD :] = scale_slots.reshape(-1)
+    return storage.view(*kv.shape[:-1], bytes_per_token), dequantized
+
+
 def pack_prefill_kv(kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pack the complete prefill KV allocation as one page-tail-scale page."""
     assert kv.ndim == 3

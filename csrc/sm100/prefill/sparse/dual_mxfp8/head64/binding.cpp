@@ -14,6 +14,8 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
+    float w1,
+    float w2,
     const std::optional<at::Tensor>& attn_sink,
     const std::optional<at::Tensor>& topk_length
 ) {
@@ -37,16 +39,17 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     constexpr int d_qk = 512;
     constexpr int d_v = 512;
     constexpr int q_bytes_per_head = d_qk + 16;
-    constexpr int kv_bytes_per_token = d_qk + d_qk / 64;
+    constexpr int kv_scale_slot_bytes = 16;
+    constexpr int kv_bytes_per_token = d_qk + kv_scale_slot_bytes;
 
     TORCH_CHECK(s_q > 0 && s_q % 2 == 0,
                 "q must contain an even, positive number of query tokens");
     TORCH_CHECK(h_q == 64, "q must have shape [s_q, 64, 528]");
-    TORCH_CHECK(h_kv == 1, "kv must have shape [s_kv, 1, 520]");
+    TORCH_CHECK(h_kv == 1, "kv must have shape [s_kv, 1, 528]");
     TORCH_CHECK(q.size(2) == q_bytes_per_head,
-                "q must store 512 E4M3 bytes followed by 8 UE8M0 scale bytes and 8 padding bytes per head");
+                "q must store 512 E4M3 bytes followed by a replicated 16-byte UE8M0 scale slot per head");
     TORCH_CHECK(kv.size(2) == kv_bytes_per_token,
-                "kv must provide a 520-byte envelope per token for page-tail scales");
+                "kv must provide a 528-byte envelope per token for replicated page-tail scales");
     TORCH_CHECK(topk > 0 && topk % 64 == 0,
                 "topk must be a positive multiple of 64");
 
@@ -93,7 +96,8 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
         max_logits.data_ptr<float>(),
         lse.data_ptr<float>(),
         arch.num_sms,
-        at::cuda::getCurrentCUDAStream().stream()
+        at::cuda::getCurrentCUDAStream().stream(),
+        w1, w2
     };
 
     sm100::dual_mxfp8::head64::run_dual_mxfp8_phase1_kernel<

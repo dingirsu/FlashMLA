@@ -81,6 +81,9 @@ build_dual_mxfp8() {
     mkdir -p "$dir"
     "$CXX" "${INCLUDES[@]}" -O3 -std=c++20 -DNDEBUG -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-deprecated-declarations -DTORCH_EXTENSION_NAME=dual_mxfp8_test_ext -fPIC -c "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/binding.cpp" -o "$dir/binding.o"
     local nvcc_flags=("${COMMON[@]}" -c --ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage -lineinfo -gencode arch=compute_100f,code=sm_100f --threads "${NVCC_THREADS:-16}")
+    if [[ "${DUAL_MXFP8_K_SCALE_CP_ASYNC:-0}" == "1" ]]; then
+        nvcc_flags+=( -DDUAL_MXFP8_K_SCALE_CP_ASYNC=1 )
+    fi
     "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/instantiations/phase1_k512.cu" -o "$dir/phase1_k512.o"
     link_extension "$output" "$dir/binding.o" "$dir/phase1_k512.o"
     echo "built $output"

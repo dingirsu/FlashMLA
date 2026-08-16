@@ -10,6 +10,10 @@
 #include "defines.h"
 #include "params.h"
 
+#ifndef DUAL_MXFP8_K_SCALE_CP_ASYNC
+#define DUAL_MXFP8_K_SCALE_CP_ASYNC 0
+#endif
+
 namespace sm100::dual_mxfp8::head64 {
 
 using namespace cute;
@@ -30,6 +34,7 @@ using fp8_e8m0 = cutlass::float_ue8m0_t;
 struct TmaParamsForPrefill {
     CUtensorMap tensor_map_q;
     CUtensorMap tensor_map_kv;
+    CUtensorMap tensor_map_k_scale;
     CUtensorMap tensor_map_o;
 };
 
@@ -62,9 +67,9 @@ static constexpr int B_TOPK = 64; // For 2 CTAs
 static constexpr int NUM_THREADS = 128*4;
 // Prefill run_outer_loop participants per CTA:
 // WG0=128, KV producer elected lanes=4, validity lanes=8, K-scale
-    // warps=64, and softmax WG=128. Only CTA0's elected warp8 lane issues
-    // cta_group::2 UTCCP/MMA operations. Warp10 folds the CLC query into its
-    // K-scale loop.
+    // copy warps=64, and softmax WG=128. Only CTA0's elected warp8 lane
+    // issues cta_group::2 UTCCP/MMA operations. Warp10 folds the CLC query
+    // into its K-scale loop.
     static constexpr int NUM_WORKER_THREADS = IS_PREFILL
     ? (128 + 4 + (B_TOPK/8) + 64 + 128)*2 + 1
     : (128 + 128 + 1 + 32 + 2 + 128)*2;
@@ -84,18 +89,21 @@ static constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
 static constexpr int Q_SCALE_SLOT_BYTES = 16;
 static constexpr int K_QUANT_GROUP_SIZE = 64;
 static constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
-static constexpr int K_SCALE_DUP = K_QUANT_GROUP_SIZE / MXFP8_SCALE_VEC_SIZE;
-static constexpr int K_SCALE_TMA_BYTES = 16;
+static constexpr int K_SCALE_SLOT_BYTES = 16;
 static constexpr int K_SCALE_GATHER_ROWS = 4;
+static constexpr int K_SCALE_GATHER_BYTES =
+    K_SCALE_GATHER_ROWS * K_SCALE_SLOT_BYTES;
+// Gather4 writes four complete 16B slots into a 64B raw payload. Keep each
+// gather destination on a separate 128B row so the destination is aligned for
+// both the TMA path and the warp10/warp11 repack loads.
 static constexpr int K_SCALE_GATHER_SMEM_STRIDE = 128;
 static constexpr int SCALE_GROUPS_PER_TMEM_BLOCK = 4;
 static constexpr int Q_BYTES_PER_HEAD = D_Q + Q_SCALE_SLOT_BYTES;
-static constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_BYTES;
-static constexpr uint8_t UE8M0_ONE_BITS = 0x7f;
+static constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_SLOT_BYTES;
 static_assert(Q_SCALE_BYTES == 8);
 static_assert(Q_SCALE_SLOT_BYTES == 16);
 static_assert(K_SCALE_BYTES == 8);
-static_assert(K_SCALE_DUP == 2);
+static_assert(K_SCALE_SLOT_BYTES == 2 * K_SCALE_BYTES);
 
 static constexpr int B_EPI = 64;                // Epilogue block size for normal case (i.e. prefill or non-splitkv decoding)
 static constexpr int B_EPI_SPLITKV = 32;        // Epilogue block size for splitkv decoding
@@ -122,22 +130,26 @@ struct SharedMemoryPlan {
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
-    // Q scales are loaded once per adjacent-token pair.  K scales are
-    // double-buffered with K data and expanded from 64-value groups to the
-    // 32-value groups consumed by tcgen05.
+    // Q scales are loaded once per adjacent-token pair. K scales are
+    // double-buffered with K data. The default path repacks TMA gather4
+    // payloads; the optional cp.async path writes this final layout directly.
     array_aligned<fp8_e8m0, 8192> q_scale_mma;
-    // Each selected token uses an aligned ordinary 16B load of its token pair;
-    // parity selects the requested 8B scale row afterwards.
+#if !DUAL_MXFP8_K_SCALE_CP_ASYNC
+    // Raw gather4 payload: 16 gather rows x 4 complete 16B token slots. The
+    // 128B row stride keeps each gather destination aligned while leaving the
+    // remaining 64B in each row as padding.
     CUTE_ALIGNAS(128) fp8_e8m0
-        k_scale_pair_raw[NUM_K_BUFS][B_TOPK / K_SCALE_GATHER_ROWS][K_SCALE_GATHER_SMEM_STRIDE];
-    CUTE_ALIGNAS(16) int k_scale_token_idx[NUM_K_BUFS][B_TOPK];
+        k_scale_pair_raw[NUM_K_BUFS][B_TOPK / K_SCALE_GATHER_ROWS]
+            [K_SCALE_GATHER_SMEM_STRIDE];
     CUTE_ALIGNAS(16) fp8_e8m0
-        k_scale_expanded[B_TOPK][D_K / MXFP8_SCALE_VEC_SIZE];
-    // The 2x64 UTCCP source footprint is 64 rows x 16B. Keep one source per
-    // K ring stage so producers for different stages never alias.
+        k_scale_token[B_TOPK][K_SCALE_BYTES];
+#endif
+    // The first K scale of each selected token is also the token scale used
+    // to pre-scale S before its E4M3 conversion for the S@V MMA. Keep it
+    // double-buffered with K so a scale producer never aliases an S reader.
+    CUTE_ALIGNAS(16) fp8_e8m0 v_token_scale[NUM_K_BUFS][B_TOPK];
+    // Final 64-row x 16B post-transpose source consumed by 2x64 UTCCP.
     array_aligned<fp8_e8m0, B_TOPK * 16> k_scale_mma[NUM_K_BUFS];
-    // V remains unit-scaled and uses the CUTLASS SMEM -> TMEM scale path.
-    array_aligned<fp8_e8m0, 8192> v_scale_one;
     float P_exchange[4][(H_Q/2/2)*(B_TOPK/2)];
     float rowwise_max_buf[128], rowwise_li_buf[128];
 
@@ -150,7 +162,9 @@ struct SharedMemoryPlan {
     transac_bar_t bar_tQ_empty, bar_tQ_full;
     transac_bar_t bar_tOut_full, bar_tOut_empty;
     transac_bar_t bar_KV_full[NUM_K_BUFS], bar_KV_empty[NUM_K_BUFS];
+#if !DUAL_MXFP8_K_SCALE_CP_ASYNC
     transac_bar_t bar_K_scale_raw_full[NUM_K_BUFS];
+#endif
     transac_bar_t bar_K_scale_copy_ready[NUM_K_BUFS];
     transac_bar_t bar_P_empty;
     transac_bar_t bar_QK_done[NUM_K_BUFS], bar_SV_done;
@@ -199,6 +213,8 @@ static_assert(cosize_v<SmemLayoutPScaleA> <= 8192);
 static_assert(cosize_v<SmemLayoutPScaleB> <= 8192);
 static_assert(cosize_v<SmemLayoutOScaleA> <= 8192);
 static_assert(cosize_v<SmemLayoutOScaleB> <= 8192);
+static_assert(cosize_v<SmemLayoutOScaleB>
+    == (B_TOPK / MXFP8_SCALE_VEC_SIZE) * D_V);
 static_assert(tmem_cols::Q_scale + 32 <= tmem_cols::K_scale);
 static_assert(tmem_cols::K_scale + 16 <= tmem_cols::S_scale);
 static_assert(tmem_cols::S_scale + 4 <= tmem_cols::V_scale);

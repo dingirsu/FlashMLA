@@ -159,10 +159,11 @@ void utcmma_blockscaled_ts(
 }
 
 // Perform TS UTCMMA with explicit UE8M0 byte selectors.  This mirrors
-// DeepGEMM's SM100 block-scaled loop: each K=32 instruction selects one of the
-// four scale bytes packed in the current TMEM word, and the fragment advances
-// to the next word after four instructions.
+// DeepGEMM's SM100 block-scaled loop: each K=32 instruction explicitly selects
+// a byte from the current TMEM scale word. BScaleGroupSize controls how many
+// consecutive K=32 instructions reuse each B scale byte.
 template<
+    int BScaleGroupSize,
     typename TiledMMA,
     typename TensorA,
     typename TensorB,
@@ -181,30 +182,33 @@ void utcmma_blockscaled_ts_explicit_sf_ids(
     bool clear_accum
 ) {
     using namespace cute;
+    static_assert(BScaleGroupSize >= 32 && BScaleGroupSize % 32 == 0);
+    constexpr int BScaleReuse = BScaleGroupSize / 32;
     tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
     ThrMMA thr_mma = tiled_mma.get_slice(_0{});
     auto sB_frag = thr_mma.partition_fragment_B(sB);
     static_assert(size<2>(tA_frag) == size<2>(sB_frag));
     CUTE_UNROLL
     for (int k = 0; k < size<2>(tA_frag); ++k) {
-        uint32_t sf_id = uint32_t(k) & 3u;
-        // Keep the address fixed for four K=32 instructions and rotate only
-        // the scale-factor ID. UTCCP destinations are four-column aligned, so
-        // each K=128 scale tile occupies the next four-column slot for both
-        // operands even when the compact SFB fragment aliases fewer columns.
-        // Keep the M128/2x2 fragment's physical TMEM column stride.  In this
-        // mode the SFB fragment advances by two TMEM columns per K=128 tile;
-        // flattening it to a four-column stride aliases the second datapath.
+        uint32_t a_sf_id = uint32_t(k) & 3u;
+        uint32_t b_scale_idx = uint32_t(k) / BScaleReuse;
+        uint32_t b_sf_id = b_scale_idx & 3u;
+        int b_word_k = int(b_scale_idx & ~3u) * BScaleReuse;
+        // A retains the existing K=32 scale packing. B may reuse one scale
+        // byte across multiple K=32 instructions; keep its TMEM word fixed
+        // until all four bytes in that word have been consumed.
+        // Keep the M128/2x2 fragment's physical TMEM column stride. In this
+        // mode SFB advances by two TMEM columns per K=128 tile.
         auto tSFA = tSFA_frag(_, _, k);
-        auto tSFB = tSFB_frag(_, _, k);
+        auto tSFB = tSFB_frag(_, _, b_word_k);
         tSFA.data().get() = raw_pointer_cast(tSFA.data());
         tSFB.data().get() = raw_pointer_cast(tSFB.data());
         auto tiled_mma_with_scale = tiled_mma.with(
             tiled_mma.accumulate_,
             tSFA,
             tSFB,
-            sf_id,
-            sf_id
+            a_sf_id,
+            b_sf_id
         );
         cute::gemm(
             tiled_mma_with_scale,

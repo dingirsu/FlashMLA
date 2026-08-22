@@ -190,6 +190,51 @@ struct SparseAttnMxfp8DecodeParams {
     int num_sm_parts;
 };
 
+// Dual MXFP8 head64 decode parameters. This is intentionally separate from
+// SparseAttnMxfp8DecodeParams: the dual kernel has no rank-1 kv_scale_w input
+// and accepts the eight V dimension scale bytes packed into w1/w2.
+struct SparseAttnDualMxfp8DecodeParams {
+    int b, s_q;
+    int h_q, h_kv;
+    int d_qk, d_v;
+    float sm_scale, sm_scale_div_log2;
+    int num_blocks, page_block_size, topk;
+    ModelType model_type;
+
+    void* __restrict__ q;
+    void* __restrict__ kv;
+    float w1, w2;
+    int* __restrict__ indices;
+    int* __restrict__ topk_length;
+    float* __restrict__ attn_sink;
+
+    float* __restrict__ lse;
+    cutlass::bfloat16_t* __restrict__ out;
+
+    int extra_num_blocks, extra_page_block_size, extra_topk;
+    void* __restrict__ extra_kv;
+    int* __restrict__ extra_indices;
+    int* __restrict__ extra_topk_length;
+
+    int stride_q_b, stride_q_s_q, stride_q_h_q;
+    int stride_kv_block, stride_kv_row;
+    int stride_indices_b, stride_indices_s_q;
+    int stride_lse_b, stride_lse_s_q;
+    int stride_o_b, stride_o_s_q, stride_o_h_q;
+    int stride_extra_kv_block, stride_extra_kv_row;
+    int stride_extra_indices_b, stride_extra_indices_s_q;
+
+    cudaStream_t stream;
+
+    float* __restrict__ lse_accum;
+    float* __restrict__ o_accum;
+    int stride_lse_accum_split, stride_lse_accum_s_q;
+    int stride_o_accum_split, stride_o_accum_s_q, stride_o_accum_h_q;
+    DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr;
+    int* __restrict__ num_splits_ptr;
+    int num_sm_parts;
+};
+
 struct CombineParams {
     int b, s_q, h_q, d_v;
 

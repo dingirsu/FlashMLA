@@ -85,7 +85,10 @@ build_dual_mxfp8() {
         nvcc_flags+=( -DDUAL_MXFP8_K_SCALE_CP_ASYNC=1 )
     fi
     "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/instantiations/phase1_k512.cu" -o "$dir/phase1_k512.o"
-    link_extension "$output" "$dir/binding.o" "$dir/phase1_k512.o"
+    "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/sm100/prefill/sparse/dual_mxfp8/head64/instantiations/phase1_decode_k512.cu" -o "$dir/phase1_decode_k512.o"
+    "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu" -o "$dir/get_decoding_sched_meta.o"
+    "$NVCC" "${nvcc_flags[@]}" "$ROOT/csrc/smxx/decode/combine/combine.cu" -o "$dir/combine.o"
+    link_extension "$output" "$dir/binding.o" "$dir/phase1_k512.o" "$dir/phase1_decode_k512.o" "$dir/get_decoding_sched_meta.o" "$dir/combine.o"
     echo "built $output"
 }
 

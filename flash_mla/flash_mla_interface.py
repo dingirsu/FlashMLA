@@ -570,7 +570,6 @@ def flash_mla_mxfp8_with_kvcache(
     extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
     if softmax_scale is None:
         softmax_scale = d_qk ** (-0.5)
-
     if not sched_meta.have_initialized:
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(
@@ -595,3 +594,46 @@ def flash_mla_mxfp8_with_kvcache(
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
     return (out, lse)
+
+
+def flash_mla_dual_mxfp8_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    d_qk: int,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    w1: float = 0.0,
+    w2: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual-MXFP8 sparse decode for the head64 kernel."""
+    sched_meta = tile_scheduler_metadata
+    assert isinstance(sched_meta, FlashMLASchedMeta)
+    assert num_splits is None
+    if softmax_scale is None:
+        softmax_scale = d_qk ** (-0.5)
+    topk = indices.shape[-1]
+    extra_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
+    extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
+    if not sched_meta.have_initialized:
+        sched_meta.have_initialized = True
+        sched_meta.config = FlashMLASchedMeta.Config(
+            q.shape[0], q.shape[1], q.shape[2], k_cache.shape[1], k_cache.shape[2],
+            False, True, topk, extra_page_block_size, extra_topk,
+        )
+    out, lse, new_meta, new_splits = flash_mla_cuda.dual_mxfp8_sparse_decode_fwd(
+        q, k_cache, indices, topk_length, attn_sink,
+        sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+        extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
+        d_qk, head_dim_v, softmax_scale, w1, w2,
+    )
+    sched_meta.tile_scheduler_metadata = new_meta
+    sched_meta.num_splits = new_splits
+    return out, lse

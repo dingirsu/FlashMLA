@@ -6,6 +6,7 @@
 #include "api/common.h"
 #include "params.h"
 #include "sm100/prefill/sparse/dual_mxfp8/head64/phase1.h"
+#include "api/dual_mxfp8_sparse_decode.h"
 
 namespace {
 
@@ -112,5 +113,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "dual_mxfp8_head64_sparse_prefill_fwd",
         &dual_mxfp8_head64_sparse_prefill_interface
+    );
+    m.def(
+        "dual_mxfp8_sparse_decode_fwd",
+        &dual_mxfp8_sparse_attn_decode_interface
     );
 }

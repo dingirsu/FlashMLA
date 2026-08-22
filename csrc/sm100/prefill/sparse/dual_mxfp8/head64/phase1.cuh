@@ -116,14 +116,20 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     } else if (warp_idx == 3 && elect_one_sync()) {
         CUTE_UNROLL
         for (int i = 0; i < NUM_K_BUFS; ++i) {
-            smem.bar_KV_full[i].init(IS_PREFILL ? 1 : (128/32)*2+1);
+            // TMA completion contributes transaction bytes, while the MMA
+            // consumer supplies the single barrier arrival. The historical
+            // decode dequant path had extra explicit arrivals; direct E4M3
+            // gather does not.
+            smem.bar_KV_full[i].init(1);
             smem.bar_KV_empty[i].init(1);
 #if !DUAL_MXFP8_K_SCALE_CP_ASYNC
             smem.bar_K_scale_raw_full[i].init(4);
 #endif
-            // CTA0's barrier gathers completion reports from warp10/warp11 in
-            // both CTAs after the final K-scale source is visible.
-            smem.bar_K_scale_copy_ready[i].init(4);
+            // CTA0's MMA reads its local post-transpose source. Warp10 and
+            // warp11 in CTA0 publish the two completed copy streams; CTA1
+            // builds its own source for the cluster peer but does not need to
+            // increment CTA0's local barrier.
+            smem.bar_K_scale_copy_ready[i].init(2);
             // The MMA completion releases this stage's scale source and is
             // also consumed by the softmax workers as QK-ready.
             smem.bar_QK_done[i].init(1);
@@ -131,7 +137,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         CUTE_UNROLL
         for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
             smem.bar_valid_coord_scales_full[i].init(IS_PREFILL ? B_TOPK/8 : 32);
-            smem.bar_valid_coord_scales_empty[i].init(IS_PREFILL ? 128 : (128 + (cta_idx==1) + 2 + 128));
+            // Decode has four elected K-data producers per CTA (warps 4..7)
+            // and 128 softmax consumers. The old BF16/NoPE path had an
+            // additional 128-thread dequant stage and two raw-K producers;
+            // those arrivals no longer exist in the direct E4M3 path.
+            smem.bar_valid_coord_scales_empty[i].init(IS_PREFILL ? 128 : 128 + 4);
         }
         fence_barrier_init();
     }
@@ -139,12 +149,18 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     ku::barrier_cluster_arrive_relaxed();
     ku::barrier_cluster_wait_acquire();
 
+
     // w1/w2 each pack four UE8M0 values. One 32-bit TMEM store writes all
     // four scale-factor IDs. Four warps cover the four 32-DP subpartitions.
     if (warpgroup_idx == 0) {
-        const uint32_t packed_v_scales = __float_as_uint(
-            cta_idx == 0 ? params.w1 : params.w2
-        );
+        uint32_t packed_v_scales;
+        if constexpr (IS_DECODE) {
+            // Decode uses the same packed W arguments as prefill. Each CTA
+            // owns four consecutive UE8M0 groups.
+            packed_v_scales = __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
+        } else {
+            packed_v_scales = __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
+        }
         const uint32_t warp_dp_addr = tmem_cols::V_scale
             + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
         CUTE_UNROLL
@@ -402,16 +418,25 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
         bool final_outer_loop_phase = \
         run_outer_loop([&](const OuterloopArgs &args) {
-            if constexpr (!IS_DECODE) {
+            {
                 // Each lane loads Q heads r and r+32. The replicated 16B
                 // slots provide two packed words per head; arrange them in
                 // the eight consecutive Q-scale TMEM columns consumed by
-                // the QK MMA.
+                // the QK MMA. Decode adds the batch stride, while prefill
+                // has one batch and uses the sequence stride directly.
                 const int head_idx = lane_idx;
                 const int q_token_idx = 2 * args.s_q_idx + cta_idx;
                 const int q_load_token_idx = min(q_token_idx, params.s_q - 1);
+                const int q_batch_offset = [&]() {
+                    if constexpr (IS_DECODE) {
+                        return args.batch_idx * params.stride_q_b;
+                    } else {
+                        return 0;
+                    }
+                }();
                 const uint8_t* q_scale_base =
                     reinterpret_cast<const uint8_t*>(params.q)
+                    + q_batch_offset
                     + q_load_token_idx * params.stride_q_s_q
                     + D_Q;
                 uint4 packed_scale_lo, packed_scale_hi;
@@ -444,7 +469,14 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 ku::tcgen05_before_thread_sync();
                 NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
                 if (warp_idx == 0 && elect_one_sync()) {
-                    smem.bar_Q_scale_ready.arrive(uint32_t{0}, 1u);
+                    // The MMA consumer is elected in CTA0, but both CTAs
+                    // contribute their Q-scale TMEM fragment. Publish CTA1's
+                    // completion into CTA0's barrier explicitly.
+                    if (cta_idx == 0) {
+                        smem.bar_Q_scale_ready.arrive();
+                    } else {
+                        smem.bar_Q_scale_ready.arrive(uint32_t{0}, 1u);
+                    }
                 }
             }
 
@@ -618,7 +650,50 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             }
 
         } else {
-#if 0  // Decode-only legacy path; dual_mxfp8 currently instantiates prefill only.
+            // Decode K is already E4M3. Four elected lanes (one per warp in
+            // WG1) issue gather4 operations for their 16-token slice. K
+            // scales are copied separately by WG2 warp10/warp11 using
+            // cp.async.ca, so no raw scale/dequant buffer is needed here.
+            if (elect_one_sync()) {
+                const int producer_warp = warp_idx - 4;
+                run_outer_loop([&](const OuterloopArgs &args) {
+                    CUTE_NO_UNROLL
+                    for (int block_idx = args.start_block_idx;
+                         block_idx < args.end_block_idx; ++block_idx) {
+                        auto [k_buf_idx, k_bar_phase] = rs.get<NUM_K_BUFS>();
+                        auto [index_buf_idx, index_bar_phase] = rs.get<NUM_INDEX_BUFS>();
+                        smem.bar_valid_coord_scales_full[index_buf_idx].wait(index_bar_phase);
+                        smem.bar_KV_empty[k_buf_idx].wait(k_bar_phase ^ 1);
+
+                        const int row_begin = producer_warp * (B_TOPK / 4);
+                        CUTE_UNROLL
+                        for (int row = row_begin;
+                             row < row_begin + B_TOPK / 4; row += 4) {
+                            int4 coords = *reinterpret_cast<int4*>(
+                                smem.tma_coord[index_buf_idx] + row
+                            );
+                            CUTE_UNROLL
+                            for (int col = 0; col < (D_K / 128) / 2; ++col) {
+                                ku::tma_gather4_cta_group_2<true>(
+                                    block_idx >= args.num_orig_kv_blocks
+                                        ? &tma_params.tensor_map_extra_kv
+                                        : &tma_params.tensor_map_kv,
+                                    smem.bar_KV_full[k_buf_idx],
+                                    smem.K[k_buf_idx].data()
+                                        + row * 128
+                                        + col * 128 * B_TOPK,
+                                    col * 128 + cta_idx * (D_K / 2),
+                                    coords,
+                                    ku::create_simple_cache_policy<ku::CacheHint::EVICT_LAST>()
+                                );
+                            }
+                        }
+                        smem.bar_valid_coord_scales_empty[index_buf_idx].arrive();
+                        rs.update();
+                    }
+                });
+            }
+#if 0  // Retained only as historical BF16/NoPE decode code.
             // 8 threads per token
             struct IsCTA0 {};
             struct IsCTA1 {};
@@ -727,12 +802,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     auto [k_buf_idx, k_bar_phase] = rs.offset_by(rs_offset).get<NUM_K_BUFS>();
                     auto [_, bar_phase] = rs.offset_by(rs_offset).get<1>();
                     smem.bar_P_empty.wait(bar_phase^1);
-                    if constexpr (IS_PREFILL) {
-                        smem.bar_KV_full[k_buf_idx].arrive_and_expect_tx(B_TOPK*D_K*sizeof(fp8_e4m3));
-                    } else {
-                        // RoPE only
-                        smem.bar_KV_full[k_buf_idx].arrive_and_expect_tx(B_TOPK*D_ROPE*sizeof(bf16));
-                    }
+                    smem.bar_KV_full[k_buf_idx].arrive_and_expect_tx(
+                        B_TOPK * D_K * sizeof(fp8_e4m3)
+                    );
                     smem.bar_KV_full[k_buf_idx].wait(k_bar_phase);
                     ku::tcgen05_after_thread_sync();
 
@@ -831,11 +903,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             } else {
                 static_assert(B_TOPK == 64);
                 // Each thread is responsible for 2 tokens
-                static constexpr int tma_coords_step_per_token = 576/TMA_K_STRIDE_FOR_DECODING;
-                int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE_FOR_DECODING; // must < 2G since k_batch_stride < 1T and TMA_K_STRIDE_FOR_DECODING > 512
+                static constexpr int tma_coords_step_per_token = 1;
+                int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE_FOR_DECODING;
                 int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE_FOR_DECODING;
-                uint8_t* k_scales_ptr = (uint8_t*)params.kv + params.page_block_size*(D_NOPE+2*D_ROPE);
-                uint8_t* extra_k_scales_ptr = (uint8_t*)params.extra_kv + params.extra_page_block_size*(D_NOPE+2*D_ROPE);
 
                 run_outer_loop([&](const OuterloopArgs &args) {
                     int* indices = (int*)params.indices + params.stride_indices_b*args.batch_idx + params.stride_indices_s_q*args.s_q_idx;
@@ -847,9 +917,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         auto [index_buf_idx, index_bar_phase] = rs.get<NUM_INDEX_BUFS>();
                         static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
                         int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
-                        int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
-                        [[maybe_unused]] int cur_k_row_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_row : params.stride_kv_row;
-                        uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
                         int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
 
                         int abs_pos, my_indices[2];
@@ -863,7 +930,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         smem.bar_valid_coord_scales_empty[index_buf_idx].wait(index_bar_phase^1);
 
                         int tma_coords[2];
-                        fp8_e8m0 scales[2*(NUM_SCALES_EACH_TOKEN/2)];
                         char valid_mask = 0;
                         CUTE_UNROLL
                         for (int i = 0; i < 2; ++i) {
@@ -873,15 +939,10 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                             bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
                             valid_mask |= is_token_valid << i;
                             tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
-
-                            int64_t offset = block_idx*cur_k_block_stride + (idx_in_block*8 + (cta_idx == 1 ? 4 : 0)); // Each token has 7 scale factors with an extra 1B padding
-                            uint32_t scalesx4 = is_token_valid ? __ldg((uint32_t*)(cur_k_scales_ptr + offset)) : 0;
-                            *(uint32_t*)(scales+i*(NUM_SCALES_EACH_TOKEN/2)) = scalesx4;
                         }
                         valid_mask <<= lane_idx%4*2;
                         valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                         valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                        *(uint64_t*)(smem.scales[index_buf_idx] + lane_idx*2) = *(uint64_t*)scales;
                         *(int2*)(smem.tma_coord[index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                         if (lane_idx%4 == 0)
                             smem.is_k_valid[index_buf_idx][lane_idx/4] = valid_mask;
@@ -964,7 +1025,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
                         // The first copied byte is also the token multiplier
                         // applied to S before its E4M3 conversion.
-                        smem.v_token_scale[k_buf_idx][row] = dst_lo[0];
+                        smem.v_token_scale[k_buf_idx][row] =
+                            reinterpret_cast<const fp8_e8m0*>(dst_lo)[0];
                         fence_view_async_shared();
                         __syncwarp();
 #else
@@ -1040,7 +1102,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         __syncwarp();
 #endif
                         if (elect_one_sync()) {
-                            smem.bar_K_scale_copy_ready[k_buf_idx].arrive(uint32_t{0}, 1u);
+                            if (cta_idx == 0) {
+                                smem.bar_K_scale_copy_ready[k_buf_idx].arrive();
+                            }
                         }
                         scale_rs.update();
                     }
@@ -1056,7 +1120,74 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     }
                 });
             } else {
-#if 0  // Decode-only legacy path; dual_mxfp8 currently instantiates prefill only.
+                // Decode K scales use only the direct cp.async.ca path. The
+                // index producer has already materialized the flattened page
+                // coordinates; recover page/token offsets from those
+                // coordinates and write the final UTCCP source layout.
+                const int scale_warp = warp_idx - 10;
+                RingBufferState scale_rs;
+                run_outer_loop([&](const OuterloopArgs &args) {
+                    CUTE_NO_UNROLL
+                    for (int block_idx = args.start_block_idx;
+                         block_idx < args.end_block_idx; ++block_idx) {
+                        auto [k_buf_idx, k_bar_phase] = scale_rs.get<NUM_K_BUFS>();
+                        auto [index_buf_idx, index_bar_phase] = scale_rs.get<NUM_INDEX_BUFS>();
+                        smem.bar_valid_coord_scales_full[index_buf_idx].wait(index_bar_phase);
+                        smem.bar_QK_done[k_buf_idx].wait(k_bar_phase ^ 1);
+
+                        const int row = scale_warp * (B_TOPK / 2) + lane_idx;
+                        const int coord = smem.tma_coord[index_buf_idx][row];
+                        const bool token_valid =
+                            static_cast<uint8_t>(smem.is_k_valid[index_buf_idx][row / 8])
+                            & (uint8_t(1) << (row % 8));
+                        const bool is_extra = block_idx >= args.num_orig_kv_blocks;
+                        const int page_size = is_extra
+                            ? params.extra_page_block_size : params.page_block_size;
+                        const int64_t page_stride = is_extra
+                            ? params.stride_extra_kv_block : params.stride_kv_block;
+                        const int stride_units = int(page_stride / TMA_K_STRIDE_FOR_DECODING);
+                        const int safe_coord = token_valid ? coord : 0;
+                        const int page_idx = safe_coord / stride_units;
+                        const int token_idx = safe_coord - page_idx * stride_units;
+                        const uint8_t* scale_base = reinterpret_cast<const uint8_t*>(
+                            is_extra ? params.extra_kv : params.kv
+                        );
+                        const uint32_t* src = reinterpret_cast<const uint32_t*>(
+                            scale_base + int64_t(page_idx) * page_stride
+                                + int64_t(page_size) * D_K
+                                + int64_t(token_idx) * K_SCALE_SLOT_BYTES
+                        );
+
+                        const int token_lane = row % 32;
+                        const int token_half = row / 32;
+                        fp8_e8m0* dst_lo = smem.k_scale_mma[k_buf_idx].data()
+                            + token_lane * 16 + token_half * 4;
+                        fp8_e8m0* dst_hi = smem.k_scale_mma[k_buf_idx].data()
+                            + (32 + token_lane) * 16 + token_half * 4;
+                        uint32_t* dst_lo_words = reinterpret_cast<uint32_t*>(dst_lo);
+                        uint32_t* dst_hi_words = reinterpret_cast<uint32_t*>(dst_hi);
+                        using CpAsync4 = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint32_t>;
+                        CpAsync4::copy(src[0], dst_lo_words[0], token_valid);
+                        CpAsync4::copy(src[2], dst_lo_words[2], token_valid);
+                        CpAsync4::copy(src[1], dst_hi_words[0], token_valid);
+                        CpAsync4::copy(src[3], dst_hi_words[2], token_valid);
+                        cute::cp_async_fence();
+                        cute::cp_async_wait<0>();
+                        __syncwarp();
+
+                        smem.v_token_scale[k_buf_idx][row] =
+                            reinterpret_cast<const fp8_e8m0*>(dst_lo)[0];
+                        fence_view_async_shared();
+                        __syncwarp();
+                        if (elect_one_sync()) {
+                            if (cta_idx == 0) {
+                                smem.bar_K_scale_copy_ready[k_buf_idx].arrive();
+                            }
+                        }
+                        scale_rs.update();
+                    }
+                });
+#if 0  // Historical BF16/NoPE decode path.
                 // Raw KV NoPE Producer thread
                 run_outer_loop([&](const OuterloopArgs &args) {
                     CUTE_NO_UNROLL
@@ -1292,20 +1423,30 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.h_q == TOKEN_H_Q);
     KU_ASSERT(params.s_q > 0);
-    static_assert(IS_PREFILL, "dual_mxfp8/head64 currently implements the prefill path only");
     if constexpr (IS_PREFILL) {
         KU_ASSERT(params.s_q % 2 == 0);
     }
     KU_ASSERT(params.d_qk == D_QK);
 
     static_assert(D_Q == 512);
+    KU_ASSERT(params.stride_q_h_q == Q_BYTES_PER_HEAD,
+        "Q head stride must be 512 e4m3 bytes + an aligned 16-byte scale slot");
     if constexpr (IS_PREFILL) {
-        KU_ASSERT(params.stride_q_h_q == Q_BYTES_PER_HEAD,
-            "Q head stride must be 512 e4m3 bytes + an aligned 16-byte scale slot");
         KU_ASSERT(params.stride_kv_h_kv == KV_BYTES_PER_TOKEN,
             "KV token envelope must be 512 e4m3 bytes + a replicated 16-byte scale slot");
         KU_ASSERT(params.stride_kv_s_kv == params.h_kv * KV_BYTES_PER_TOKEN,
             "packed KV storage must be contiguous across logical token envelopes");
+        KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0);
+        KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0);
+    } else {
+        KU_ASSERT(params.stride_kv_row == KV_BYTES_PER_TOKEN,
+            "decode KV row stride must include the 16-byte replicated scale slot");
+        if (params.extra_topk > 0) {
+            KU_ASSERT(params.stride_extra_kv_row == KV_BYTES_PER_TOKEN,
+                "decode extra KV row stride must include the 16-byte replicated scale slot");
+            KU_ASSERT(params.stride_extra_kv_block % TMA_K_STRIDE_FOR_DECODING == 0,
+                "decode extra KV page stride must be a multiple of the 512B TMA stride");
+        }
         KU_ASSERT(reinterpret_cast<int64_t>(params.q) % 16 == 0);
         KU_ASSERT(reinterpret_cast<int64_t>(params.kv) % 16 == 0);
     }
@@ -1343,9 +1484,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
             KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
             KU_ASSERT(stride_kv_block % TMA_K_STRIDE_FOR_DECODING == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", stride_kv_block, TMA_K_STRIDE_FOR_DECODING);
             CUtensorMap tensor_map_kv = ku::make_tensor_map(
-                {D_NOPE + D_ROPE*2, (uint64_t)num_blocks * (stride_kv_block/TMA_K_STRIDE_FOR_DECODING)},
+                {D_K, (uint64_t)num_blocks * (stride_kv_block/TMA_K_STRIDE_FOR_DECODING)},
                 {TMA_K_STRIDE_FOR_DECODING},
-                {D_K/2, 1},
+                {128, 1},
                 k_ptr,
                 CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -1473,7 +1614,7 @@ template<FwdMode FWD_MODE, int D_QK>
 void run_dual_mxfp8_phase1_kernel(
         const std::conditional_t<
             is_decode_v<FWD_MODE>,
-            SparseAttnDecodeParams,
+    SparseAttnDualMxfp8DecodeParams,
             MxFp8SparseAttnFwdParams
         >& params) {
     using Kernel = KernelTemplate<FWD_MODE, D_QK>;

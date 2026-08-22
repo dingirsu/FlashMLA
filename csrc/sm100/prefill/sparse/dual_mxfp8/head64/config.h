@@ -14,6 +14,7 @@
 #define DUAL_MXFP8_K_SCALE_CP_ASYNC 0
 #endif
 
+
 namespace sm100::dual_mxfp8::head64 {
 
 using namespace cute;
@@ -25,7 +26,7 @@ static constexpr bool IS_DECODE = is_decode_v<FWD_MODE>;
 static constexpr bool IS_PREFILL = !IS_DECODE;
 using ArgT = std::conditional_t<
     IS_DECODE,
-    SparseAttnDecodeParams,
+    SparseAttnDualMxfp8DecodeParams,
     MxFp8SparseAttnFwdParams
 >;
 using fp8_e4m3 = cutlass::float_e4m3_t;
@@ -79,8 +80,6 @@ static constexpr int NUM_THREADS = 128*4;
 static constexpr int NUM_K_BUFS = IS_DECODE ? 3 : 4;
 static constexpr int NUM_INDEX_BUFS = IS_DECODE ? 4 : 4;
 
-static constexpr int D_NOPE = 448;
-static constexpr int D_ROPE = 64;
 static constexpr int TMA_K_STRIDE_FOR_DECODING = D_QK;
 static constexpr int NUM_SCALES_EACH_TOKEN = 8; // 7 scales + 1 padding
 static constexpr int MXFP8_SCALE_VEC_SIZE = 32;

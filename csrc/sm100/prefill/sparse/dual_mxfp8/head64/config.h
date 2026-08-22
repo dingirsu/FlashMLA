@@ -10,10 +10,6 @@
 #include "defines.h"
 #include "params.h"
 
-#ifndef DUAL_MXFP8_K_SCALE_CP_ASYNC
-#define DUAL_MXFP8_K_SCALE_CP_ASYNC 0
-#endif
-
 
 namespace sm100::dual_mxfp8::head64 {
 
@@ -129,22 +125,6 @@ struct SharedMemoryPlan {
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
-    // K scales are double-buffered with K data. The default path repacks TMA
-    // gather4 payloads; the optional cp.async path writes this final layout
-    // directly. Q scales go register -> TMEM and need no SMEM storage.
-#if !DUAL_MXFP8_K_SCALE_CP_ASYNC
-    // Raw gather4 payload: 16 gather rows x 4 complete 16B token slots. The
-    // 128B row stride keeps each gather destination aligned while leaving the
-    // remaining 64B in each row as padding.
-    CUTE_ALIGNAS(128) fp8_e8m0
-        k_scale_pair_raw[NUM_K_BUFS][B_TOPK / K_SCALE_GATHER_ROWS]
-            [K_SCALE_GATHER_SMEM_STRIDE];
-    CUTE_ALIGNAS(16) fp8_e8m0
-        k_scale_token[B_TOPK][K_SCALE_BYTES];
-#endif
-    // The first K scale of each selected token is also the token scale used
-    // to pre-scale S before its E4M3 conversion for the S@V MMA. Keep it
-    // double-buffered with K so a scale producer never aliases an S reader.
     CUTE_ALIGNAS(16) fp8_e8m0 v_token_scale[NUM_K_BUFS][B_TOPK];
     // Final 64-row x 16B post-transpose source consumed by 2x64 UTCCP.
     array_aligned<fp8_e8m0, B_TOPK * 16> k_scale_mma[NUM_K_BUFS];
@@ -153,6 +133,7 @@ struct SharedMemoryPlan {
 
     CUTE_ALIGNAS(16) char is_k_valid[NUM_INDEX_BUFS][B_TOPK/8];
     CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
+    CUTE_ALIGNAS(16) int64_t k_scale_offset[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) fp8_e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN/2];
     
     transac_bar_t bar_sQ_full;
@@ -160,9 +141,6 @@ struct SharedMemoryPlan {
     transac_bar_t bar_tQ_empty, bar_tQ_full;
     transac_bar_t bar_tOut_full, bar_tOut_empty;
     transac_bar_t bar_KV_full[NUM_K_BUFS], bar_KV_empty[NUM_K_BUFS];
-#if !DUAL_MXFP8_K_SCALE_CP_ASYNC
-    transac_bar_t bar_K_scale_raw_full[NUM_K_BUFS];
-#endif
     transac_bar_t bar_K_scale_copy_ready[NUM_K_BUFS];
     transac_bar_t bar_P_empty;
     transac_bar_t bar_QK_done[NUM_K_BUFS], bar_SV_done;

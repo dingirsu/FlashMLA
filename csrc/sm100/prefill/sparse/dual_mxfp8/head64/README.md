@@ -47,6 +47,21 @@ Q 的每个 head 是一个连续的 528B record：
 因此 Q tensor 的接口形状为 `[s_q, 64, 528]`，head stride 必须是
 528B，record 和 scale slot 必须至少 16B 对齐。
 
+Q scale 不经过 SMEM。warpgroup 0 的每个 warp 中，lane `r` 分别加载
+head `r` 和 `r+32` 的两个 16B slot，在寄存器中组成八个 TMEM word：
+
+```text
+[lo.s0..s3, hi.s0..s3, lo.s0..s3, hi.s0..s3,
+ lo.s4..s7, hi.s4..s7, lo.s4..s7, hi.s4..s7]
+```
+
+随后使用 `tcgen05.st.32x32b.x8` 直接写入 `Q_scale` 的八个 TMEM
+column。SFA 使用 4x1 DP replication；`tcgen05.st.32dp` 的目标
+subpartition 由发出指令的 warp 决定，因此 WG0 的四个 warp 分别写入
+自己的 32-DP subpartition。不能由一个 warp 仅修改地址中的 DP 位来代替
+四个 warp。producer 完成 store 后通过 TMEM fence 和
+`bar_Q_scale_ready` 通知 CTA0 的 MMA consumer。
+
 ## K 分组
 
 每个 K token 有 512 个元素。K 使用连续的 64-element groups：

@@ -130,10 +130,9 @@ struct SharedMemoryPlan {
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
-    // Q scales are loaded once per adjacent-token pair. K scales are
-    // double-buffered with K data. The default path repacks TMA gather4
-    // payloads; the optional cp.async path writes this final layout directly.
-    array_aligned<fp8_e8m0, 8192> q_scale_mma;
+    // K scales are double-buffered with K data. The default path repacks TMA
+    // gather4 payloads; the optional cp.async path writes this final layout
+    // directly. Q scales go register -> TMEM and need no SMEM storage.
 #if !DUAL_MXFP8_K_SCALE_CP_ASYNC
     // Raw gather4 payload: 16 gather rows x 4 complete 16B token slots. The
     // 128B row stride keeps each gather destination aligned while leaving the

@@ -21,26 +21,6 @@ using namespace cute;
 
 using FwdMode = SparseAttnFwdMode;
 
-template<class TiledMMA, class SmemScaleLayout>
-CUTE_DEVICE void copy_sfa_smem_to_tmem(
-        typename TiledMMA::ValTypeSFA* smem_ptr, uint32_t tmem_col) {
-    Tensor sScale = make_tensor(make_smem_ptr(smem_ptr), SmemScaleLayout{});
-    Tensor tScale = make_tensor<typename TiledMMA::FrgTypeSFA>(shape(SmemScaleLayout{}));
-    tScale.data().get() = tmem_col;
-
-    auto sScaleCompact = make_tensor(sScale.data(), filter_zeros(sScale.layout()));
-    auto tScaleCompact = make_tensor(tScale.data(), filter_zeros(tScale.layout()));
-    auto tiled_copy = make_utccp_copy(
-        SM100_UTCCP_4x32dp128bit_2cta{}, tScaleCompact
-    );
-    auto thr_copy = tiled_copy.get_slice(0);
-    auto src = get_utccp_smem_desc_tensor<SM100_UTCCP_4x32dp128bit_2cta>(
-        thr_copy.partition_S(sScaleCompact)
-    );
-    auto dst = thr_copy.partition_D(tScaleCompact);
-    cute::copy(tiled_copy, src, dst);
-}
-
 CUTE_DEVICE UMMA::SmemDescriptor make_utccp_scale_desc(void* smem_ptr) {
     // Same descriptor used by DeepGEMM for a post-transpose scale tile:
     // eight 16-byte atoms along MN, one atom along K.
@@ -53,23 +33,6 @@ CUTE_DEVICE UMMA::SmemDescriptor make_utccp_scale_desc(void* smem_ptr) {
     desc.stride_byte_offset_ = (8 * 16) >> 4;
     desc.leading_byte_offset_ = 0;
     return desc;
-}
-
-CUTE_DEVICE void copy_q_scale_smem_to_tmem(
-        void* smem_ptr, uint32_t tmem_col) {
-    UMMA::SmemDescriptor desc = make_utccp_scale_desc(nullptr);
-    CUTE_UNROLL
-    for (int sf_block = 0; sf_block < 2; ++sf_block) {
-        // Global -> SMEM already writes DeepGEMM's post-transpose physical
-        // order. Each K=128 scale tile is 128 uint32_t words (512 bytes).
-        void* block_ptr = reinterpret_cast<uint8_t*>(smem_ptr) + sf_block * 512;
-        desc.start_address_ = static_cast<uint16_t>(
-            cast_smem_ptr_to_uint(block_ptr) >> 4
-        );
-        SM100_UTCCP_4x32dp128bit_2cta::copy(
-            desc, tmem_col + sf_block * 4
-        );
-    }
 }
 
 CUTE_DEVICE void copy_k_scale_smem_to_tmem(
@@ -440,40 +403,45 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         bool final_outer_loop_phase = \
         run_outer_loop([&](const OuterloopArgs &args) {
             if constexpr (!IS_DECODE) {
-                // One WG0 thread loads one complete replicated 16B scale slot
-                // for each Q head. Keep the physical post-transpose SMEM
-                // layout expected by the existing Q-scale UTCCP path.
-                const int head_idx = idx_in_warpgroup;
-                if (head_idx < TOKEN_H_Q) {
-                    const int q_token_idx = 2 * args.s_q_idx + cta_idx;
-                    const int q_load_token_idx = min(q_token_idx, params.s_q - 1);
-                    const uint8_t* q_scale_base =
-                        reinterpret_cast<const uint8_t*>(params.q)
-                        + q_load_token_idx * params.stride_q_s_q
-                        + head_idx * params.stride_q_h_q
-                        + D_Q;
-                    uint4 packed_scale;
-                    KU_LDG_128(
-                        q_scale_base,
-                        &packed_scale,
-                        ".nc",
-                        "evict_first",
-                        "128B"
-                    );
-
-                    const int row_base =
-                        (head_idx % 32) * 16 + (head_idx / 32) * 4;
-                    fp8_e8m0* dst = smem.q_scale_mma.data() + row_base;
-                    *reinterpret_cast<uint32_t*>(dst + 0 * 512) = packed_scale.x;
-                    *reinterpret_cast<uint32_t*>(dst + 1 * 512) = packed_scale.y;
-                    *reinterpret_cast<uint32_t*>(dst + 2 * 512) = packed_scale.z;
-                    *reinterpret_cast<uint32_t*>(dst + 3 * 512) = packed_scale.w;
-                    *reinterpret_cast<uint32_t*>(dst + 0 * 512 + 8) = packed_scale.x;
-                    *reinterpret_cast<uint32_t*>(dst + 1 * 512 + 8) = packed_scale.y;
-                    *reinterpret_cast<uint32_t*>(dst + 2 * 512 + 8) = packed_scale.z;
-                    *reinterpret_cast<uint32_t*>(dst + 3 * 512 + 8) = packed_scale.w;
-                }
-                fence_view_async_shared();
+                // Each lane loads Q heads r and r+32. The replicated 16B
+                // slots provide two packed words per head; arrange them in
+                // the eight consecutive Q-scale TMEM columns consumed by
+                // the QK MMA.
+                const int head_idx = lane_idx;
+                const int q_token_idx = 2 * args.s_q_idx + cta_idx;
+                const int q_load_token_idx = min(q_token_idx, params.s_q - 1);
+                const uint8_t* q_scale_base =
+                    reinterpret_cast<const uint8_t*>(params.q)
+                    + q_load_token_idx * params.stride_q_s_q
+                    + D_Q;
+                uint4 packed_scale_lo, packed_scale_hi;
+                KU_LDG_128(
+                    q_scale_base + head_idx * params.stride_q_h_q,
+                    &packed_scale_lo,
+                    ".nc",
+                    "evict_first",
+                    "128B"
+                );
+                KU_LDG_128(
+                    q_scale_base + (head_idx + 32) * params.stride_q_h_q,
+                    &packed_scale_hi,
+                    ".nc",
+                    "evict_first",
+                    "128B"
+                );
+                uint32_t q_scale_words[8] = {
+                    packed_scale_lo.x, packed_scale_hi.x,
+                    packed_scale_lo.x, packed_scale_hi.x,
+                    packed_scale_lo.y, packed_scale_hi.y,
+                    packed_scale_lo.y, packed_scale_hi.y
+                };
+                ku::tmem_st_32dp32bNx<8>(
+                    tmem_cols::Q_scale
+                        + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value,
+                    q_scale_words
+                );
+                cutlass::arch::fence_view_async_tmem_store();
+                ku::tcgen05_before_thread_sync();
                 NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
                 if (warp_idx == 0 && elect_one_sync()) {
                     smem.bar_Q_scale_ready.arrive(uint32_t{0}, 1u);
@@ -752,10 +720,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 smem.bar_tQ_full.wait(args.outer_loop_phase);
                 ku::tcgen05_after_thread_sync();
                 smem.bar_Q_scale_ready.wait(args.outer_loop_phase);
-                copy_q_scale_smem_to_tmem(
-                    smem.q_scale_mma.data(), tmem_cols::Q_scale
-                );
-                ku::tcgen05_before_thread_sync();
+                ku::tcgen05_after_thread_sync();
 
                 // Issue P = Q K^T
                 auto issue_P = [&](int k, int rs_offset) {

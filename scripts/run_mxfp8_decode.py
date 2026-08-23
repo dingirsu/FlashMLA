@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import struct
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -7,11 +8,22 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXTENSION_PATH = Path(os.environ.get("MXFP8_EXTENSION_OUTPUT", ROOT / "build/mxfp8_test_ext.so"))
+EXTENSION_PATH = Path(os.environ.get(
+    "DUAL_MXFP8_EXTENSION_PATH", ROOT / "build/dual_mxfp8_test_ext.so"
+))
 
 
 def _load_extension():
-    spec = importlib.util.spec_from_file_location("mxfp8_test_ext", EXTENSION_PATH)
+    if not EXTENSION_PATH.exists():
+        # The in-tree extension contains the same pybind entry point. This
+        # fallback keeps the precision test usable after setup.py builds the
+        # main package without requiring a second test-only link step.
+        import sys
+        sys.path.insert(0, str(ROOT))
+        import flash_mla.cuda as module
+        return module
+    module_name = EXTENSION_PATH.name.split(".", 1)[0]
+    spec = importlib.util.spec_from_file_location(module_name, EXTENSION_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load MXFP8 test extension from {EXTENSION_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -25,7 +37,6 @@ ext = _load_extension()
 def mxfp8_sparse_decode(
     q: torch.Tensor,
     kv: torch.Tensor,
-    kv_scale_w: torch.Tensor,
     indices: torch.Tensor,
     topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
@@ -37,6 +48,8 @@ def mxfp8_sparse_decode(
     d_qk: int = 512,
     d_v: int = 512,
     sm_scale: Optional[float] = None,
+    w1: float = 0.0,
+    w2: float = 0.0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -45,10 +58,9 @@ def mxfp8_sparse_decode(
 ]:
     if sm_scale is None:
         sm_scale = d_qk**-0.5
-    return ext.mxfp8_sparse_decode_fwd(
+    return ext.dual_mxfp8_sparse_decode_fwd(
         q,
         kv,
-        kv_scale_w,
         indices,
         topk_length,
         attn_sink,
@@ -60,6 +72,8 @@ def mxfp8_sparse_decode(
         d_qk,
         d_v,
         sm_scale,
+        w1,
+        w2,
     )
 
 
@@ -70,8 +84,8 @@ def main() -> None:
     from mxfp8_test_utils import (
         assert_close,
         attention_reference,
-        pack_decode_kv_pages_rank1,
-        pack_q,
+        pack_dual_decode_kv_pages,
+        pack_dual_q64,
     )
 
     torch.manual_seed(20260717)
@@ -93,10 +107,11 @@ def main() -> None:
             if os.getenv("MXFP8_DECODE_W_ONE") == "1"
             else None
         )
-    packed_q, dequant_q = pack_q(q)
-    packed_kv, dequant_kv, kv_scale_w, _, _ = pack_decode_kv_pages_rank1(
-        kv, w_exponents=w_exponents
-    )
+    packed_q, dequant_q = pack_dual_q64(q)
+    packed_kv, dequant_kv, _, _ = pack_dual_decode_kv_pages(kv)
+    w_bits = [127, 128, 130, 127, 131, 129, 128, 130]
+    w1 = struct.unpack("<f", bytes(w_bits[:4]))[0]
+    w2 = struct.unpack("<f", bytes(w_bits[4:8]))[0]
     indices = (
         torch.randperm(s_kv, device="cuda")[:topk]
         .to(torch.int32)
@@ -107,12 +122,13 @@ def main() -> None:
     out, lse, _, _ = mxfp8_sparse_decode(
         packed_q,
         packed_kv,
-        kv_scale_w,
         indices,
         topk_length=topk_length,
         d_qk=d,
         d_v=d,
         sm_scale=d**-0.5,
+        w1=w1,
+        w2=w2,
     )
     torch.cuda.synchronize()
     ref_out, _, ref_lse = attention_reference(

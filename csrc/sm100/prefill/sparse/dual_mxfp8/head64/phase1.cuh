@@ -147,14 +147,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     // w1/w2 each pack four UE8M0 values. One 32-bit TMEM store writes all
     // four scale-factor IDs. Four warps cover the four 32-DP subpartitions.
     if (warpgroup_idx == 0) {
-        uint32_t packed_v_scales;
-        if constexpr (IS_DECODE) {
-            // Decode uses the same packed W arguments as prefill. Each CTA
-            // owns four consecutive UE8M0 groups.
-            packed_v_scales = __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
-        } else {
-            packed_v_scales = __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
-        }
+        const uint32_t packed_v_scales =
+            __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
         const uint32_t warp_dp_addr = tmem_cols::V_scale
             + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
         CUTE_UNROLL

@@ -1,4 +1,5 @@
 import math
+import struct
 from typing import Optional, Tuple
 
 import torch
@@ -10,6 +11,13 @@ Q_GROUP_SIZE = 32
 KV_GROUP_SIZE = 64
 Q_BYTES_PER_TOKEN = D_HEAD + D_HEAD // Q_GROUP_SIZE
 KV_BYTES_PER_TOKEN = D_HEAD + D_HEAD // KV_GROUP_SIZE
+
+
+def pack_e8m0x4_as_float(scales: torch.Tensor) -> float:
+    """Pack four UE8M0 bytes into the raw bits of one float argument."""
+    bits = scales.detach().to(device="cpu", dtype=torch.uint8).tolist()
+    assert len(bits) == 4
+    return struct.unpack("<f", bytes(bits))[0]
 
 
 def require_sm100_family() -> None:
@@ -132,7 +140,7 @@ def pack_prefill_kv_rank1(
 
     if w_exponents is None:
         w_exponents = torch.tensor(
-            [2, 1, 3, 0, 4, 2, 1, 3],
+            [0, 1, 3, 0, 4, 2, 1, 3],
             dtype=torch.int32,
             device=kv.device,
         )
@@ -202,7 +210,7 @@ def pack_decode_kv_pages_rank1(
 
     if w_exponents is None:
         w_exponents = torch.tensor(
-            [2, 1, 3, 0, 4, 2, 1, 3],
+            [0, 1, 3, 0, 4, 2, 1, 3],
             dtype=torch.int32,
             device=kv.device,
         )
@@ -245,6 +253,73 @@ def pack_decode_kv_pages_rank1(
         w_scale,
         u_scale,
         quantized.reshape_as(kv).float(),
+    )
+
+
+def pack_dual_decode_kv_pages_rank1(
+    kv: torch.Tensor,
+    w_exponents: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack head64 dual-MXFP8 pages with replicated 16B scale slots.
+
+    The physical page is laid out as one contiguous 512B E4M3 data plane
+    followed by one 16B ``[scale[0:8], scale[0:8]]`` slot per token.  The
+    tensor's last dimension is therefore a 528B storage envelope; it is not
+    an interleaved per-row representation of the page.
+    """
+    packed, dequantized, w_scale, u_scale, quantized = pack_decode_kv_pages_rank1(
+        kv, w_exponents=w_exponents
+    )
+    num_pages, page_size, h_kv, _ = kv.shape
+    num_tokens = page_size * h_kv
+    flat = packed.reshape(num_pages, -1)
+    data_bytes = num_tokens * D_HEAD
+    scale_bytes = num_tokens * (D_HEAD // KV_GROUP_SIZE)
+    scales = flat[:, data_bytes : data_bytes + scale_bytes].reshape(
+        num_pages, page_size, h_kv, D_HEAD // KV_GROUP_SIZE
+    )
+    dual_storage = torch.empty(
+        (num_pages, num_tokens * (D_HEAD + 16)),
+        dtype=torch.uint8,
+        device=kv.device,
+    )
+    dual_storage[:, :data_bytes] = flat[:, :data_bytes]
+    # The kernel addresses one 16B replicated slot per token from the page
+    # tail. Replicate within each token slot, then flatten the page.
+    scale_slots = torch.cat((scales, scales), dim=-1).reshape(num_pages, -1)
+    dual_storage[:, data_bytes:] = scale_slots
+    return (
+        dual_storage.view(num_pages, page_size, h_kv, D_HEAD + 16),
+        dequantized,
+        w_scale,
+        u_scale,
+        quantized,
+    )
+
+
+def pack_dual_decode_kv_pages(
+    kv: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack decode pages with the same independent group quantization as prefill."""
+    assert kv.ndim == 4 and kv.shape[2] == 1 and kv.shape[-1] == D_HEAD
+    data, scales, dequantized = _quantize_groups(kv, KV_GROUP_SIZE)
+    num_pages, page_size, h_kv, _ = kv.shape
+    num_tokens = page_size * h_kv
+    flat_data = data.reshape(num_pages, -1)
+    # Decode addresses one replicated 16B slot per token from the page tail.
+    # Keep the scale bytes adjacent to their token, unlike the legacy packed
+    # representation whose tail was two contiguous copies of the whole page.
+    scale_slots = torch.cat((scales, scales), dim=-1).reshape(num_pages, -1)
+    storage = torch.empty(
+        (num_pages, num_tokens * (D_HEAD + 16)), dtype=torch.uint8, device=kv.device
+    )
+    storage[:, : num_tokens * D_HEAD] = flat_data
+    storage[:, num_tokens * D_HEAD :] = scale_slots
+    return (
+        storage.view(num_pages, page_size, h_kv, D_HEAD + 16),
+        dequantized,
+        scales.view(num_pages, page_size, h_kv, D_HEAD // KV_GROUP_SIZE),
+        data.view(num_pages, page_size, h_kv, D_HEAD),
     )
 
 
@@ -312,6 +387,47 @@ def attention_reference(
         max_logits.reshape(*q_leading, h_q),
         returned_lse.reshape(*q_leading, h_q),
     )
+
+
+def attention_reference_dual_mxfp8(
+    q: torch.Tensor,
+    k_v: torch.Tensor,
+    v_e4m3: torch.Tensor,
+    token_u: torch.Tensor,
+    w_scale: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    sm_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference the dual-MXFP8 QK/SV path used by prefill and decode."""
+    q_leading = q.shape[:-2]
+    h_q = q.shape[-2]
+    topk = indices.shape[-1]
+    q_flat = q.float().reshape(-1, h_q, D_HEAD)
+    k_flat = k_v.float().reshape(-1, D_HEAD)
+    v_flat = v_e4m3.float().reshape(-1, D_HEAD)
+    u_flat = token_u.float().reshape(-1)
+    w_flat = w_scale.float().repeat_interleave(KV_GROUP_SIZE)
+    idx_flat = indices.reshape(-1, topk)
+    len_flat = topk_length.reshape(-1)
+    safe = idx_flat.clamp(0, k_flat.shape[0] - 1).long()
+    gathered_k = k_flat.index_select(0, safe.reshape(-1)).reshape(-1, topk, D_HEAD)
+    gathered_v = v_flat.index_select(0, safe.reshape(-1)).reshape(-1, topk, D_HEAD)
+    gathered_u = u_flat.index_select(0, safe.reshape(-1)).reshape(-1, topk)
+    pos = torch.arange(topk, device=q.device).view(1, topk)
+    valid = (idx_flat >= 0) & (idx_flat < k_flat.shape[0]) & (pos < len_flat[:, None])
+    scores = torch.matmul(q_flat, gathered_k.transpose(-1, -2)) * sm_scale
+    scores.masked_fill_(~valid[:, None, :], -math.inf)
+    lse = torch.logsumexp(scores, dim=-1)
+    weights = torch.softmax(scores, dim=-1)
+    weights = torch.where(torch.isfinite(lse)[..., None], weights, 0.0)
+    s_fp8 = (weights * gathered_u[:, None, :]).to(torch.float8_e4m3fn).float()
+    out = torch.matmul(s_fp8, gathered_v * w_flat)
+    if attn_sink is not None:
+        sink = attn_sink.float().view(1, h_q)
+        out *= torch.sigmoid(lse - sink)[..., None]
+    return out.reshape(*q_leading, h_q, D_HEAD), lse.reshape(*q_leading, h_q)
 
 
 def assert_close(

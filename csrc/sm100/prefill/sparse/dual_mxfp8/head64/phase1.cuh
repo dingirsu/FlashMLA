@@ -1128,7 +1128,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 }
 
                 // Rescale O
-                if (k > 0 && should_scale_o) {
+                if (k > args.start_block_idx && should_scale_o) {
                     ku::tcgen05_after_thread_sync();
                     rescale_O<D_V, 32, tmem_cols::O>(scale_for_old);
                     ku::tcgen05_before_thread_sync();

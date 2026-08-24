@@ -997,39 +997,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         scale_rs.update();
                     }
                 });
-#if 0  // Historical BF16/NoPE decode path.
-                // Raw KV NoPE Producer thread
-                run_outer_loop([&](const OuterloopArgs &args) {
-                    CUTE_NO_UNROLL
-                    for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
-                        auto [raw_k_buf_idx, raw_k_bar_phase] = rs.get<NUM_RAW_K_BUFS>();
-                        auto [index_buf_idx, index_bar_phase] = rs.get<NUM_INDEX_BUFS>();
-                        smem.bar_valid_coord_scales_full[index_buf_idx].wait(index_bar_phase);
-                        smem.bar_raw_KV_empty[raw_k_buf_idx].wait(raw_k_bar_phase^1);
-
-                        int4 nxt_indices = *(int4*)(smem.tma_coord[index_buf_idx] + (warp_idx == 10 ? 0 : 4));
-                        CUTE_UNROLL
-                        for (int row = (warp_idx == 10 ? 0 : 4); row < B_TOPK; row += 8) {
-                            int4 cur_indices = nxt_indices;
-                            if (row+8 < B_TOPK)
-                                nxt_indices = *(int4*)(smem.tma_coord[index_buf_idx] + row + 8);
-                            ku::tma_gather4(
-                                block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_nope : &tma_params.tensor_map_kv_nope,
-                                smem.bar_raw_KV_full[raw_k_buf_idx],
-                                smem.K_raw[raw_k_buf_idx].data() + row*(D_K/2),
-                                cta_idx*(D_K/2),
-                                cur_indices,
-                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                            );
-                        }
-                        if (warp_idx == 10) {
-                            smem.bar_raw_KV_full[raw_k_buf_idx].arrive_and_expect_tx(B_TOPK*(D_K/2)*sizeof(fp8_e4m3));
-                        }
-                        smem.bar_valid_coord_scales_empty[index_buf_idx].arrive();
-                        rs.update();
-                    }
-                });
-#endif
             }
         }
     } else {
@@ -1112,6 +1079,10 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 // Calculate S
                 fp8_e4m3 s[NUM_ELEMS_PER_THREAD];
                 float cur_sum = 0.0f;
+                // Each softmax thread owns one contiguous 32-token MMA-K
+                // group. Quantize that group independently; the resulting
+                // S scale is kept local until the TMEM path is wired up.
+                float s_abs_max = 0.0f;
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
                     float s_value = exp2f(fmaf(p[i], params.sm_scale_div_log2, -new_max));
@@ -1121,9 +1092,18 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     // TMEM scale remains one, so this multiplication carries
                     // the token scale into the S operand itself.
                     const int token = s_col_base + i;
-                    s[i] = fp8_e4m3(
-                        s_value * float(smem.v_token_scale[k_buf_idx][token])
-                    );
+                    float scaled_s = s_value * float(smem.v_token_scale[k_buf_idx][token]);
+                    s_abs_max = max(s_abs_max, scaled_s);
+                    p[i] = scaled_s;
+                }
+                // UE8M0 scales are powers of two. Round the scale upward so
+                // the normalized E4M3 values stay within the finite range.
+                float raw_s_scale = s_abs_max > 0.0f
+                    ? s_abs_max / 448.0f : 1.0f;
+                fp8_e8m0 s_scale_exp_e8m0 = fp8_e8m0(raw_s_scale);
+                float s_scale = float(s_scale_exp_e8m0);
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
+                    s[i] = fp8_e4m3(p[i] / s_scale);
                 }
                 li = fmaf(li, scale_for_old, cur_sum);
 

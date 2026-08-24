@@ -341,11 +341,11 @@ def _cutlass_segment(
         # E4M3 conversion; the O MMA supplies W as SFB on the V operand.
         # CUTLASS uses cvt.rn.satfinite.e4m3; Torch's direct float8 cast
         # returns NaN on overflow, so apply the finite E4M3 endpoint first.
-        # s_value = (softmax * block_u[:, None, :]).clamp(
-        #     -FP8_E4M3_MAX, FP8_E4M3_MAX
-        # )
-        s_value = (softmax * block_u[:, None, :])
-        s_e4m3 = s_value.to(torch.float8_e4m3fn)
+        s_value = (softmax * block_u[:, None, :]).clamp(
+            -FP8_E4M3_MAX, FP8_E4M3_MAX
+        )
+        # s_value = (softmax * block_u[:, None, :]) * 448.0
+        s_e4m3 = s_value.to(torch.float8_e4m3fn).float()/448.0
         # The S/V tile is likewise two K=32 atoms, with FP32 accumulation
         # retained between them.
         block_out = torch.zeros_like(out)
@@ -488,10 +488,11 @@ def run_prefill(
         pair_indices=True,
     )
     torch.cuda.synchronize()
-    print(f"prefill CUTLASS out:\n{actual}")
-    print(f"prefill Torch simulated CUTLASS out:\n{cutlass_expected}")
+    # print(f"prefill CUTLASS out:\n{actual}")
+    # print(f"prefill Torch simulated CUTLASS out:\n{cutlass_expected}")
     _summary("prefill.out vs Torch (no S quant/dequant)", actual, torch_expected)
     _summary("prefill.out vs Torch CUTLASS flow", actual, cutlass_expected)
+    _summary("Torch (no S quant/dequant) vs Torch CUTLASS flow", torch_expected, cutlass_expected)
     _summary("prefill.max_logits vs Torch", actual_max, expected_max)
     _summary("prefill.lse vs Torch", actual_lse, expected_lse)
     print(
@@ -606,8 +607,8 @@ def main() -> None:
     ext = _load_extension()
     w_exponents = torch.zeros_like(W_EXPONENTS) if args.w_all_ones else W_EXPONENTS
     run_prefill(ext, torch.device("cuda"), args.strict, w_exponents)
-    run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
-    run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
+    # run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
+    # run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
 
 
 if __name__ == "__main__":

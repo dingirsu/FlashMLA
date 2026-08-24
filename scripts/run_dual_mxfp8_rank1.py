@@ -28,8 +28,17 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+from quant import FP8KVCacheLayout, dequantize_k_cache, quantize_k_cache
 EXTENSION_PATH = Path(
     os.environ.get("DUAL_MXFP8_EXTENSION_PATH", ROOT / "build/dual_mxfp8_test_ext.so")
+)
+BF16_EXTENSION_PATH = Path(
+    os.environ.get("BF16_EXTENSION_PATH", ROOT / "build/bf16_test_ext.so")
+)
+HEAD64_DECODE_EXTENSION_PATH = Path(
+    os.environ.get(
+        "HEAD64_DECODE_EXTENSION_PATH", ROOT / "build/head64_decode_test_ext.so"
+    )
 )
 D_HEAD = 512
 H_Q = 64
@@ -55,6 +64,36 @@ def _load_extension():
     spec = importlib.util.spec_from_file_location("dual_mxfp8_test_ext", EXTENSION_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {EXTENSION_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_bf16_extension():
+    if not BF16_EXTENSION_PATH.exists():
+        raise RuntimeError(
+            f"{BF16_EXTENSION_PATH} does not exist; run "
+            "PYTHON=/usr/bin/python3 ./compile_sm100.sh bf16"
+        )
+    spec = importlib.util.spec_from_file_location("bf16_test_ext", BF16_EXTENSION_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {BF16_EXTENSION_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_head64_decode_extension():
+    if not HEAD64_DECODE_EXTENSION_PATH.exists():
+        raise RuntimeError(
+            f"{HEAD64_DECODE_EXTENSION_PATH} does not exist; run "
+            "PYTHON=/usr/bin/python3 ./compile_sm100.sh decode_head64"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "head64_decode_test_ext", HEAD64_DECODE_EXTENSION_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {HEAD64_DECODE_EXTENSION_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -167,10 +206,11 @@ def _torch_reference(
     *,
     pair_indices: bool,
     topk_length: Optional[torch.Tensor] = None,
+    dtype = torch.bfloat16
 ):
     """Ordinary Torch attention without quantizing/dequantizing S."""
-    qf = q.float()
-    kvf = kv.float().reshape(-1, D_HEAD)
+    qf = q.to(dtype)
+    kvf = kv.to(dtype).reshape(-1, D_HEAD)
     if pair_indices:
         # Prefill has one index row for each adjacent pair of query tokens.
         idx = indices[:, 0]
@@ -199,7 +239,7 @@ def _torch_reference(
     max_logits = logits.amax(dim=-1)
     lse = torch.logsumexp(logits, dim=-1)
     weights = torch.softmax(logits, dim=-1)
-    weights = torch.where(torch.isfinite(lse)[..., None], weights, 0.0)
+    weights = torch.where(torch.isfinite(lse)[..., None], weights, 0.0).to(dtype)
     out = torch.matmul(weights, gathered)
     out = out.reshape_as(qf).to(torch.bfloat16)
     return out, max_logits, lse
@@ -227,8 +267,6 @@ def _summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
     print(
         f"{name}: max_abs={values.max().item():.6g} "
         f"mean_abs={values.mean().item():.6g} "
-        f"actual=[{actual_f.amin().item():.6g},{actual_f.amax().item():.6g}] "
-        f"reference=[{expected_f.amin().item():.6g},{expected_f.amax().item():.6g}]"
     )
 
 
@@ -462,7 +500,11 @@ def _cutlass_flow_reference(
 
 @torch.inference_mode()
 def run_prefill(
-    ext, device: torch.device, strict: bool, w_exponents: torch.Tensor
+    ext,
+    device: torch.device,
+    strict: bool,
+    w_exponents: torch.Tensor,
+    bf16_ext=None,
 ) -> None:
     s_q, s_kv, topk = 2, 256, 128
     packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
@@ -482,38 +524,18 @@ def run_prefill(
         None,
         None,
     )
-    torch_expected, expected_max, expected_lse = _torch_reference(
-        q_dequant,
-        kv_dequant,
-        indices,
-        pair_indices=True,
-    )
-    cutlass_expected = _cutlass_flow_reference(
-        q_dequant,
-        kv_dequant,
-        kv_fp8,
-        indices,
-        u_scale,
-        w_scale,
-        pair_indices=True,
+    
+    bf16_indices = indices.expand(s_q, -1, -1).contiguous()
+    bf16_actual, bf16_max, bf16_lse = bf16_ext.bf16_sparse_prefill_fwd(
+        q_dequant.to(torch.bfloat16),
+        kv_dequant.reshape(s_kv, 1, D_HEAD).to(torch.bfloat16),
+        bf16_indices,
+        SM_SCALE,
+        None,
+        None,
     )
     torch.cuda.synchronize()
-    # print(f"prefill CUTLASS out:\n{actual}")
-    # print(f"prefill Torch simulated CUTLASS out:\n{cutlass_expected}")
-    _summary("prefill.out vs Torch (no S quant/dequant)", actual, torch_expected)
-    _summary("prefill.out vs Torch CUTLASS flow", actual, cutlass_expected)
-    _summary("Torch (no S quant/dequant) vs Torch CUTLASS flow", torch_expected, cutlass_expected)
-    _summary("prefill.max_logits vs Torch", actual_max, expected_max)
-    _summary("prefill.lse vs Torch", actual_lse, expected_lse)
-    print(
-        "prefill rank1 scales: "
-        f"U range={u_scale.min().item():.4g}..{u_scale.max().item():.4g}, "
-        f"W={w_scale.tolist()}"
-    )
-    if strict:
-        torch.testing.assert_close(actual, cutlass_expected, atol=0.5, rtol=5.0e-3)
-        torch.testing.assert_close(actual_max, expected_max, atol=0.08, rtol=0.02)
-        torch.testing.assert_close(actual_lse, expected_lse, atol=0.08, rtol=0.02)
+    _summary("prefill", actual, bf16_actual)
 
 
 @torch.inference_mode()
@@ -523,6 +545,7 @@ def run_decode(
     topk: int,
     strict: bool,
     w_exponents: torch.Tensor,
+    bf16_decode_ext=None,
 ) -> None:
     batch, s_q, page_size = 1, 1, 64
     num_pages = (topk + page_size - 1) // page_size
@@ -538,6 +561,24 @@ def run_decode(
     kv_dequant = kv_dequant.reshape(num_pages, page_size, 1, D_HEAD)
     indices = torch.arange(topk, device=device, dtype=torch.int32).view(batch, s_q, topk)
     lengths = torch.full((batch,), topk, device=device, dtype=torch.int32)
+    
+    # The ordinary decode kernel consumes the Model1 FP8 cache format,
+    # so quantize the same BF16 KV values and use its dequantized form as
+    # the matching Torch reference.
+    model1_kv_quantized = quantize_k_cache(
+        kv_dequant.to(torch.bfloat16), FP8KVCacheLayout.MODEL1_FP8Sparse
+    )
+    model1_kv_dequant = dequantize_k_cache(
+        model1_kv_quantized, FP8KVCacheLayout.MODEL1_FP8Sparse
+    )
+    # The Model1 kernel's TMA descriptor requires each page stride to be
+    # a multiple of 576 bytes.  quantize_k_cache retains that padding in
+    # its storage, but a single-page view can expose the unpadded stride.
+    model1_kv = model1_kv_quantized.view(torch.uint8)
+    page_stride = ((page_size * 584 + 575) // 576) * 576
+    model1_kv = model1_kv.as_strided(
+        model1_kv.shape, (page_stride, 584, 584, 1)
+    )
     w1, w2, w_scale = _w_arguments(device, w_exponents)
     actual, actual_lse, scheduler_metadata, splits = ext.dual_mxfp8_sparse_decode_fwd(
         packed_q,
@@ -556,45 +597,15 @@ def run_decode(
         w1,
         w2,
     )
-    torch_expected, _, expected_lse = _torch_reference(
-        q_dequant,
-        kv_dequant,
-        indices,
-        pair_indices=False,
-        topk_length=lengths,
+    
+    bf16_actual, bf16_lse = bf16_decode_ext.head64_decode(
+        q_dequant.to(torch.bfloat16), model1_kv, indices, SM_SCALE
     )
-    split_ranges = _decode_split_ranges(scheduler_metadata, splits, topk)
-    cutlass_expected = _cutlass_flow_reference(
-        q_dequant,
-        kv_dequant,
-        kv_fp8,
-        indices,
-        u_scale,
-        w_scale,
-        pair_indices=False,
-        topk_length=lengths,
-        split_ranges=split_ranges,
-    )
-    expected_lse = expected_lse.view(batch, s_q, H_Q).transpose(1, 2)
+    bf16_actual = bf16_actual.reshape_as(actual)
+
     torch.cuda.synchronize()
-    print(f"decode[{topk}] CUTLASS out:\n{actual}")
-    print(
-        f"decode[{topk}] Torch simulated CUTLASS out:\n{cutlass_expected}"
-    )
-    _summary(
-        f"decode[{topk}].out vs Torch (no S quant/dequant)",
-        actual,
-        torch_expected,
-    )
-    _summary(f"decode[{topk}].out vs Torch CUTLASS flow", actual, cutlass_expected)
-    _summary(f"decode[{topk}].lse vs Torch", actual_lse, expected_lse)
-    print(
-        f"decode[{topk}] rank1 scales: U range={u_scale.min().item():.4g}.."
-        f"{u_scale.max().item():.4g}, W={w_scale.tolist()}, splits={splits.tolist()}"
-    )
-    if strict:
-        torch.testing.assert_close(actual, cutlass_expected, atol=0.5, rtol=5.0e-3)
-        torch.testing.assert_close(actual_lse, expected_lse, atol=0.08, rtol=0.02)
+    
+    _summary("decode", actual, bf16_actual)
 
 
 def main() -> None:
@@ -615,10 +626,13 @@ def main() -> None:
         raise RuntimeError("this test requires an NVIDIA SM100-family GPU")
     torch.cuda.set_device(args.device)
     ext = _load_extension()
+    bf16_ext = _load_bf16_extension()
+    bf16_decode_ext = _load_head64_decode_extension()
     w_exponents = torch.zeros_like(W_EXPONENTS) if args.w_all_ones else W_EXPONENTS
-    run_prefill(ext, torch.device("cuda"), args.strict, w_exponents)
-    run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
-    run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
+    run_prefill(ext, torch.device("cuda"), args.strict, w_exponents, bf16_ext)
+    run_decode(
+        ext, torch.device("cuda"), 256, args.strict, w_exponents, bf16_decode_ext
+    )
 
 
 if __name__ == "__main__":

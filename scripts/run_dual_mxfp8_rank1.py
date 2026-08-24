@@ -66,18 +66,21 @@ def _pack_scale_bytes(bits: torch.Tensor) -> int:
     return int.from_bytes(bytes(values), byteorder="little", signed=False)
 
 
-def _w_arguments(device: torch.device) -> Tuple[int, int, torch.Tensor]:
-    assert int(W_EXPONENTS[0]) == 0, "rank-1 W[0] must be the fixed unit anchor"
-    bits = (W_EXPONENTS + 127).to(device=device, dtype=torch.uint8)
+def _w_arguments(
+    device: torch.device, w_exponents: torch.Tensor
+) -> Tuple[int, int, torch.Tensor]:
+    assert int(w_exponents[0]) == 0, "rank-1 W[0] must be the fixed unit anchor"
+    bits = (w_exponents + 127).to(device=device, dtype=torch.uint8)
     w1 = _pack_scale_bytes(bits[:4])
     w2 = _pack_scale_bytes(bits[4:])
-    return w1, w2, torch.exp2(W_EXPONENTS.to(device=device, dtype=torch.float32))
+    return w1, w2, torch.exp2(w_exponents.to(device=device, dtype=torch.float32))
 
 
 def _make_rank1_storage(
     num_tokens: int,
     device: torch.device,
     seed: int,
+    w_exponents: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return raw data bytes, replicated scale slots, dequantized KV, U, FP8."""
     generator = torch.Generator(device=device)
@@ -92,7 +95,7 @@ def _make_rank1_storage(
     u_exp = torch.randint(
         -3, 4, (num_tokens,), device=device, dtype=torch.int32, generator=generator
     )
-    product_exp = u_exp[:, None] + W_EXPONENTS.to(device=device)[None, :]
+    product_exp = u_exp[:, None] + w_exponents.to(device=device)[None, :]
     if int(product_exp.amin()) < -126 or int(product_exp.amax()) > 127:
         raise AssertionError("rank-1 product scale is outside UE8M0 range")
 
@@ -106,7 +109,7 @@ def _make_rank1_storage(
     # The 528-byte interface envelope represents a page's average stride.  The
     # physical allocation is [all data rows][all 16-byte scale slots].
     expected_product = u_scale[:, None] * torch.exp2(
-        W_EXPONENTS.to(device=device, dtype=torch.float32)
+        w_exponents.to(device=device, dtype=torch.float32)
     )[None, :]
     torch.testing.assert_close(product_scale.float(), expected_product, atol=0, rtol=0)
     return data_bytes, scale_slots, dequant, u_scale, fp8.float()
@@ -338,9 +341,10 @@ def _cutlass_segment(
         # E4M3 conversion; the O MMA supplies W as SFB on the V operand.
         # CUTLASS uses cvt.rn.satfinite.e4m3; Torch's direct float8 cast
         # returns NaN on overflow, so apply the finite E4M3 endpoint first.
-        s_value = (softmax * block_u[:, None, :]).clamp(
-            -FP8_E4M3_MAX, FP8_E4M3_MAX
-        )
+        # s_value = (softmax * block_u[:, None, :]).clamp(
+        #     -FP8_E4M3_MAX, FP8_E4M3_MAX
+        # )
+        s_value = (softmax * block_u[:, None, :])
         s_e4m3 = s_value.to(torch.float8_e4m3fn)
         # The S/V tile is likewise two K=32 atoms, with FP32 accumulation
         # retained between them.
@@ -447,15 +451,17 @@ def _cutlass_flow_reference(
 
 
 @torch.inference_mode()
-def run_prefill(ext, device: torch.device, strict: bool) -> None:
+def run_prefill(
+    ext, device: torch.device, strict: bool, w_exponents: torch.Tensor
+) -> None:
     s_q, s_kv, topk = 2, 256, 128
     packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        s_kv, device, 1002
+        s_kv, device, 1002, w_exponents
     )
     packed_kv = _pack_prefill_storage(data_bytes, scale_slots)
     indices = _make_indices(s_q // 2, topk, s_kv, device, 1003).unsqueeze(1)
-    w1, w2, w_scale = _w_arguments(device)
+    w1, w2, w_scale = _w_arguments(device, w_exponents)
     actual, actual_max, actual_lse = ext.dual_mxfp8_head64_sparse_prefill_fwd(
         packed_q,
         packed_kv,
@@ -482,6 +488,8 @@ def run_prefill(ext, device: torch.device, strict: bool) -> None:
         pair_indices=True,
     )
     torch.cuda.synchronize()
+    print(f"prefill CUTLASS out:\n{actual}")
+    print(f"prefill Torch simulated CUTLASS out:\n{cutlass_expected}")
     _summary("prefill.out vs Torch (no S quant/dequant)", actual, torch_expected)
     _summary("prefill.out vs Torch CUTLASS flow", actual, cutlass_expected)
     _summary("prefill.max_logits vs Torch", actual_max, expected_max)
@@ -498,14 +506,20 @@ def run_prefill(ext, device: torch.device, strict: bool) -> None:
 
 
 @torch.inference_mode()
-def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
+def run_decode(
+    ext,
+    device: torch.device,
+    topk: int,
+    strict: bool,
+    w_exponents: torch.Tensor,
+) -> None:
     batch, s_q, page_size = 1, 1, 64
     num_pages = (topk + page_size - 1) // page_size
     packed_q, q_dequant = _make_prefill_q(batch * s_q, device, 2001)
     packed_q = packed_q.reshape(batch, s_q, H_Q, D_HEAD + 16)
     q_dequant = q_dequant.reshape(batch, s_q, H_Q, D_HEAD)
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        num_pages * page_size, device, 2002
+        num_pages * page_size, device, 2002, w_exponents
     )
     packed_kv = _pack_page_storage(
         data_bytes, scale_slots, num_pages=num_pages, page_size=page_size
@@ -513,7 +527,7 @@ def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
     kv_dequant = kv_dequant.reshape(num_pages, page_size, 1, D_HEAD)
     indices = torch.arange(topk, device=device, dtype=torch.int32).view(batch, s_q, topk)
     lengths = torch.full((batch,), topk, device=device, dtype=torch.int32)
-    w1, w2, w_scale = _w_arguments(device)
+    w1, w2, w_scale = _w_arguments(device, w_exponents)
     actual, actual_lse, scheduler_metadata, splits = ext.dual_mxfp8_sparse_decode_fwd(
         packed_q,
         packed_kv,
@@ -552,6 +566,10 @@ def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
     )
     expected_lse = expected_lse.view(batch, s_q, H_Q).transpose(1, 2)
     torch.cuda.synchronize()
+    print(f"decode[{topk}] CUTLASS out:\n{actual}")
+    print(
+        f"decode[{topk}] Torch simulated CUTLASS out:\n{cutlass_expected}"
+    )
     _summary(
         f"decode[{topk}].out vs Torch (no S quant/dequant)",
         actual,
@@ -576,15 +594,20 @@ def main() -> None:
         action="store_true",
         help="fail when the kernel disagrees with the Torch CUTLASS-flow reference",
     )
+    parser.add_argument(
+        "--w-all-ones",
+        action="store_true",
+        help="use W=1 for KV generation, kernel arguments, and both Torch references",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("this test requires an NVIDIA SM100-family GPU")
     torch.cuda.set_device(args.device)
-    torch.set_float32_matmul_precision("highest")
     ext = _load_extension()
-    run_prefill(ext, torch.device("cuda"), args.strict)
-    run_decode(ext, torch.device("cuda"), 64, args.strict)
-    run_decode(ext, torch.device("cuda"), 256, args.strict)
+    w_exponents = torch.zeros_like(W_EXPONENTS) if args.w_all_ones else W_EXPONENTS
+    run_prefill(ext, torch.device("cuda"), args.strict, w_exponents)
+    run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
+    run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
 
 
 if __name__ == "__main__":

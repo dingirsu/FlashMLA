@@ -502,9 +502,8 @@ def _cutlass_flow_reference(
 def run_prefill(
     ext,
     device: torch.device,
-    strict: bool,
     w_exponents: torch.Tensor,
-    bf16_ext=None,
+    bf16_ext,
 ) -> None:
     s_q, s_kv, topk = 2, 256, 128
     packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
@@ -543,9 +542,8 @@ def run_decode(
     ext,
     device: torch.device,
     topk: int,
-    strict: bool,
     w_exponents: torch.Tensor,
-    bf16_decode_ext=None,
+    bf16_decode_ext,
 ) -> None:
     batch, s_q, page_size = 1, 1, 64
     num_pages = (topk + page_size - 1) // page_size
@@ -612,12 +610,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="fail when the kernel disagrees with the Torch CUTLASS-flow reference",
-    )
-    parser.add_argument(
-        "--w-all-ones",
+        "--one", "-o",
         action="store_true",
         help="use W=1 for KV generation, kernel arguments, and both Torch references",
     )
@@ -628,10 +621,10 @@ def main() -> None:
     ext = _load_extension()
     bf16_ext = _load_bf16_extension()
     bf16_decode_ext = _load_head64_decode_extension()
-    w_exponents = torch.zeros_like(W_EXPONENTS) if args.w_all_ones else W_EXPONENTS
-    run_prefill(ext, torch.device("cuda"), args.strict, w_exponents, bf16_ext)
+    w_exponents = torch.zeros_like(W_EXPONENTS) if args.one else W_EXPONENTS
+    run_prefill(ext, torch.device("cuda"), w_exponents, bf16_ext)
     run_decode(
-        ext, torch.device("cuda"), 256, args.strict, w_exponents, bf16_decode_ext
+        ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext
     )
 
 

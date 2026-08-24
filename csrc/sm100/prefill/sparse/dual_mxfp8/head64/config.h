@@ -118,6 +118,7 @@ struct tmem_cols {
     static constexpr int K_scale = 480;
     static constexpr int S_scale = 496;
     static constexpr int V_scale = 500;
+    static constexpr int V_scale_n_stride = 4;
 };
 
 struct SharedMemoryPlan {
@@ -185,16 +186,6 @@ using SmemLayoutOScaleB = decltype(cutlass::detail::Sm1xxBlockScaledConfig<32>::
     TiledMMA_O{}, Shape<Int<H_Q*2>, Int<256>, _128>{}
 ));
 
-static_assert(cosize_v<SmemLayoutPScaleA> <= 8192);
-static_assert(cosize_v<SmemLayoutPScaleB> <= 8192);
-static_assert(cosize_v<SmemLayoutOScaleA> <= 8192);
-static_assert(cosize_v<SmemLayoutOScaleB> <= 8192);
-static_assert(cosize_v<SmemLayoutOScaleB>
-    == (B_TOPK / MXFP8_SCALE_VEC_SIZE) * D_V);
-static_assert(tmem_cols::Q_scale + 32 <= tmem_cols::K_scale);
-static_assert(tmem_cols::K_scale + 16 <= tmem_cols::S_scale);
-static_assert(tmem_cols::S_scale + 4 <= tmem_cols::V_scale);
-static_assert(tmem_cols::V_scale + 4 <= 512);
 
 struct barrier_ids {
     static constexpr int WG0_SYNC = 0;

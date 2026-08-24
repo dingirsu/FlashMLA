@@ -203,7 +203,7 @@ struct SparseAttnDualMxfp8DecodeParams {
 
     void* __restrict__ q;
     void* __restrict__ kv;
-    float w1, w2;
+    uint32_t w1, w2;
     int* __restrict__ indices;
     int* __restrict__ topk_length;
     float* __restrict__ attn_sink;
@@ -366,9 +366,9 @@ struct MxFp8SparseAttnFwdParams {
     int num_sm;
     cudaStream_t stream;
 
-    // Dual-MXFP8 V dimension scales. Each float carries four packed UE8M0
-    // bytes in its raw 32-bit representation: w1=[g0..g3], w2=[g4..g7].
-    float w1, w2;
+    // Dual-MXFP8 V dimension scales. Each uint32 carries four packed UE8M0
+    // bytes in little-endian order: w1=[g0..g3], w2=[g4..g7].
+    uint32_t w1, w2;
 };
 
 struct Head64Fp8SparseAttnFwdParams {

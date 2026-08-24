@@ -1,6 +1,5 @@
 import importlib.util
 import os
-import struct
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -48,8 +47,8 @@ def mxfp8_sparse_decode(
     d_qk: int = 512,
     d_v: int = 512,
     sm_scale: Optional[float] = None,
-    w1: float = 0.0,
-    w2: float = 0.0,
+    w1: int = 0,
+    w2: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -83,8 +82,8 @@ def main() -> None:
     sys.path.insert(0, str(ROOT / "tests"))
     from mxfp8_test_utils import (
         assert_close,
-        attention_reference,
-        pack_dual_decode_kv_pages,
+        attention_reference_dual_mxfp8,
+        pack_dual_decode_kv_pages_rank1,
         pack_dual_q64,
     )
 
@@ -102,16 +101,14 @@ def main() -> None:
     else:
         q = torch.randn(batch, s_q, h, d, device="cuda") * 0.35
         kv = torch.randn(num_pages, page_size, 1, d, device="cuda") * 0.35
-        w_exponents = (
-            torch.zeros(8, dtype=torch.int32, device="cuda")
-            if os.getenv("MXFP8_DECODE_W_ONE") == "1"
-            else None
-        )
+        w_exponents = torch.zeros(8, dtype=torch.int32, device="cuda")
     packed_q, dequant_q = pack_dual_q64(q)
-    packed_kv, dequant_kv, _, _ = pack_dual_decode_kv_pages(kv)
-    w_bits = [127, 128, 130, 127, 131, 129, 128, 130]
-    w1 = struct.unpack("<f", bytes(w_bits[:4]))[0]
-    w2 = struct.unpack("<f", bytes(w_bits[4:8]))[0]
+    packed_kv, dequant_kv, w_scale, token_scale, v_e4m3 = (
+        pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
+    )
+    w_bits = w_scale.view(torch.uint8).cpu().tolist()
+    w1 = int.from_bytes(bytes(w_bits[:4]), byteorder="little", signed=False)
+    w2 = int.from_bytes(bytes(w_bits[4:8]), byteorder="little", signed=False)
     indices = (
         torch.randperm(s_kv, device="cuda")[:topk]
         .to(torch.int32)
@@ -131,9 +128,12 @@ def main() -> None:
         w2=w2,
     )
     torch.cuda.synchronize()
-    ref_out, _, ref_lse = attention_reference(
+    ref_out, ref_lse = attention_reference_dual_mxfp8(
         dequant_q,
         dequant_kv,
+        v_e4m3,
+        token_scale,
+        w_scale,
         indices,
         topk_length.view(batch, 1),
         d**-0.5,

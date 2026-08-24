@@ -85,6 +85,58 @@ void utcmma_blockscaled_ss(
     }
 }
 
+// Perform a 2x2-datapath SS UTCMMA with an explicitly padded SFB allocation.
+// Each N=128 atom gets its own four-column-aligned scale tile; consecutive
+// K=32 atoms select successive bytes in the same TMEM words.
+template<
+    typename TiledMMA,
+    typename TensorA,
+    typename TensorB,
+    typename TensorFragC
+>
+CUTE_DEVICE
+void utcmma_blockscaled_ss_explicit_sfb(
+    TiledMMA &tiled_mma,
+    TensorA sA,
+    TensorB sB,
+    uint32_t tmem_sfa_addr,
+    uint32_t tmem_sfb_addr,
+    uint32_t tmem_sfb_n_stride,
+    TensorFragC tC_frag,
+    bool clear_accum
+) {
+    using namespace cute;
+    ThrMMA thr_mma = tiled_mma.get_slice(_0{});
+    auto sA_frag = thr_mma.partition_fragment_A(sA);
+    auto sB_frag = thr_mma.partition_fragment_B(sB);
+    static_assert(size<2>(sA_frag) == size<2>(sB_frag));
+    static_assert(size<1>(sA_frag) == size<1>(tC_frag));
+    static_assert(size<1>(sB_frag) == size<2>(tC_frag));
+    static_assert(size<2>(sA_frag) == Int<2>{});
+    static_assert(size<1>(sB_frag) == Int<2>{});
+
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(sA_frag); ++k) {
+        CUTE_UNROLL
+        for (int n = 0; n < size<1>(sB_frag); ++n) {
+            UMMA::ScaleOut accumulate =
+                (clear_accum && k == 0) ? UMMA::ScaleOut::Zero
+                                         : UMMA::ScaleOut::One;
+            auto mma = tiled_mma.with(
+                accumulate,
+                tmem_sfa_addr,
+                tmem_sfb_addr + uint32_t(n) * tmem_sfb_n_stride,
+                uint32_t(k),
+                uint32_t(k)
+            );
+            auto tC_atom = tC_frag(_, 0, n);
+            auto sA_atom = sA_frag(_, 0, k);
+            auto sB_atom = sB_frag(_, n, k);
+            mma.call(tC_atom, sA_atom, sB_atom, tC_atom);
+        }
+    }
+}
+
 // Perform TS UTCMMA
 // sB should be shared memory tensors (i.e. make_tensor(make_shared_ptr(XXX), XXX)) while tA_frag and tC_frag should be tmem fragment
 template<

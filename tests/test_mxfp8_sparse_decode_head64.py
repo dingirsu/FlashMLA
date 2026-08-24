@@ -4,17 +4,16 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 from run_mxfp8_decode import mxfp8_sparse_decode
 from mxfp8_test_utils import (
     D_HEAD,
     assert_close,
-    attention_reference,
     attention_reference_dual_mxfp8,
-    pack_dual_decode_kv_pages,
+    pack_dual_decode_kv_pages_rank1,
     make_indices,
     pack_dual_q64,
-    pack_e8m0x4_as_float,
+    pack_e8m0x4_as_uint32,
     require_sm100_family,
 )
 
@@ -34,10 +33,13 @@ def test_mxfp8_sparse_decode_head64_precision() -> None:
         (num_pages, page_size, 1, D_HEAD), device=device, dtype=torch.float32
     ) * 0.35
     packed_q, dequant_q = pack_dual_q64(q)
-    packed_kv, dequant_kv, kv_scales, kv_fp8 = pack_dual_decode_kv_pages(kv)
-    w_bits = torch.tensor([127, 128, 130, 127, 131, 129, 128, 130], dtype=torch.uint8)
-    w1 = pack_e8m0x4_as_float(w_bits[:4])
-    w2 = pack_e8m0x4_as_float(w_bits[4:])
+    w_exponents = torch.zeros(8, dtype=torch.int32, device=device)
+    packed_kv, dequant_kv, w_scale, token_scale, v_e4m3 = (
+        pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
+    )
+    w_bits = w_scale.view(torch.uint8).cpu()
+    w1 = pack_e8m0x4_as_uint32(w_bits[:4])
+    w2 = pack_e8m0x4_as_uint32(w_bits[4:])
     indices, topk_length = make_indices(b, topk, s_kv, device)
     indices = indices.unsqueeze(1)
     attn_sink = torch.linspace(-1.0, 1.0, h_q, device=device, dtype=torch.float32)
@@ -54,9 +56,6 @@ def test_mxfp8_sparse_decode_head64_precision() -> None:
         w1=w1,
         w2=w2,
     )
-    v_e4m3 = packed_kv[..., :D_HEAD].contiguous().view(torch.float8_e4m3fn).float()
-    token_scale = kv_scales[..., 0].contiguous().view(torch.float8_e8m0fnu)
-    w_scale = torch.tensor([2.0 ** (int(x) - 127) for x in w_bits.tolist()], device=device)
     ref_out, ref_lse = attention_reference_dual_mxfp8(
         dequant_q, dequant_kv, v_e4m3, token_scale, w_scale,
         indices,
@@ -66,7 +65,9 @@ def test_mxfp8_sparse_decode_head64_precision() -> None:
     )
 
     assert_close("decode.out", out, ref_out, atol=3.0e-2, rtol=1.2e-1)
-    assert_close("decode.lse", lse, ref_lse, atol=2.0e-2, rtol=5.0e-3)
+    assert_close(
+        "decode.lse", lse, ref_lse.transpose(1, 2), atol=2.0e-2, rtol=5.0e-3
+    )
     assert torch.count_nonzero(out[2]) == 0
 
 
@@ -83,10 +84,13 @@ def test_mxfp8_sparse_decode_head64_multitile_precision() -> None:
     q = torch.randn((b, s_q, h_q, D_HEAD), device=device) * 0.35
     kv = torch.randn((num_pages, page_size, 1, D_HEAD), device=device) * 0.35
     packed_q, dequant_q = pack_dual_q64(q)
-    packed_kv, dequant_kv, kv_scales, kv_fp8 = pack_dual_decode_kv_pages(kv)
-    w_bits = torch.tensor([127, 128, 130, 127, 131, 129, 128, 130], dtype=torch.uint8)
-    w1 = pack_e8m0x4_as_float(w_bits[:4])
-    w2 = pack_e8m0x4_as_float(w_bits[4:])
+    w_exponents = torch.zeros(8, dtype=torch.int32, device=device)
+    packed_kv, dequant_kv, w_scale, token_scale, v_e4m3 = (
+        pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
+    )
+    w_bits = w_scale.view(torch.uint8).cpu()
+    w1 = pack_e8m0x4_as_uint32(w_bits[:4])
+    w2 = pack_e8m0x4_as_uint32(w_bits[4:])
     indices = torch.stack(
         [torch.randperm(s_kv, device=device)[:topk] for _ in range(b)]
     ).to(torch.int32).unsqueeze(1)
@@ -105,9 +109,6 @@ def test_mxfp8_sparse_decode_head64_multitile_precision() -> None:
         w1=w1,
         w2=w2,
     )
-    v_e4m3 = packed_kv[..., :D_HEAD].contiguous().view(torch.float8_e4m3fn).float()
-    token_scale = kv_scales[..., 0].contiguous().view(torch.float8_e8m0fnu)
-    w_scale = torch.tensor([2.0 ** (int(x) - 127) for x in w_bits.tolist()], device=device)
     ref_out, ref_lse = attention_reference_dual_mxfp8(
         dequant_q, dequant_kv, v_e4m3, token_scale, w_scale,
         indices,
@@ -120,7 +121,7 @@ def test_mxfp8_sparse_decode_head64_multitile_precision() -> None:
     assert_close(
         "decode.multitile.lse",
         lse,
-        ref_lse,
+        ref_lse.transpose(1, 2),
         atol=2.0e-2,
         rtol=5.0e-3,
     )

@@ -144,17 +144,23 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     ku::barrier_cluster_wait_acquire();
 
 
-    // w1/w2 each pack four UE8M0 values. One 32-bit TMEM store writes all
-    // four scale-factor IDs. Four warps cover the four 32-DP subpartitions.
+    // Store the complete V dimension-scale vector in each CTA's local TMEM.
+    // A 2x2 datapath selects DP0/1 for N[0,256) and DP2/3 for N[256,512).
     if (warpgroup_idx == 0) {
-        const uint32_t packed_v_scales =
-            __float_as_uint(cta_idx == 0 ? params.w1 : params.w2);
+        const uint32_t packed_w_lo = params.w1;
+        const uint32_t packed_w_hi = params.w2;
         const uint32_t warp_dp_addr = tmem_cols::V_scale
             + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
         CUTE_UNROLL
-        for (int col = 0; col < 4; ++col) {
+        for (int col = 0; col < 8; ++col) {
+            // Within each half, one 64-D scale covers two adjacent 32-N
+            // columns and is repeated across the K/SF bytes.
+            const uint32_t packed_w = warp_idx < 2 ? packed_w_lo : packed_w_hi;
+            const int w_idx = col >> 1;
+            const uint32_t w = (packed_w >> (w_idx * 8)) & 0xffu;
+            const uint32_t scale_word = w * 0x01010101u;
             SM100_TMEM_STORE_32dp32b1x::copy(
-                packed_v_scales, warp_dp_addr + col
+                scale_word, warp_dp_addr + col
             );
         }
         cutlass::arch::fence_view_async_tmem_store();
@@ -725,7 +731,12 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutOScaleB{}));
                     tS_scale.data().get() = tmem_cols::S_scale;
                     tV_scale.data().get() = tmem_cols::V_scale;
-                    ku::utcmma_blockscaled_ss(tiled_mma_O, sS, sV, tS_scale, tV_scale, tO, k == args.start_block_idx);
+                    ku::utcmma_blockscaled_ss_explicit_sfb(
+                        tiled_mma_O, sS, sV,
+                        tmem_cols::S_scale, tmem_cols::V_scale,
+                        tmem_cols::V_scale_n_stride,
+                        tO, k == args.start_block_idx
+                    );
                     ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_SV_done, 1|2);
                     ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_KV_empty[k_buf_idx], 1|2);
                 };

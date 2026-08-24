@@ -15,8 +15,8 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
-    float w1,
-    float w2,
+    uint32_t w1,
+    uint32_t w2,
     const std::optional<at::Tensor>& attn_sink,
     const std::optional<at::Tensor>& topk_length
 ) {

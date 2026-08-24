@@ -610,8 +610,8 @@ def flash_mla_dual_mxfp8_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    w1: float = 0.0,
-    w2: float = 0.0,
+    w1: int = 0,
+    w2: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dual-MXFP8 sparse decode for the head64 kernel."""
     sched_meta = tile_scheduler_metadata

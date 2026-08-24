@@ -169,15 +169,15 @@ S_e4m3[h, t]   = E4M3(s_for_sv[h, t])
 
 ## V 的 Dimension Scale
 
-接口新增两个 float 参数 `w1` 和 `w2`。它们不是数值意义上的 FP32
-scale，而是分别用原始 32-bit float bit pattern 打包四个 UE8M0 byte：
+接口新增两个 uint32 参数 `w1` 和 `w2`，分别按 little-endian 顺序打包
+四个 UE8M0 byte：
 
 ```text
 w1 bits = [v_sf0, v_sf1, v_sf2, v_sf3]
 w2 bits = [v_sf4, v_sf5, v_sf6, v_sf7]
 ```
 
-列表顺序是从 float raw bits 的最低 byte 到最高 byte。
+列表顺序是从 uint32 的最低 byte 到最高 byte。
 
 第 `i` 个 scale 作用于 V 的维度 `[64*i, 64*i+63]`。逻辑 V scale
 矩阵形状是 `[TOPK/32, D] = [2, 512]`，两个 TOPK/32 行使用相同的
@@ -187,9 +187,38 @@ dimension scale：
 V_scale[:, 64*i : 64*(i+1)] = v_sfi
 ```
 
-CTA0 使用 `w1`，CTA1 使用 `w2`。每个 float 的 raw bits 已经是四个
-UE8M0 组成的 32-bit word；四个 warp 分别覆盖四个 32-DP subpartition，
-用 `tcgen05.st` 将 packed word 直接写入 V-scale 的四个 TMEM column。
+两个 CTA 分别拥有 `O` 的不同 M 行（相邻两个 query token），而不是
+各自拥有一半 N。因此两个 CTA 的本地 TMEM 都必须保存完整的八个 V
+dimension scale。每个 64-D scale 覆盖两个连续的 32-N scale group，
+所以相邻两列写相同的 scale；同一个 UE8M0 byte 还要复制到 word 的四个
+K/SF byte。
+
+在现有 `M=128, N=256` 2-SM、2x2-datapath atom 中，用 `S=V=SFA=1`、
+仅给 SFB 编码不同的 2 的幂实测得到：每条 atom 从 `tsfb` 起连续读取
+四列；DP0/DP1 服务前 256 个 N，DP2/DP3 服务后 256 个 N。完整映射为：
+
+```text
+output N          TMEM DP  atom tsfb  physical column  logical V scale
+[  0, 32)            0       +0          +0               v_sf0
+[ 32, 64)            0       +0          +1               v_sf0
+[ 64, 96)            0       +0          +2               v_sf1
+[ 96,128)            0       +0          +3               v_sf1
+[128,160)            0       +4          +4               v_sf2
+[160,192)            0       +4          +5               v_sf2
+[192,224)            0       +4          +6               v_sf3
+[224,256)            0       +4          +7               v_sf3
+[256,288)            2       +0          +0               v_sf4
+[288,320)            2       +0          +1               v_sf4
+[320,352)            2       +0          +2               v_sf5
+[352,384)            2       +0          +3               v_sf5
+[384,416)            2       +4          +4               v_sf6
+[416,448)            2       +4          +5               v_sf6
+[448,480)            2       +4          +6               v_sf7
+[480,512)            2       +4          +7               v_sf7
+```
+
+DP1 和 DP3 分别为另一组 32 个 M 行提供同样的 N 映射。因此 production
+写入时 DP0/DP1 使用 `w1`，DP2/DP3 使用 `w2`，两个 CTA 都执行相同写入。
 这条路径不使用 SMEM，也不经过 UTCCP。
 
 ## 为什么 direct gather4 到最终 SMEM 布局不成立

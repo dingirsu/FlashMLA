@@ -24,8 +24,8 @@ dual_mxfp8_sparse_attn_decode_interface(
     int d_qk,
     int d_v,
     float sm_scale,
-    float w1,
-    float w2
+    uint32_t w1,
+    uint32_t w2
 ) {
     using bf16 = cutlass::bfloat16_t;
     constexpr int d = 512;

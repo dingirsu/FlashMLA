@@ -1,5 +1,4 @@
 import math
-import struct
 from typing import Optional, Tuple
 
 import torch
@@ -13,11 +12,11 @@ Q_BYTES_PER_TOKEN = D_HEAD + D_HEAD // Q_GROUP_SIZE
 KV_BYTES_PER_TOKEN = D_HEAD + D_HEAD // KV_GROUP_SIZE
 
 
-def pack_e8m0x4_as_float(scales: torch.Tensor) -> float:
-    """Pack four UE8M0 bytes into the raw bits of one float argument."""
+def pack_e8m0x4_as_uint32(scales: torch.Tensor) -> int:
+    """Pack four UE8M0 bytes into one little-endian uint32 argument."""
     bits = scales.detach().to(device="cpu", dtype=torch.uint8).tolist()
     assert len(bits) == 4
-    return struct.unpack("<f", bytes(bits))[0]
+    return int.from_bytes(bytes(bits), byteorder="little", signed=False)
 
 
 def require_sm100_family() -> None:
@@ -400,7 +399,7 @@ def attention_reference_dual_mxfp8(
     sm_scale: float,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reference the dual-MXFP8 QK/SV path used by prefill and decode."""
+    """Reference dual-MXFP8, including its 64-token online-softmax tiles."""
     q_leading = q.shape[:-2]
     h_q = q.shape[-2]
     topk = indices.shape[-1]
@@ -417,17 +416,59 @@ def attention_reference_dual_mxfp8(
     gathered_u = u_flat.index_select(0, safe.reshape(-1)).reshape(-1, topk)
     pos = torch.arange(topk, device=q.device).view(1, topk)
     valid = (idx_flat >= 0) & (idx_flat < k_flat.shape[0]) & (pos < len_flat[:, None])
-    scores = torch.matmul(q_flat, gathered_k.transpose(-1, -2)) * sm_scale
-    scores.masked_fill_(~valid[:, None, :], -math.inf)
-    lse = torch.logsumexp(scores, dim=-1)
-    weights = torch.softmax(scores, dim=-1)
-    weights = torch.where(torch.isfinite(lse)[..., None], weights, 0.0)
-    s_fp8 = (weights * gathered_u[:, None, :]).to(torch.float8_e4m3fn).float()
-    out = torch.matmul(s_fp8, gathered_v * w_flat)
+    scores_log2 = (
+        torch.matmul(q_flat, gathered_k.transpose(-1, -2))
+        * (sm_scale * math.log2(math.e))
+    )
+    scores_log2.masked_fill_(~valid[:, None, :], -math.inf)
+
+    local_out = []
+    local_lse = []
+    for tile_begin in range(0, topk, 64):
+        tile_end = tile_begin + 64
+        tile_scores = scores_log2[..., tile_begin:tile_end]
+        tile_valid = valid[:, tile_begin:tile_end]
+        tile_max = tile_scores.amax(dim=-1)
+        softmax = torch.exp2(tile_scores - tile_max[..., None])
+        softmax = torch.where(tile_valid[:, None, :], softmax, 0.0)
+        li = softmax.sum(dim=-1)
+        s_fp8 = (
+            softmax * gathered_u[:, None, tile_begin:tile_end]
+        ).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
+        numerator = torch.matmul(
+            s_fp8,
+            gathered_v[:, tile_begin:tile_end] * w_flat,
+        )
+        local_out.append(
+            torch.where(li[..., None] != 0, numerator / li[..., None], 0.0)
+        )
+        local_lse.append(
+            torch.where(li != 0, torch.log2(li) + tile_max, -math.inf)
+        )
+
+    stacked_out = torch.stack(local_out)
+    stacked_lse = torch.stack(local_lse)
+    max_lse = stacked_lse.amax(dim=0)
+    safe_max = torch.where(torch.isneginf(max_lse), 0.0, max_lse)
+    sum_lse = torch.exp2(stacked_lse - safe_max).sum(dim=0)
+    global_lse = torch.where(
+        sum_lse != 0, torch.log2(sum_lse) + safe_max, math.inf
+    )
+    output_lse = global_lse
     if attn_sink is not None:
-        sink = attn_sink.float().view(1, h_q)
-        out *= torch.sigmoid(lse - sink)[..., None]
-    return out.reshape(*q_leading, h_q, D_HEAD), lse.reshape(*q_leading, h_q)
+        sink_log2 = attn_sink.float().view(1, h_q) * math.log2(math.e)
+        output_lse = torch.where(
+            torch.isfinite(global_lse),
+            torch.log2(torch.exp2(global_lse) + torch.exp2(sink_log2)),
+            sink_log2,
+        )
+    combine_weights = torch.exp2(stacked_lse - output_lse)
+    out = (stacked_out * combine_weights[..., None]).sum(dim=0)
+    returned_lse = global_lse / math.log2(math.e)
+    return (
+        out.reshape(*q_leading, h_q, D_HEAD),
+        returned_lse.reshape(*q_leading, h_q),
+    )
 
 
 def assert_close(

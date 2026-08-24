@@ -7,9 +7,10 @@ form the stored UE8M0 scale:
 
     scale[t, g] = U[t] * W[g]
 
-The BF16 reference is built by dequantizing that exact E4M3 data and scale,
-then running ordinary attention.  This keeps the test independent of the
-kernel's input quantizer and makes the rank-1 construction explicit.
+Each output is compared with both ordinary Torch attention (without an extra
+S quantize/dequantize) and a Torch simulation of the CUTLASS kernel flow.
+This keeps the test independent of the input quantizer while exposing the
+error introduced by the kernel's E4M3 S operand.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import argparse
 import importlib.util
 import math
 import os
-import struct
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -35,6 +35,8 @@ D_HEAD = 512
 H_Q = 64
 KV_GROUP_SIZE = 64
 KV_GROUPS = D_HEAD // KV_GROUP_SIZE
+MMA_K = 32
+FP8_E4M3_MAX = 448.0
 KV_SCALE_SLOT_BYTES = 16
 KV_RECORD_BYTES = D_HEAD + KV_SCALE_SLOT_BYTES
 SM_SCALE = D_HEAD ** -0.5
@@ -58,17 +60,17 @@ def _load_extension():
     return module
 
 
-def _pack_float_bytes(bits: torch.Tensor) -> float:
+def _pack_scale_bytes(bits: torch.Tensor) -> int:
     values = bits.to(device="cpu", dtype=torch.uint8).tolist()
     assert len(values) == 4
-    return struct.unpack("<f", bytes(values))[0]
+    return int.from_bytes(bytes(values), byteorder="little", signed=False)
 
 
-def _w_arguments(device: torch.device) -> Tuple[float, float, torch.Tensor]:
+def _w_arguments(device: torch.device) -> Tuple[int, int, torch.Tensor]:
     assert int(W_EXPONENTS[0]) == 0, "rank-1 W[0] must be the fixed unit anchor"
     bits = (W_EXPONENTS + 127).to(device=device, dtype=torch.uint8)
-    w1 = _pack_float_bytes(bits[:4])
-    w2 = _pack_float_bytes(bits[4:])
+    w1 = _pack_scale_bytes(bits[:4])
+    w2 = _pack_scale_bytes(bits[4:])
     return w1, w2, torch.exp2(W_EXPONENTS.to(device=device, dtype=torch.float32))
 
 
@@ -80,11 +82,11 @@ def _make_rank1_storage(
     """Return raw data bytes, replicated scale slots, dequantized KV, U, FP8."""
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
-    # Directly generate finite E4M3 values.  Casting a normal distribution
-    # avoids the two E4M3 NaN bit patterns while retaining realistic values.
-    fp8 = torch.randn((num_tokens, D_HEAD), device=device, generator=generator).to(
-        torch.float8_e4m3fn
-    )
+    # Match CUTLASS's cvt.rn.satfinite conversion explicitly. Random normal
+    # data is already well inside the endpoint; the clamp documents the rule.
+    fp8 = torch.randn(
+        (num_tokens, D_HEAD), device=device, generator=generator
+    ).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     if not torch.isfinite(fp8.float()).all():
         raise AssertionError("random E4M3 generation produced a non-finite value")
     u_exp = torch.randint(
@@ -155,7 +157,7 @@ def _make_indices(rows: int, topk: int, s_kv: int, device: torch.device, seed: i
     return indices
 
 
-def _bf16_reference(
+def _torch_reference(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -163,11 +165,9 @@ def _bf16_reference(
     pair_indices: bool,
     topk_length: Optional[torch.Tensor] = None,
 ):
-    """Reference attention from dequantized values, with BF16 output."""
-    # Materialize the reference operands as BF16 after exact FP8*scale
-    # dequantization; use FP32 accumulation for a stable baseline.
-    qf = q.to(torch.bfloat16).float()
-    kvf = kv.to(torch.bfloat16).float().reshape(-1, D_HEAD)
+    """Ordinary Torch attention without quantizing/dequantizing S."""
+    qf = q.float()
+    kvf = kv.float().reshape(-1, D_HEAD)
     if pair_indices:
         # Prefill has one index row for each adjacent pair of query tokens.
         idx = indices[:, 0]
@@ -203,25 +203,254 @@ def _bf16_reference(
 
 
 def _summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
-    diff = (actual.float() - expected.float()).abs()
-    finite = torch.isfinite(diff)
-    if not finite.any():
-        print(f"{name}: no finite values (actual or expected contains only NaN/Inf)")
+    actual_f = actual.float()
+    expected_f = expected.float()
+    both_finite = torch.isfinite(actual_f) & torch.isfinite(expected_f)
+    same_nan = torch.isnan(actual_f) & torch.isnan(expected_f)
+    same_inf = (
+        torch.isinf(actual_f)
+        & torch.isinf(expected_f)
+        & (torch.signbit(actual_f) == torch.signbit(expected_f))
+    )
+    nonfinite_mismatch = ~(both_finite | same_nan | same_inf)
+    if nonfinite_mismatch.any():
+        raise AssertionError(
+            f"{name}: {int(nonfinite_mismatch.sum().item())} mismatched NaN/Inf values"
+        )
+    if not both_finite.any():
+        print(f"{name}: all values are matching NaN/Inf")
         return
-    values = diff[finite]
+    values = (actual_f[both_finite] - expected_f[both_finite]).abs()
     print(
         f"{name}: max_abs={values.max().item():.6g} "
         f"mean_abs={values.mean().item():.6g} "
-        f"actual=[{actual.float().amin().item():.6g},{actual.float().amax().item():.6g}] "
-        f"reference=[{expected.float().amin().item():.6g},{expected.float().amax().item():.6g}]"
+        f"actual=[{actual_f.amin().item():.6g},{actual_f.amax().item():.6g}] "
+        f"reference=[{expected_f.amin().item():.6g},{expected_f.amax().item():.6g}]"
     )
+
+
+def _gather_reference_inputs(
+    q_dequant: torch.Tensor,
+    kv_dequant: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    indices: torch.Tensor,
+    u_scale: torch.Tensor,
+    *,
+    pair_indices: bool,
+    topk_length: Optional[torch.Tensor],
+):
+    qf = q_dequant.float().reshape(-1, H_Q, D_HEAD)
+    kf = kv_dequant.reshape(-1, D_HEAD).float()
+    vf = kv_fp8.reshape(-1, D_HEAD).float()
+    uf = u_scale.reshape(-1).float()
+
+    if pair_indices:
+        idx = indices[:, 0]
+        row_for_q = torch.arange(qf.shape[0], device=qf.device) // 2
+        idx = idx.index_select(0, row_for_q)
+        lengths = (
+            torch.full(
+                (idx.shape[0],), idx.shape[1], device=qf.device, dtype=torch.int32
+            )
+            if topk_length is None
+            else topk_length.index_select(0, row_for_q)
+        )
+    else:
+        idx = indices.reshape(-1, indices.shape[-1])
+        lengths = (
+            torch.full(
+                (idx.shape[0],), idx.shape[1], device=qf.device, dtype=torch.int32
+            )
+            if topk_length is None
+            else topk_length.reshape(-1)
+        )
+
+    safe = idx.clamp(0, kf.shape[0] - 1).long()
+    gathered_k = kf.index_select(0, safe.reshape(-1)).reshape(
+        idx.shape[0], idx.shape[1], D_HEAD
+    )
+    gathered_v = vf.index_select(0, safe.reshape(-1)).reshape_as(gathered_k)
+    gathered_u = uf.index_select(0, safe.reshape(-1)).reshape(idx.shape)
+    positions = torch.arange(idx.shape[1], device=qf.device)[None, :]
+    valid = (idx >= 0) & (idx < kf.shape[0]) & (positions < lengths[:, None])
+    return qf, gathered_k, gathered_v, gathered_u, valid
+
+
+def _cutlass_segment(
+    qf: torch.Tensor,
+    gathered_k: torch.Tensor,
+    gathered_v: torch.Tensor,
+    gathered_u: torch.Tensor,
+    valid: torch.Tensor,
+    w_scale: torch.Tensor,
+    begin_block: int,
+    end_block: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Simulate one kernel segment, including its online mi/li state."""
+    rows = qf.shape[0]
+    mi = torch.full((rows, H_Q), -1.0e30, device=qf.device, dtype=torch.float32)
+    li = torch.zeros_like(mi)
+    out = torch.zeros((rows, H_Q, D_HEAD), device=qf.device, dtype=torch.float32)
+    v_scale = w_scale.float().repeat_interleave(KV_GROUP_SIZE)
+    sm_scale_log2 = SM_SCALE * math.log2(math.e)
+
+    for block_idx in range(begin_block, end_block):
+        begin = block_idx * 64
+        end = begin + 64
+        block_k = gathered_k[:, begin:end]
+        block_v = gathered_v[:, begin:end] * v_scale[None, None, :]
+        block_u = gathered_u[:, begin:end]
+        block_valid = valid[:, begin:end]
+
+        # tcgen05 accumulates QK as sixteen K=32 atoms.  Preserve that
+        # accumulation order instead of replacing it with one K=512 GEMM.
+        p = torch.zeros(
+            (rows, H_Q, block_k.shape[1]), device=qf.device, dtype=torch.float32
+        )
+        for k_begin in range(0, D_HEAD, MMA_K):
+            k_end = k_begin + MMA_K
+            p.add_(
+                torch.matmul(
+                    qf[..., k_begin:k_end],
+                    block_k[..., k_begin:k_end].transpose(-1, -2),
+                )
+            )
+        p.masked_fill_(~block_valid[:, None, :], -math.inf)
+        p_log2 = p * sm_scale_log2
+        cur_max = p_log2.amax(dim=-1)
+
+        # __any_sync makes the rescale decision jointly for heads 0..31 and
+        # 32..63. Once selected, each head still updates to its own maximum.
+        should_scale = torch.empty_like(cur_max, dtype=torch.bool)
+        for head_begin in (0, 32):
+            head_end = head_begin + 32
+            trigger = (
+                cur_max[:, head_begin:head_end] - mi[:, head_begin:head_end] > 6.0
+            ).any(dim=-1, keepdim=True)
+            should_scale[:, head_begin:head_end] = trigger
+
+        new_max = torch.where(should_scale, torch.maximum(cur_max, mi), mi)
+        scale_old = torch.where(should_scale, torch.exp2(mi - new_max), 1.0)
+        softmax = torch.exp2(p_log2 - new_max[..., None])
+        softmax = torch.where(block_valid[:, None, :], softmax, 0.0)
+
+        # The kernel transfers the rank-1 token factor U from V into S before
+        # E4M3 conversion; the O MMA supplies W as SFB on the V operand.
+        # CUTLASS uses cvt.rn.satfinite.e4m3; Torch's direct float8 cast
+        # returns NaN on overflow, so apply the finite E4M3 endpoint first.
+        s_value = (softmax * block_u[:, None, :]).clamp(
+            -FP8_E4M3_MAX, FP8_E4M3_MAX
+        )
+        s_e4m3 = s_value.to(torch.float8_e4m3fn)
+        # The S/V tile is likewise two K=32 atoms, with FP32 accumulation
+        # retained between them.
+        block_out = torch.zeros_like(out)
+        for k_begin in range(0, block_k.shape[1], MMA_K):
+            k_end = k_begin + MMA_K
+            block_out.add_(
+                torch.matmul(
+                    s_e4m3[..., k_begin:k_end].float(),
+                    block_v[:, k_begin:k_end],
+                )
+            )
+        out = out * scale_old[..., None] + block_out
+        li = li * scale_old + softmax.sum(dim=-1)
+        mi = new_max
+
+    normalized = torch.where(li[..., None] != 0, out / li[..., None], 0.0)
+    lse_log2 = torch.where(li != 0, torch.log2(li) + mi, math.inf)
+    return normalized, lse_log2
+
+
+def _decode_split_ranges(
+    scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    topk: int,
+) -> list[Tuple[int, int]]:
+    """Recover the batch-0 block ranges consumed by decode's split kernel."""
+    first_split = int(num_splits[0].item())
+    split_count = int((num_splits[1] - num_splits[0]).item())
+    num_blocks = (topk + 63) // 64
+    if split_count == 1:
+        return [(0, num_blocks)]
+
+    ranges: list[Optional[Tuple[int, int]]] = [None] * split_count
+    for row in scheduler_metadata.cpu().tolist():
+        begin_req, end_req, begin_block, end_block, begin_split = row[:5]
+        if begin_req != 0 or end_req != 0:
+            continue
+        split_idx = begin_split - first_split
+        if 0 <= split_idx < split_count:
+            ranges[split_idx] = (begin_block, end_block)
+    if any(block_range is None for block_range in ranges):
+        raise AssertionError(
+            f"could not recover all decode split ranges from scheduler metadata: {ranges}"
+        )
+    result = [block_range for block_range in ranges if block_range is not None]
+    if result[0][0] != 0 or result[-1][1] != num_blocks:
+        raise AssertionError(f"decode split ranges do not cover all blocks: {result}")
+    if any(left[1] != right[0] for left, right in zip(result, result[1:])):
+        raise AssertionError(f"decode split ranges are not contiguous: {result}")
+    return result
+
+
+def _cutlass_flow_reference(
+    q_dequant: torch.Tensor,
+    kv_dequant: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    indices: torch.Tensor,
+    u_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    pair_indices: bool,
+    topk_length: Optional[torch.Tensor] = None,
+    split_ranges: Optional[list[Tuple[int, int]]] = None,
+) -> torch.Tensor:
+    """Mirror CUTLASS QK/softmax/SV, plus decode split combine when given."""
+    qf, gathered_k, gathered_v, gathered_u, valid = _gather_reference_inputs(
+        q_dequant,
+        kv_dequant,
+        kv_fp8,
+        indices,
+        u_scale,
+        pair_indices=pair_indices,
+        topk_length=topk_length,
+    )
+    num_blocks = indices.shape[-1] // 64
+    # Prefill is one persistent online-softmax segment. Decode receives the
+    # scheduler's exact split ranges and then follows the combine kernel.
+    ranges = [(0, num_blocks)] if split_ranges is None else split_ranges
+    local_out, local_lse = zip(*(
+        _cutlass_segment(
+            qf,
+            gathered_k,
+            gathered_v,
+            gathered_u,
+            valid,
+            w_scale,
+            begin_block,
+            end_block,
+        )
+        for begin_block, end_block in ranges
+    ))
+
+    if len(local_out) == 1:
+        out = local_out[0]
+    else:
+        stacked_out = torch.stack(local_out)
+        stacked_lse = torch.stack(local_lse)
+        max_lse = stacked_lse.amax(dim=0)
+        global_lse = torch.log2(torch.exp2(stacked_lse - max_lse).sum(dim=0)) + max_lse
+        weights = torch.exp2(stacked_lse - global_lse)
+        out = (stacked_out * weights[..., None]).sum(dim=0)
+    return out.reshape_as(q_dequant).to(torch.bfloat16)
 
 
 @torch.inference_mode()
 def run_prefill(ext, device: torch.device, strict: bool) -> None:
     s_q, s_kv, topk = 2, 256, 128
     packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
-    data_bytes, scale_slots, kv_dequant, u_scale, _ = _make_rank1_storage(
+    data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
         s_kv, device, 1002
     )
     packed_kv = _pack_prefill_storage(data_bytes, scale_slots)
@@ -237,23 +466,33 @@ def run_prefill(ext, device: torch.device, strict: bool) -> None:
         None,
         None,
     )
-    expected, expected_max, expected_lse = _bf16_reference(
+    torch_expected, expected_max, expected_lse = _torch_reference(
         q_dequant,
         kv_dequant,
         indices,
         pair_indices=True,
     )
+    cutlass_expected = _cutlass_flow_reference(
+        q_dequant,
+        kv_dequant,
+        kv_fp8,
+        indices,
+        u_scale,
+        w_scale,
+        pair_indices=True,
+    )
     torch.cuda.synchronize()
-    _summary("prefill.out vs BF16", actual, expected)
-    _summary("prefill.max_logits vs BF16", actual_max, expected_max)
-    _summary("prefill.lse vs BF16", actual_lse, expected_lse)
+    _summary("prefill.out vs Torch (no S quant/dequant)", actual, torch_expected)
+    _summary("prefill.out vs Torch CUTLASS flow", actual, cutlass_expected)
+    _summary("prefill.max_logits vs Torch", actual_max, expected_max)
+    _summary("prefill.lse vs Torch", actual_lse, expected_lse)
     print(
         "prefill rank1 scales: "
         f"U range={u_scale.min().item():.4g}..{u_scale.max().item():.4g}, "
         f"W={w_scale.tolist()}"
     )
     if strict:
-        torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.12)
+        torch.testing.assert_close(actual, cutlass_expected, atol=0.5, rtol=5.0e-3)
         torch.testing.assert_close(actual_max, expected_max, atol=0.08, rtol=0.02)
         torch.testing.assert_close(actual_lse, expected_lse, atol=0.08, rtol=0.02)
 
@@ -265,7 +504,7 @@ def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
     packed_q, q_dequant = _make_prefill_q(batch * s_q, device, 2001)
     packed_q = packed_q.reshape(batch, s_q, H_Q, D_HEAD + 16)
     q_dequant = q_dequant.reshape(batch, s_q, H_Q, D_HEAD)
-    data_bytes, scale_slots, kv_dequant, u_scale, _ = _make_rank1_storage(
+    data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
         num_pages * page_size, device, 2002
     )
     packed_kv = _pack_page_storage(
@@ -275,7 +514,7 @@ def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
     indices = torch.arange(topk, device=device, dtype=torch.int32).view(batch, s_q, topk)
     lengths = torch.full((batch,), topk, device=device, dtype=torch.int32)
     w1, w2, w_scale = _w_arguments(device)
-    actual, actual_lse, _, splits = ext.dual_mxfp8_sparse_decode_fwd(
+    actual, actual_lse, scheduler_metadata, splits = ext.dual_mxfp8_sparse_decode_fwd(
         packed_q,
         packed_kv,
         indices,
@@ -292,35 +531,56 @@ def run_decode(ext, device: torch.device, topk: int, strict: bool) -> None:
         w1,
         w2,
     )
-    expected, _, expected_lse = _bf16_reference(
+    torch_expected, _, expected_lse = _torch_reference(
         q_dequant,
         kv_dequant,
         indices,
         pair_indices=False,
         topk_length=lengths,
     )
+    split_ranges = _decode_split_ranges(scheduler_metadata, splits, topk)
+    cutlass_expected = _cutlass_flow_reference(
+        q_dequant,
+        kv_dequant,
+        kv_fp8,
+        indices,
+        u_scale,
+        w_scale,
+        pair_indices=False,
+        topk_length=lengths,
+        split_ranges=split_ranges,
+    )
     expected_lse = expected_lse.view(batch, s_q, H_Q).transpose(1, 2)
     torch.cuda.synchronize()
-    _summary(f"decode[{topk}].out vs BF16", actual, expected)
-    _summary(f"decode[{topk}].lse vs BF16", actual_lse, expected_lse)
+    _summary(
+        f"decode[{topk}].out vs Torch (no S quant/dequant)",
+        actual,
+        torch_expected,
+    )
+    _summary(f"decode[{topk}].out vs Torch CUTLASS flow", actual, cutlass_expected)
+    _summary(f"decode[{topk}].lse vs Torch", actual_lse, expected_lse)
     print(
         f"decode[{topk}] rank1 scales: U range={u_scale.min().item():.4g}.."
         f"{u_scale.max().item():.4g}, W={w_scale.tolist()}, splits={splits.tolist()}"
     )
     if strict:
-        torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.12)
+        torch.testing.assert_close(actual, cutlass_expected, atol=0.5, rtol=5.0e-3)
         torch.testing.assert_close(actual_lse, expected_lse, atol=0.08, rtol=0.02)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--strict", action="store_true", help="fail on BF16-reference mismatch")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail when the kernel disagrees with the Torch CUTLASS-flow reference",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("this test requires an NVIDIA SM100-family GPU")
     torch.cuda.set_device(args.device)
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest")
     ext = _load_extension()
     run_prefill(ext, torch.device("cuda"), args.strict)
     run_decode(ext, torch.device("cuda"), 64, args.strict)

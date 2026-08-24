@@ -66,6 +66,26 @@ CUTE_DEVICE void fill_sfa_from_registers(uint32_t tmem_col, int warp_in_warpgrou
     }
 }
 
+CUTE_DEVICE void store_s_scale_to_tmem(
+        uint32_t tmem_col, int warp_in_warpgroup,
+        uint8_t scale0_bits, uint8_t scale1_bits) {
+    // S is quantized independently for each softmax row.  The O MMA consumes
+    // four K=32 SFA bytes from one 32-bit TMEM word, so repeat this row's
+    // UE8M0 factor across the word and keep the duplicated 2x2 DP layout.
+    const uint32_t packed_scale = uint32_t(scale0_bits)
+        | (uint32_t(scale1_bits) << 8)
+        | (uint32_t(scale0_bits) << 16)
+        | (uint32_t(scale1_bits) << 24);
+    const uint32_t warp_dp_addr =
+        tmem_col + warp_in_warpgroup * 32 * cute::TMEM::DP<uint32_t>::value;
+    CUTE_UNROLL
+    for (int row_group = 0; row_group < 4; ++row_group) {
+        SM100_TMEM_STORE_32dp32b1x::copy(
+            packed_scale, warp_dp_addr + row_group
+        );
+    }
+}
+
 template<FwdMode FWD_MODE, int D_QK>
 __device__ void
 KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
@@ -1004,11 +1024,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         cutlass::arch::warpgroup_reg_alloc<176>();
 
         int local_warp_idx = warp_idx - 12;
-        fill_sfa_from_registers<TiledMMA_O, SmemLayoutOScaleA>(
-            tmem_cols::S_scale, local_warp_idx
-        );
-        cutlass::arch::fence_view_async_tmem_store();
-
         Tensor sS_store = make_tensor(
             make_smem_ptr(smem.S.data()),
             ku::make_umma_canonical_k_major_layout<
@@ -1081,7 +1096,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 float cur_sum = 0.0f;
                 // Each softmax thread owns one contiguous 32-token MMA-K
                 // group. Quantize that group independently; the resulting
-                // S scale is kept local until the TMEM path is wired up.
+                // S scale is computed per K=32 atom and packed below for the
+                // two SF-ID byte selections used by the O MMA.
                 float s_abs_max = 0.0f;
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
@@ -1105,10 +1121,24 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
                     s[i] = fp8_e4m3(p[i] / s_scale);
                 }
+
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
                 smem.bar_SV_done.wait(bar_phase^1);
+                smem.s_scale_exp[k_buf_idx][s_row][local_warp_idx >= 2 ? 1 : 0] =
+                    s_scale_exp_e8m0.storage;
+                NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_WARP02_SYNC);
+                // Publish the per-row S scale only after the previous O MMA
+                // has released this stage.  S_scale is a single TMEM buffer,
+                // so writing it earlier would race with issue_O(k-1).
+                store_s_scale_to_tmem(
+                    tmem_cols::S_scale,
+                    local_warp_idx,
+                    smem.s_scale_exp[k_buf_idx][s_row][0],
+                    smem.s_scale_exp[k_buf_idx][s_row][1]
+                );
+                cutlass::arch::fence_view_async_tmem_store();
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
                     fp8_e4m3* sS_base = &sS_store(

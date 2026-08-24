@@ -338,14 +338,23 @@ def _cutlass_segment(
         softmax = torch.where(block_valid[:, None, :], softmax, 0.0)
 
         # The kernel transfers the rank-1 token factor U from V into S before
-        # E4M3 conversion; the O MMA supplies W as SFB on the V operand.
+        # E4M3 conversion; S is then normalized by a per-row UE8M0 scale and
+        # the O MMA supplies that scale together with W as SFA/SFB.
         # CUTLASS uses cvt.rn.satfinite.e4m3; Torch's direct float8 cast
         # returns NaN on overflow, so apply the finite E4M3 endpoint first.
-        s_value = (softmax * block_u[:, None, :]).clamp(
-            -FP8_E4M3_MAX, FP8_E4M3_MAX
+        s_value = (softmax * block_u[:, None, :])
+        s_grouped = s_value.reshape(*s_value.shape[:-1], 2, MMA_K)
+        s_abs_max = s_grouped.amax(dim=-1)
+        raw_s_scale = torch.where(
+            s_abs_max > 0,
+            s_abs_max / FP8_E4M3_MAX,
+            torch.ones_like(s_abs_max),
         )
-        # s_value = (softmax * block_u[:, None, :]) * 448.0
-        s_e4m3 = s_value.to(torch.float8_e4m3fn).float()/448.0
+        # UE8M0 conversion uses round-up (cvt.rp), i.e. the next power of two.
+        s_scale = torch.exp2(torch.ceil(torch.log2(raw_s_scale)))
+        s_e4m3 = (
+            (s_grouped / s_scale[..., None]).to(torch.float8_e4m3fn).float()
+        )
         # The S/V tile is likewise two K=32 atoms, with FP32 accumulation
         # retained between them.
         block_out = torch.zeros_like(out)
@@ -353,7 +362,8 @@ def _cutlass_segment(
             k_end = k_begin + MMA_K
             block_out.add_(
                 torch.matmul(
-                    s_e4m3[..., k_begin:k_end].float(),
+                    s_e4m3[..., k_begin // MMA_K, :].float()
+                    * s_scale[..., k_begin // MMA_K, None],
                     block_v[:, k_begin:k_end],
                 )
             )
@@ -607,8 +617,8 @@ def main() -> None:
     ext = _load_extension()
     w_exponents = torch.zeros_like(W_EXPONENTS) if args.w_all_ones else W_EXPONENTS
     run_prefill(ext, torch.device("cuda"), args.strict, w_exponents)
-    # run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
-    # run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
+    run_decode(ext, torch.device("cuda"), 64, args.strict, w_exponents)
+    run_decode(ext, torch.device("cuda"), 256, args.strict, w_exponents)
 
 
 if __name__ == "__main__":

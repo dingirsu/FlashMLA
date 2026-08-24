@@ -127,6 +127,9 @@ struct SharedMemoryPlan {
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
     CUTE_ALIGNAS(16) fp8_e8m0 v_token_scale[NUM_K_BUFS][B_TOPK];
+    // One S scale per softmax row and per K=32 atom in the 64-token tile.
+    // The two bytes are packed into one TMEM scale word before O MMA.
+    CUTE_ALIGNAS(16) uint8_t s_scale_exp[NUM_K_BUFS][H_Q/2][2];
     // Final 64-row x 16B post-transpose source consumed by 2x64 UTCCP.
     array_aligned<fp8_e8m0, B_TOPK * 16> k_scale_mma[NUM_K_BUFS];
     float P_exchange[4][(H_Q/2/2)*(B_TOPK/2)];

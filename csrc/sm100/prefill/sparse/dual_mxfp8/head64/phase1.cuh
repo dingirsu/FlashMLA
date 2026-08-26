@@ -1117,11 +1117,14 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 float raw_s_scale = s_abs_max > 0.0f
                     ? s_abs_max / 448.0f : 1.0f;
                 fp8_e8m0 s_scale_exp_e8m0 = fp8_e8m0(raw_s_scale);
-                float s_scale = float(s_scale_exp_e8m0);
+                // UE8M0 can underflow to zero for a very small scale. Keep
+                // the reciprocal finite so S quantization cannot create NaN.
+                constexpr float S_SCALE_EPS = 1.0e-20f;
+                float s_scale = 1.0f / max(float(s_scale_exp_e8m0), S_SCALE_EPS);
+                s_scale_exp_e8m0 = fp8_e8m0(1.0f / s_scale);
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                    s[i] = fp8_e4m3(p[i] / s_scale);
+                    s[i] = fp8_e4m3(p[i] * s_scale);
                 }
-
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S

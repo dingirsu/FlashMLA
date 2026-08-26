@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Exercise dual-MXFP8 prefill and decode with an explicit rank-1 KV scale.
 
-The KV data is generated as random E4M3 values.  A fixed dimension scale
-``W[g]`` (with ``W[0] == 1``) and independently generated token scales ``U[t]``
-form the stored UE8M0 scale:
+The KV data is generated as random E4M3 values.  The first and second 256-D
+halves each use an independent rank-1 UE8M0 scale matrix.  Their dimension
+anchors are ``W[0] == W[4] == 1``:
 
-    scale[t, g] = U[t] * W[g]
+    scale[t, g] = U_half[t] * W[g]
 
 Each output is compared with both ordinary Torch attention (without an extra
 S quantize/dequantize) and a Torch simulation of the CUTLASS kernel flow.
@@ -49,10 +49,14 @@ FP8_E4M3_MAX = 448.0
 KV_SCALE_SLOT_BYTES = 16
 KV_RECORD_BYTES = D_HEAD + KV_SCALE_SLOT_BYTES
 SM_SCALE = D_HEAD ** -0.5
+PRINT_S_ROW = 0
+PRINT_S_HEAD = 24
 
-# W[0] is the anchor.  All factors are exactly representable UE8M0 powers of
-# two and are deliberately shared by every token and by both kernels.
-W_EXPONENTS = torch.tensor([0, 1, 3, 0, 4, 2, 1, 3], dtype=torch.int32)
+# All factors are exactly representable UE8M0 powers of two.  The two-anchor
+# case has an independent unit anchor in each 256-D half; the single-anchor
+# case retains the original full-512-D rank-1 construction.
+W_EXPONENTS_TWO_ANCHORS = torch.tensor([0, 8, 8, 8, 0, 8, 8, 8], dtype=torch.int32)
+W_EXPONENTS_SINGLE_ANCHOR = torch.tensor([0, 8, 8, 8, 8, 8, 8, 8], dtype=torch.int32)
 
 
 def _load_extension():
@@ -106,9 +110,13 @@ def _pack_scale_bytes(bits: torch.Tensor) -> int:
 
 
 def _w_arguments(
-    device: torch.device, w_exponents: torch.Tensor
+    device: torch.device, w_exponents: torch.Tensor, two_anchors: bool
 ) -> Tuple[int, int, torch.Tensor]:
-    assert int(w_exponents[0]) == 0, "rank-1 W[0] must be the fixed unit anchor"
+    assert int(w_exponents[0]) == 0, "W[0] must be the fixed unit anchor"
+    if two_anchors:
+        assert int(w_exponents[4]) == 0, (
+            "two-anchor mode requires W[4] to be the fixed unit anchor"
+        )
     bits = (w_exponents + 127).to(device=device, dtype=torch.uint8)
     w1 = _pack_scale_bytes(bits[:4])
     w2 = _pack_scale_bytes(bits[4:])
@@ -120,6 +128,7 @@ def _make_rank1_storage(
     device: torch.device,
     seed: int,
     w_exponents: torch.Tensor,
+    two_anchors: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return raw data bytes, replicated scale slots, dequantized KV, U, FP8."""
     generator = torch.Generator(device=device)
@@ -131,10 +140,27 @@ def _make_rank1_storage(
     ).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     if not torch.isfinite(fp8.float()).all():
         raise AssertionError("random E4M3 generation produced a non-finite value")
-    u_exp = torch.randint(
-        -3, 4, (num_tokens,), device=device, dtype=torch.int32, generator=generator
+    if two_anchors:
+        # Relaxed construction: U_lo/W_lo and U_hi/W_hi are rank-1
+        # independently within their respective 256-D halves.
+        u_exp = torch.randint(
+            -3, 4, (num_tokens, 2), device=device, dtype=torch.int32,
+            generator=generator,
+        )
+    else:
+        # Original construction: one U[t] is shared by all 512 dimensions.
+        u_one = torch.randint(
+            -3, 4, (num_tokens,), device=device, dtype=torch.int32,
+            generator=generator,
+        )
+        u_exp = u_one[:, None].expand(-1, 2)
+    w_device = w_exponents.to(device=device)
+    product_exp = torch.cat(
+        (
+            u_exp[:, 0, None] + w_device[None, :4],
+            u_exp[:, 1, None] + w_device[None, 4:],
+        ), dim=1
     )
-    product_exp = u_exp[:, None] + w_exponents.to(device=device)[None, :]
     if int(product_exp.amin()) < -126 or int(product_exp.amax()) > 127:
         raise AssertionError("rank-1 product scale is outside UE8M0 range")
 
@@ -147,9 +173,13 @@ def _make_rank1_storage(
     dequant = fp8.float() * product_scale.float().repeat_interleave(KV_GROUP_SIZE, dim=-1)
     # The 528-byte interface envelope represents a page's average stride.  The
     # physical allocation is [all data rows][all 16-byte scale slots].
-    expected_product = u_scale[:, None] * torch.exp2(
-        w_exponents.to(device=device, dtype=torch.float32)
-    )[None, :]
+    expected_product = torch.cat(
+        (
+            u_scale[:, 0, None] * torch.exp2(w_device[:4].float())[None, :],
+            u_scale[:, 1, None] * torch.exp2(w_device[4:].float())[None, :],
+        ),
+        dim=1,
+    )
     torch.testing.assert_close(product_scale.float(), expected_product, atol=0, rtol=0)
     return data_bytes, scale_slots, dequant, u_scale, fp8.float()
 
@@ -263,11 +293,46 @@ def _summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
     if not both_finite.any():
         print(f"{name}: all values are matching NaN/Inf")
         return
-    values = (actual_f[both_finite] - expected_f[both_finite]).abs()
-    print(
-        f"{name}: max_abs={values.max().item():.6g} "
-        f"mean_abs={values.mean().item():.6g} "
-    )
+    diff = (actual_f - expected_f).abs()
+
+    def print_part(
+        label: str,
+        part_actual: torch.Tensor,
+        part_diff: torch.Tensor,
+        part_expected: torch.Tensor,
+        part_mask: torch.Tensor,
+    ) -> None:
+        values = part_diff[part_mask]
+        actual_values = part_actual[part_mask]
+        expected_values = part_expected[part_mask]
+        relative = values / expected_values.abs().clamp_min(1.0e-8)
+        flat_position = int(values.argmax().item())
+        print(
+            f"{name}[{label}]: max_abs={values.max().item():.6g} "
+            f"max_position={flat_position} mean_abs={values.mean().item():.6g} "
+            f"actual={actual_values[flat_position].item():.6g} "
+            f"reference={expected_values[flat_position].item():.6g} "
+            f"max_rel={relative.max().item():.6g} "
+            f"mean_rel={relative.mean().item():.6g}"
+        )
+
+    if actual_f.shape[-1] == D_HEAD:
+        print_part(
+            "0:256",
+            actual_f[..., :256],
+            diff[..., :256],
+            expected_f[..., :256],
+            both_finite[..., :256],
+        )
+        print_part(
+            "256:512",
+            actual_f[..., 256:],
+            diff[..., 256:],
+            expected_f[..., 256:],
+            both_finite[..., 256:],
+        )
+    else:
+        print_part("all", actual_f, diff, expected_f, both_finite)
 
 
 def _gather_reference_inputs(
@@ -283,7 +348,7 @@ def _gather_reference_inputs(
     qf = q_dequant.float().reshape(-1, H_Q, D_HEAD)
     kf = kv_dequant.reshape(-1, D_HEAD).float()
     vf = kv_fp8.reshape(-1, D_HEAD).float()
-    uf = u_scale.reshape(-1).float()
+    uf = u_scale.reshape(-1, 2).float()
 
     if pair_indices:
         idx = indices[:, 0]
@@ -311,7 +376,7 @@ def _gather_reference_inputs(
         idx.shape[0], idx.shape[1], D_HEAD
     )
     gathered_v = vf.index_select(0, safe.reshape(-1)).reshape_as(gathered_k)
-    gathered_u = uf.index_select(0, safe.reshape(-1)).reshape(idx.shape)
+    gathered_u = uf.index_select(0, safe.reshape(-1)).reshape(*idx.shape, 2)
     positions = torch.arange(idx.shape[1], device=qf.device)[None, :]
     valid = (idx >= 0) & (idx < kf.shape[0]) & (positions < lengths[:, None])
     return qf, gathered_k, gathered_v, gathered_u, valid
@@ -340,7 +405,10 @@ def _cutlass_segment(
         end = begin + 64
         block_k = gathered_k[:, begin:end]
         block_v = gathered_v[:, begin:end] * v_scale[None, None, :]
-        block_u = gathered_u[:, begin:end]
+        # The kernel's S path reads the token factor from scale group 0.  The
+        # second U half remains present in K/V dequantization, exposing any
+        # incorrect attempt to use one half's factor for the other half.
+        block_u = gathered_u[:, begin:end, 0]
         block_valid = valid[:, begin:end]
 
         # tcgen05 accumulates QK as sixteen K=32 atoms.  Preserve that
@@ -388,11 +456,25 @@ def _cutlass_segment(
             s_abs_max / FP8_E4M3_MAX,
             torch.ones_like(s_abs_max),
         )
+        raw_s_scale = raw_s_scale.clamp_min(1.0e-20)
         # UE8M0 conversion uses round-up (cvt.rp), i.e. the next power of two.
         s_scale = torch.exp2(torch.ceil(torch.log2(raw_s_scale)))
-        s_e4m3 = (
-            (s_grouped / s_scale[..., None]).to(torch.float8_e4m3fn).float()
-        )
+        s_quantized = (s_grouped / s_scale[..., None]).to(torch.float8_e4m3fn)
+        s_e4m3 = s_quantized.float()
+        # Match the kernel's single-thread S dump: row 0, head 0, first
+        # K=32 atom.
+        for print_atom in range(2):
+            s_values = s_e4m3[PRINT_S_ROW, PRINT_S_HEAD, print_atom].detach().cpu().tolist()
+            s_scale_value = float(s_scale[PRINT_S_ROW, PRINT_S_HEAD, print_atom].item())
+            entries = ", ".join(
+                f"{value:g}"
+                for value in s_values
+            )
+            print(
+                f"python cutlass k={block_idx} head={PRINT_S_HEAD} atom={print_atom} "
+                f"s_scale={s_scale_value:g} s=[{entries}]",
+                flush=True,
+            )
         # The S/V tile is likewise two K=32 atoms, with FP32 accumulation
         # retained between them.
         block_out = torch.zeros_like(out)
@@ -495,7 +577,19 @@ def _cutlass_flow_reference(
         global_lse = torch.log2(torch.exp2(stacked_lse - max_lse).sum(dim=0)) + max_lse
         weights = torch.exp2(stacked_lse - global_lse)
         out = (stacked_out * weights[..., None]).sum(dim=0)
-    return out.reshape_as(q_dequant).to(torch.bfloat16)
+    out = out.reshape_as(q_dequant)
+    out_flat = out.reshape(-1, H_Q, D_HEAD)
+    print(
+        "python O before bf16 q=0 head=59 dim=122 "
+        f"value={out_flat[0, 59, 122].float().item():.9g}",
+        flush=True,
+    )
+    print(
+        "python O before bf16 q=0 head=59 dim=432 "
+        f"value={out_flat[0, 59, 432].float().item():.9g}",
+        flush=True,
+    )
+    return out.to(torch.bfloat16)
 
 
 @torch.inference_mode()
@@ -504,15 +598,16 @@ def run_prefill(
     device: torch.device,
     w_exponents: torch.Tensor,
     bf16_ext,
+    two_anchors: bool,
 ) -> None:
     s_q, s_kv, topk = 2, 256, 128
     packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        s_kv, device, 1002, w_exponents
+        s_kv, device, 1002, w_exponents, two_anchors
     )
     packed_kv = _pack_prefill_storage(data_bytes, scale_slots)
     indices = _make_indices(s_q // 2, topk, s_kv, device, 1003).unsqueeze(1)
-    w1, w2, w_scale = _w_arguments(device, w_exponents)
+    w1, w2, w_scale = _w_arguments(device, w_exponents, two_anchors)
     actual, actual_max, actual_lse = ext.dual_mxfp8_head64_sparse_prefill_fwd(
         packed_q,
         packed_kv,
@@ -533,9 +628,30 @@ def run_prefill(
         None,
         None,
     )
+    torch_expected, expected_max, expected_lse = _torch_reference(
+        q_dequant,
+        kv_dequant,
+        indices,
+        pair_indices=True,
+        dtype=torch.float32
+    )
+    cutlass_expected = _cutlass_flow_reference(
+        q_dequant,
+        kv_dequant,
+        kv_fp8,
+        indices,
+        u_scale,
+        w_scale,
+        pair_indices=True,
+    )
     torch.cuda.synchronize()
-    _summary("prefill", actual, bf16_actual)
-
+    # _summary("mxfp8 kernel vs bf16 kernel", actual, bf16_actual)
+    # breakpoint()
+    _summary("lse", actual_lse, expected_lse)
+    _summary("mxfp8 torch vs mxfp8 kernel", actual, cutlass_expected)
+    # _summary("torch vs bf16", bf16_actual, cutlass_expected)
+    # _summary("mxfp8 torch vs fp32 torch", cutlass_expected, torch_expected)
+    # _summary("mxfp8 torch vs bf16 kernel", torch_expected, bf16_actual)
 
 @torch.inference_mode()
 def run_decode(
@@ -544,6 +660,7 @@ def run_decode(
     topk: int,
     w_exponents: torch.Tensor,
     bf16_decode_ext,
+    two_anchors: bool,
 ) -> None:
     batch, s_q, page_size = 1, 1, 64
     num_pages = (topk + page_size - 1) // page_size
@@ -551,7 +668,7 @@ def run_decode(
     packed_q = packed_q.reshape(batch, s_q, H_Q, D_HEAD + 16)
     q_dequant = q_dequant.reshape(batch, s_q, H_Q, D_HEAD)
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        num_pages * page_size, device, 2002, w_exponents
+        num_pages * page_size, device, 2002, w_exponents, two_anchors
     )
     packed_kv = _pack_page_storage(
         data_bytes, scale_slots, num_pages=num_pages, page_size=page_size
@@ -577,7 +694,7 @@ def run_decode(
     model1_kv = model1_kv.as_strided(
         model1_kv.shape, (page_stride, 584, 584, 1)
     )
-    w1, w2, w_scale = _w_arguments(device, w_exponents)
+    w1, w2, w_scale = _w_arguments(device, w_exponents, two_anchors)
     actual, actual_lse, scheduler_metadata, splits = ext.dual_mxfp8_sparse_decode_fwd(
         packed_q,
         packed_kv,
@@ -595,6 +712,19 @@ def run_decode(
         w1,
         w2,
     )
+
+    split_ranges = _decode_split_ranges(scheduler_metadata, splits, topk)
+    cutlass_expected = _cutlass_flow_reference(
+        q_dequant,
+        kv_dequant,
+        kv_fp8,
+        indices,
+        u_scale,
+        w_scale,
+        pair_indices=False,
+        topk_length=lengths,
+        split_ranges=split_ranges,
+    )
     
     bf16_actual, bf16_lse = bf16_decode_ext.head64_decode(
         q_dequant.to(torch.bfloat16), model1_kv, indices, SM_SCALE
@@ -602,8 +732,8 @@ def run_decode(
     bf16_actual = bf16_actual.reshape_as(actual)
 
     torch.cuda.synchronize()
-    
-    _summary("decode", actual, bf16_actual)
+
+    _summary("mxfp8 torch vs mxfp8 decode kernel", actual, cutlass_expected)
 
 
 def main() -> None:
@@ -614,6 +744,20 @@ def main() -> None:
         action="store_true",
         help="use W=1 for KV generation, kernel arguments, and both Torch references",
     )
+    anchor_group = parser.add_mutually_exclusive_group()
+    anchor_group.add_argument(
+        "--two-anchors",
+        dest="two_anchors",
+        action="store_true",
+        help="use independent rank-1 U/W factors for the two 256-D halves (default)",
+    )
+    anchor_group.add_argument(
+        "--single-anchor",
+        dest="two_anchors",
+        action="store_false",
+        help="use one U factor and one W anchor for all 512 dimensions",
+    )
+    parser.set_defaults(two_anchors=True)
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("this test requires an NVIDIA SM100-family GPU")
@@ -621,10 +765,13 @@ def main() -> None:
     ext = _load_extension()
     bf16_ext = _load_bf16_extension()
     bf16_decode_ext = _load_head64_decode_extension()
-    w_exponents = torch.zeros_like(W_EXPONENTS) if args.one else W_EXPONENTS
-    run_prefill(ext, torch.device("cuda"), w_exponents, bf16_ext)
+    base_w = (
+        W_EXPONENTS_TWO_ANCHORS if args.two_anchors else W_EXPONENTS_SINGLE_ANCHOR
+    )
+    w_exponents = torch.zeros_like(base_w) if args.one else base_w
+    run_prefill(ext, torch.device("cuda"), w_exponents, bf16_ext, args.two_anchors)
     run_decode(
-        ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext
+        ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext, args.two_anchors
     )
 
 

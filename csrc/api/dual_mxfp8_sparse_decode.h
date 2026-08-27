@@ -1,5 +1,8 @@
 #pragma once
 
+#include <vector>
+#include <pybind11/stl.h>
+
 #include "common.h"
 #include "params.h"
 #include "sm100/prefill/sparse/dual_mxfp8/head64/phase1.h"
@@ -24,8 +27,8 @@ dual_mxfp8_sparse_attn_decode_interface(
     int d_qk,
     int d_v,
     float sm_scale,
-    uint32_t w1,
-    uint32_t w2
+    const std::vector<uint32_t>& w1,
+    const std::vector<uint32_t>& w2
 ) {
     using bf16 = cutlass::bfloat16_t;
     constexpr int d = 512;
@@ -55,6 +58,8 @@ dual_mxfp8_sparse_attn_decode_interface(
     TORCH_CHECK(h_kv == 1, "Dual MXFP8 decode requires h_kv=1");
     TORCH_CHECK(d_qk == d && d_v == d, "Dual MXFP8 decode requires d_qk=d_v=512");
     TORCH_CHECK(topk > 0 && topk % 64 == 0, "topk must be a positive multiple of 64");
+    TORCH_CHECK(w1.size() == 8 && w2.size() == 8,
+        "w1 and w2 must each contain 8 pre-expanded TMEM scale words");
     TORCH_CHECK(q.size(3) == q_bytes, "q must use the 528-byte head64 envelope");
     TORCH_CHECK(kv.size(3) == kv_bytes, "kv must use the 528-byte head64 envelope");
     TORCH_CHECK(!extra_kv.has_value() || extra_indices.has_value(),
@@ -143,7 +148,7 @@ dual_mxfp8_sparse_attn_decode_interface(
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk, ModelType::MODEL1,
-        q.data_ptr(), kv.data_ptr(), w1, w2,
+        q.data_ptr(), kv.data_ptr(), {}, {},
         indices.data_ptr<int>(), ku::get_optional_tensor_ptr<int>(topk_length),
         ku::get_optional_tensor_ptr<float>(attn_sink),
         lse.data_ptr<float>(), reinterpret_cast<bf16*>(out.data_ptr()),
@@ -165,6 +170,10 @@ dual_mxfp8_sparse_attn_decode_interface(
         reinterpret_cast<DecodingSchedMeta*>(tile_scheduler_metadata->data_ptr()),
         num_splits->data_ptr<int>(), num_sm_parts
     };
+    for (int i = 0; i < 8; ++i) {
+        params.w1[i] = w1[i];
+        params.w2[i] = w2[i];
+    }
 
     const int total_num_splits = b + num_sm_parts;
     at::Tensor lse_accum = torch::empty({total_num_splits, s_q, h_q}, opts.dtype(torch::kFloat));

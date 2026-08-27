@@ -1,7 +1,7 @@
 import importlib.util
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -47,8 +47,8 @@ def mxfp8_sparse_decode(
     d_qk: int = 512,
     d_v: int = 512,
     sm_scale: Optional[float] = None,
-    w1: int = 0,
-    w2: int = 0,
+    w1: Optional[Sequence[int]] = None,
+    w2: Optional[Sequence[int]] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -57,6 +57,10 @@ def mxfp8_sparse_decode(
 ]:
     if sm_scale is None:
         sm_scale = d_qk**-0.5
+    if w1 is None:
+        w1 = [0] * 8
+    if w2 is None:
+        w2 = [0] * 8
     return ext.dual_mxfp8_sparse_decode_fwd(
         q,
         kv,
@@ -85,6 +89,7 @@ def main() -> None:
         attention_reference_dual_mxfp8,
         pack_dual_decode_kv_pages_rank1,
         pack_dual_q64,
+        expand_e8m0x4_to_tmem_words,
     )
 
     torch.manual_seed(20260717)
@@ -107,8 +112,8 @@ def main() -> None:
         pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
     )
     w_bits = w_scale.view(torch.uint8).cpu().tolist()
-    w1 = int.from_bytes(bytes(w_bits[:4]), byteorder="little", signed=False)
-    w2 = int.from_bytes(bytes(w_bits[4:8]), byteorder="little", signed=False)
+    w1 = expand_e8m0x4_to_tmem_words(w_bits[:4])
+    w2 = expand_e8m0x4_to_tmem_words(w_bits[4:8])
     indices = (
         torch.randperm(s_kv, device="cuda")[:topk]
         .to(torch.int32)

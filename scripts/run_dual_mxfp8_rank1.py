@@ -21,7 +21,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -103,23 +103,24 @@ def _load_head64_decode_extension():
     return module
 
 
-def _pack_scale_bytes(bits: torch.Tensor) -> int:
+def _expand_scale_bytes(bits: torch.Tensor) -> list[int]:
     values = bits.to(device="cpu", dtype=torch.uint8).tolist()
     assert len(values) == 4
-    return int.from_bytes(bytes(values), byteorder="little", signed=False)
+    words = [value * 0x01010101 for value in values]
+    return [word for word in words for _ in range(2)]
 
 
 def _w_arguments(
     device: torch.device, w_exponents: torch.Tensor, two_anchors: bool
-) -> Tuple[int, int, torch.Tensor]:
+) -> Tuple[list[int], list[int], torch.Tensor]:
     assert int(w_exponents[0]) == 0, "W[0] must be the fixed unit anchor"
     if two_anchors:
         assert int(w_exponents[4]) == 0, (
             "two-anchor mode requires W[4] to be the fixed unit anchor"
         )
     bits = (w_exponents + 127).to(device=device, dtype=torch.uint8)
-    w1 = _pack_scale_bytes(bits[:4])
-    w2 = _pack_scale_bytes(bits[4:])
+    w1 = _expand_scale_bytes(bits[:4])
+    w2 = _expand_scale_bytes(bits[4:])
     return w1, w2, torch.exp2(w_exponents.to(device=device, dtype=torch.float32))
 
 
@@ -333,6 +334,161 @@ def _summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
         )
     else:
         print_part("all", actual_f, diff, expected_f, both_finite)
+
+
+def _benchmark_cuda_us(
+    launch: Callable[[], object], warmup: int, iterations: int
+) -> Tuple[float, float, float]:
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+    for start, end in zip(starts, ends):
+        start.record()
+        launch()
+        end.record()
+    torch.cuda.synchronize()
+
+    samples = sorted(
+        start.elapsed_time(end) * 1.0e3 for start, end in zip(starts, ends)
+    )
+    last = len(samples) - 1
+    return samples[len(samples) // 2], samples[int(0.2 * last)], samples[int(0.8 * last)]
+
+
+def _benchmark_rank1(
+    ext,
+    bf16_ext,
+    bf16_decode_ext,
+    device: torch.device,
+    w_exponents: torch.Tensor,
+    two_anchors: bool,
+    warmup: int,
+    iterations: int,
+) -> None:
+    prefill_s_q = 32768
+    decode_s_q = 4
+    s_kv = 32768
+    topk = 512
+    page_size = 64
+    num_pages = s_kv // page_size
+
+    torch.manual_seed(20260826)
+    packed_q = torch.empty(
+        (prefill_s_q, H_Q, D_HEAD + 16), dtype=torch.uint8, device=device
+    )
+    packed_q[..., :D_HEAD].random_(0, 0x7f)
+    packed_q[..., D_HEAD:].fill_(127)
+    q_bf16 = packed_q[..., :D_HEAD].view(torch.float8_e4m3fn).to(torch.bfloat16)
+
+    data_bytes = torch.empty((s_kv, D_HEAD), dtype=torch.uint8, device=device)
+    data_bytes.random_(0, 0x7f)
+    w1, w2, w_scale = _w_arguments(device, w_exponents, two_anchors)
+    scale_bits = (w_exponents + 127).to(device=device, dtype=torch.uint8)
+    scale_slots = torch.cat((scale_bits, scale_bits)).expand(s_kv, -1).contiguous()
+    packed_prefill_kv = _pack_prefill_storage(data_bytes, scale_slots)
+    packed_decode_kv = _pack_page_storage(
+        data_bytes, scale_slots, num_pages=num_pages, page_size=page_size
+    )
+    kv_bf16 = (
+        data_bytes.view(torch.float8_e4m3fn).float()
+        * w_scale.repeat_interleave(KV_GROUP_SIZE)[None, :]
+    ).to(torch.bfloat16).reshape(s_kv, 1, D_HEAD)
+
+    prefill_pair_indices = torch.randint(
+        s_kv,
+        (prefill_s_q // 2, 1, topk),
+        dtype=torch.int32,
+        device=device,
+    )
+    bf16_prefill_indices = prefill_pair_indices.repeat_interleave(2, dim=0)
+
+    def launch_mxfp8_prefill():
+        return ext.dual_mxfp8_head64_sparse_prefill_fwd(
+            packed_q,
+            packed_prefill_kv,
+            prefill_pair_indices,
+            SM_SCALE,
+            w1,
+            w2,
+            None,
+            None,
+        )
+
+    def launch_bf16_prefill():
+        return bf16_ext.bf16_sparse_prefill_fwd(
+            q_bf16, kv_bf16, bf16_prefill_indices, SM_SCALE, None, None
+        )
+
+    mxfp8_prefill = _benchmark_cuda_us(launch_mxfp8_prefill, warmup, iterations)
+    bf16_prefill = _benchmark_cuda_us(launch_bf16_prefill, warmup, iterations)
+
+    decode_q_mxfp8 = packed_q[:decode_s_q].unsqueeze(0)
+    decode_q_bf16 = q_bf16[:decode_s_q].unsqueeze(0)
+    decode_indices = torch.randint(
+        s_kv, (1, decode_s_q, topk), dtype=torch.int32, device=device
+    )
+    decode_lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+
+    model1_kv_quantized = quantize_k_cache(
+        kv_bf16.reshape(num_pages, page_size, 1, D_HEAD),
+        FP8KVCacheLayout.MODEL1_FP8Sparse,
+    )
+    model1_kv = model1_kv_quantized.view(torch.uint8)
+    page_stride = ((page_size * 584 + 575) // 576) * 576
+    model1_kv = model1_kv.as_strided(
+        model1_kv.shape, (page_stride, 584, 584, 1)
+    )
+
+    def launch_mxfp8_decode():
+        return ext.dual_mxfp8_sparse_decode_fwd(
+            decode_q_mxfp8,
+            packed_decode_kv,
+            decode_indices,
+            decode_lengths,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            D_HEAD,
+            D_HEAD,
+            SM_SCALE,
+            w1,
+            w2,
+        )
+
+    def launch_bf16_decode():
+        return bf16_decode_ext.head64_decode(
+            decode_q_bf16, model1_kv, decode_indices, SM_SCALE
+        )
+
+    mxfp8_decode = _benchmark_cuda_us(launch_mxfp8_decode, warmup, iterations)
+    bf16_decode = _benchmark_cuda_us(launch_bf16_decode, warmup, iterations)
+
+    def report(name: str, shape: str, mxfp8: Tuple[float, float, float], bf16: Tuple[float, float, float]):
+        print(
+            f"BENCH {name} {shape} "
+            f"MXFP8 median={mxfp8[0]:.3f}us p20={mxfp8[1]:.3f}us p80={mxfp8[2]:.3f}us "
+            f"BF16 median={bf16[0]:.3f}us p20={bf16[1]:.3f}us p80={bf16[2]:.3f}us "
+            f"speedup={bf16[0] / mxfp8[0]:.3f}x"
+        )
+
+    report(
+        "prefill",
+        f"sq={prefill_s_q} sk={s_kv} topk={topk}",
+        mxfp8_prefill,
+        bf16_prefill,
+    )
+    report(
+        "decode",
+        f"sq={decode_s_q} sk={s_kv} topk={topk}",
+        mxfp8_decode,
+        bf16_decode,
+    )
 
 
 def _gather_reference_inputs(
@@ -740,6 +896,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="benchmark MXFP8/BF16 prefill and decode at the large fixed shapes",
+    )
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument(
         "--one", "-o",
         action="store_true",
         help="use W=1 for KV generation, kernel arguments, and both Torch references",
@@ -769,6 +932,20 @@ def main() -> None:
         W_EXPONENTS_TWO_ANCHORS if args.two_anchors else W_EXPONENTS_SINGLE_ANCHOR
     )
     w_exponents = torch.zeros_like(base_w) if args.one else base_w
+    if args.benchmark:
+        if args.warmup < 0 or args.iterations <= 0:
+            raise ValueError("require --warmup >= 0 and --iterations > 0")
+        _benchmark_rank1(
+            ext,
+            bf16_ext,
+            bf16_decode_ext,
+            torch.device("cuda"),
+            w_exponents,
+            args.two_anchors,
+            args.warmup,
+            args.iterations,
+        )
+        return
     run_prefill(ext, torch.device("cuda"), w_exponents, bf16_ext, args.two_anchors)
     run_decode(
         ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext, args.two_anchors

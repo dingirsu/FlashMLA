@@ -192,7 +192,7 @@ struct SparseAttnMxfp8DecodeParams {
 
 // Dual MXFP8 head64 decode parameters. This is intentionally separate from
 // SparseAttnMxfp8DecodeParams: the dual kernel has no rank-1 kv_scale_w input
-// and accepts the eight V dimension scale bytes packed into w1/w2.
+// and accepts the V dimension scales pre-expanded into TMEM words.
 struct SparseAttnDualMxfp8DecodeParams {
     int b, s_q;
     int h_q, h_kv;
@@ -203,7 +203,7 @@ struct SparseAttnDualMxfp8DecodeParams {
 
     void* __restrict__ q;
     void* __restrict__ kv;
-    uint32_t w1, w2;
+    uint32_t w1[8], w2[8];
     int* __restrict__ indices;
     int* __restrict__ topk_length;
     float* __restrict__ attn_sink;
@@ -366,9 +366,9 @@ struct MxFp8SparseAttnFwdParams {
     int num_sm;
     cudaStream_t stream;
 
-    // Dual-MXFP8 V dimension scales. Each uint32 carries four packed UE8M0
-    // bytes in little-endian order: w1=[g0..g3], w2=[g4..g7].
-    uint32_t w1, w2;
+    // Dual-MXFP8 V dimension scales, pre-expanded for direct TMEM stores.
+    // Each word repeats one UE8M0 byte four times; adjacent columns share it.
+    uint32_t w1[8], w2[8];
 };
 
 struct Head64Fp8SparseAttnFwdParams {

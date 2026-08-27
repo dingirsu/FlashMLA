@@ -1,6 +1,7 @@
 #include <optional>
 #include <vector>
 
+#include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include "api/common.h"
@@ -15,8 +16,8 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
-    uint32_t w1,
-    uint32_t w2,
+    const std::vector<uint32_t>& w1,
+    const std::vector<uint32_t>& w2,
     const std::optional<at::Tensor>& attn_sink,
     const std::optional<at::Tensor>& topk_length
 ) {
@@ -53,6 +54,8 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
                 "kv must provide a 528-byte envelope per token for replicated page-tail scales");
     TORCH_CHECK(topk > 0 && topk % 64 == 0,
                 "topk must be a positive multiple of 64");
+    TORCH_CHECK(w1.size() == 8 && w2.size() == 8,
+                "w1 and w2 must each contain 8 pre-expanded TMEM scale words");
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -98,8 +101,12 @@ std::vector<at::Tensor> dual_mxfp8_head64_sparse_prefill_interface(
         lse.data_ptr<float>(),
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream(),
-        w1, w2
+        {}, {}
     };
+    for (int i = 0; i < 8; ++i) {
+        params.w1[i] = w1[i];
+        params.w2[i] = w2[i];
+    }
 
     sm100::dual_mxfp8::head64::run_dual_mxfp8_phase1_kernel<
         SparseAttnFwdMode::Prefill, 512

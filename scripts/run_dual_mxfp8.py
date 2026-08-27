@@ -5,7 +5,7 @@ Q and K use one real UE8M0 scale per 64 values. Their eight scale bytes are
 replicated into 16-byte input slots. K reuses each scale for two K=32 MMAs by
 selecting the tcgen05 scale-factor ID explicitly.
 S is multiplied by each token's first K UE8M0 scale before conversion to
-E4M3. V uses eight 64-D UE8M0 scales packed into the w1/w2 uint32 arguments.
+E4M3. V uses eight 64-D UE8M0 scales pre-expanded into w1/w2 TMEM words.
 """
 
 from __future__ import annotations
@@ -46,9 +46,12 @@ K_SCALE_SLOT_BYTES = 16
 V_SCALE_EXPONENTS = (0, 1, 2, 3, -1, -2, -3, -4)
 
 
-def pack_e8m0x4_as_uint32(scale_bits: tuple[int, int, int, int]) -> int:
-    """Bit-pack four little-endian UE8M0 bytes into one uint32 argument."""
-    return int.from_bytes(bytes(scale_bits), byteorder="little", signed=False)
+def expand_e8m0x4_to_tmem_words(
+    scale_bits: tuple[int, int, int, int]
+) -> list[int]:
+    """Expand four UE8M0 bytes into eight direct TMEM-store words."""
+    words = [bit * 0x01010101 for bit in scale_bits]
+    return [word for word in words for _ in range(2)]
 
 
 def load_extension():
@@ -281,8 +284,8 @@ def run_case(
     )
     sm_scale = D_HEAD**-0.5
     v_scale_bits = tuple(exponent + 127 for exponent in V_SCALE_EXPONENTS)
-    w1 = pack_e8m0x4_as_uint32(v_scale_bits[:4])
-    w2 = pack_e8m0x4_as_uint32(v_scale_bits[4:])
+    w1 = expand_e8m0x4_to_tmem_words(v_scale_bits[:4])
+    w2 = expand_e8m0x4_to_tmem_words(v_scale_bits[4:])
     v_scale_w = torch.exp2(
         torch.tensor(V_SCALE_EXPONENTS, device=device, dtype=torch.float32)
     )

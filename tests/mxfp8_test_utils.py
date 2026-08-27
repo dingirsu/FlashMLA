@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -17,6 +17,14 @@ def pack_e8m0x4_as_uint32(scales: torch.Tensor) -> int:
     bits = scales.detach().to(device="cpu", dtype=torch.uint8).tolist()
     assert len(bits) == 4
     return int.from_bytes(bytes(bits), byteorder="little", signed=False)
+
+
+def expand_e8m0x4_to_tmem_words(scales: Sequence[int] | torch.Tensor) -> list[int]:
+    """Expand four UE8M0 bytes into eight direct TMEM-store words."""
+    bits = torch.as_tensor(scales, device="cpu", dtype=torch.uint8).tolist()
+    assert len(bits) == 4
+    words = [int(bit) * 0x01010101 for bit in bits]
+    return [word for word in words for _ in range(2)]
 
 
 def require_sm100_family() -> None:

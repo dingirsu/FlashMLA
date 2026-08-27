@@ -13,7 +13,7 @@ from mxfp8_test_utils import (
     pack_dual_decode_kv_pages_rank1,
     make_indices,
     pack_dual_q64,
-    pack_e8m0x4_as_uint32,
+    expand_e8m0x4_to_tmem_words,
     require_sm100_family,
 )
 
@@ -38,8 +38,8 @@ def test_mxfp8_sparse_decode_head64_precision() -> None:
         pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
     )
     w_bits = w_scale.view(torch.uint8).cpu()
-    w1 = pack_e8m0x4_as_uint32(w_bits[:4])
-    w2 = pack_e8m0x4_as_uint32(w_bits[4:])
+    w1 = expand_e8m0x4_to_tmem_words(w_bits[:4])
+    w2 = expand_e8m0x4_to_tmem_words(w_bits[4:])
     indices, topk_length = make_indices(b, topk, s_kv, device)
     indices = indices.unsqueeze(1)
     attn_sink = torch.linspace(-1.0, 1.0, h_q, device=device, dtype=torch.float32)
@@ -89,8 +89,8 @@ def test_mxfp8_sparse_decode_head64_multitile_precision() -> None:
         pack_dual_decode_kv_pages_rank1(kv, w_exponents=w_exponents)
     )
     w_bits = w_scale.view(torch.uint8).cpu()
-    w1 = pack_e8m0x4_as_uint32(w_bits[:4])
-    w2 = pack_e8m0x4_as_uint32(w_bits[4:])
+    w1 = expand_e8m0x4_to_tmem_words(w_bits[:4])
+    w2 = expand_e8m0x4_to_tmem_words(w_bits[4:])
     indices = torch.stack(
         [torch.randperm(s_kv, device=device)[:topk] for _ in range(b)]
     ).to(torch.int32).unsqueeze(1)

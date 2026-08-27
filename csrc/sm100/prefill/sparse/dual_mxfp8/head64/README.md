@@ -14,6 +14,10 @@ UE8M0 scale slot 布局。当前实现不区分 NoPE 和 RoPE，Q/K head dimensi
 - S 在转换为 E4M3 前乘以对应 K token 的 `k_sf0`，S 的 TMEM UE8M0
   scale 固定为 1。V 使用 `w1/w2` 提供的八个 64-D UE8M0 scale。
 
+V 的八个 64-D UE8M0 scale 在 Python/API 侧预展开为 8 个 TMEM store
+word（每个 byte 重复四次，连续两个 word 使用同一个 scale），kernel
+直接执行 TMEM copy，不再进行 byte shift 和乘法展开。
+
 量化可表示为：
 
 ```text

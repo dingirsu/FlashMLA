@@ -128,7 +128,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         fence_barrier_init();
     } else if (warp_idx == 2) {
         cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
-        KU_TRAP_ONLY_DEVICE_ASSERT(smem.tmem_start_addr.data()[0] == 0);
+        __syncwarp();
         cute::TMEM::Allocator2Sm().release_allocation_lock();
     } else if (warp_idx == 3 && elect_one_sync()) {
         CUTE_UNROLL
@@ -139,11 +139,13 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             // gather does not.
             smem.bar_KV_full[i].init(1);
             smem.bar_KV_empty[i].init(1);
-            // CTA0's MMA reads its local post-transpose source. Warp10 and
-            // warp11 in CTA0 publish the two completed copy streams; CTA1
-            // builds its own source for the cluster peer but does not need to
-            // increment CTA0's local barrier.
-            smem.bar_K_scale_copy_ready[i].init(2);
+            // CTA0 issues a 2-CTA UTCCP, so its barrier must collect warp10
+            // and warp11 from both CTAs before either SMEM source is read.
+            smem.bar_K_scale_copy_ready[i].init(4);
+            // Warp10/11 publish one half each. All 128 softmax threads read
+            // their 32 token scales before the stage may be overwritten.
+            smem.bar_v_scale_full[i].init(2);
+            smem.bar_v_scale_empty[i].init(128);
             // The MMA completion releases this stage's scale source and is
             // also consumed by the softmax workers as QK-ready.
             smem.bar_QK_done[i].init(1);
@@ -885,6 +887,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         // the previous QK MMA has released this stage before
                         // cp.async starts writing it again.
                         smem.bar_QK_done[k_buf_idx].wait(k_bar_phase ^ 1);
+                        smem.bar_v_scale_empty[k_buf_idx].wait(k_bar_phase ^ 1);
 
                         const int row = scale_warp * (B_TOPK / 2) + lane_idx;
                         const int* g_indices = params.indices
@@ -935,9 +938,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         fence_view_async_shared();
                         __syncwarp();
                         if (elect_one_sync()) {
-                            if (cta_idx == 0) {
-                                smem.bar_K_scale_copy_ready[k_buf_idx].arrive();
-                            }
+                            smem.bar_v_scale_full[k_buf_idx].arrive();
+                            smem.bar_K_scale_copy_ready[k_buf_idx].arrive(0u);
                         }
                         scale_rs.update();
                     }
@@ -967,6 +969,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         auto [index_buf_idx, index_bar_phase] = scale_rs.get<NUM_INDEX_BUFS>();
                         smem.bar_valid_coord_scales_full[index_buf_idx].wait(index_bar_phase);
                         smem.bar_QK_done[k_buf_idx].wait(k_bar_phase ^ 1);
+                        smem.bar_v_scale_empty[k_buf_idx].wait(k_bar_phase ^ 1);
 
                         const int row = scale_warp * (B_TOPK / 2) + lane_idx;
                         const bool token_valid =
@@ -1003,9 +1006,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         fence_view_async_shared();
                         __syncwarp();
                         if (elect_one_sync()) {
-                            if (cta_idx == 0) {
-                                smem.bar_K_scale_copy_ready[k_buf_idx].arrive();
-                            }
+                            smem.bar_v_scale_full[k_buf_idx].arrive();
+                            smem.bar_K_scale_copy_ready[k_buf_idx].arrive(0u);
                         }
                         scale_rs.update();
                     }
@@ -1087,6 +1089,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 // Calculate S
                 fp8_e4m3 s[NUM_ELEMS_PER_THREAD];
                 float cur_sum = 0.0f;
+                smem.bar_v_scale_full[k_buf_idx].wait(k_bar_phase);
                 // Each softmax thread owns one contiguous 32-token MMA-K
                 // group. Quantize that group independently; the resulting
                 // S scale is computed per K=32 atom and packed below for the
@@ -1105,6 +1108,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     s_abs_max = max(s_abs_max, scaled_s);
                     p[i] = scaled_s;
                 }
+                smem.bar_v_scale_empty[k_buf_idx].arrive();
                 // UE8M0 scales are powers of two. Round the scale upward so
                 // the normalized E4M3 values stay within the finite range.
                 float raw_s_scale = s_abs_max > 0.0f

@@ -146,6 +146,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_tOut_full, bar_tOut_empty;
     transac_bar_t bar_KV_full[NUM_K_BUFS], bar_KV_empty[NUM_K_BUFS];
     transac_bar_t bar_K_scale_copy_ready[NUM_K_BUFS];
+    transac_bar_t bar_v_scale_full[NUM_K_BUFS], bar_v_scale_empty[NUM_K_BUFS];
     transac_bar_t bar_P_empty;
     transac_bar_t bar_QK_done[NUM_K_BUFS], bar_SV_done;
     transac_bar_t bar_S_O_full;

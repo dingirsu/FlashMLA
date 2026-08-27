@@ -896,7 +896,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
-        "--benchmark",
+        "--benchmark", "-b",
         action="store_true",
         help="benchmark MXFP8/BF16 prefill and decode at the large fixed shapes",
     )
@@ -915,7 +915,7 @@ def main() -> None:
         help="use independent rank-1 U/W factors for the two 256-D halves (default)",
     )
     anchor_group.add_argument(
-        "--single-anchor",
+        "--single-anchor", "-s",
         dest="two_anchors",
         action="store_false",
         help="use one U factor and one W anchor for all 512 dimensions",

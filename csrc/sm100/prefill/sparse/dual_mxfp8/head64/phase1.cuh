@@ -167,20 +167,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         cute::TMEM::Allocator2Sm().release_allocation_lock();
     } 
 
-    // Store the complete V dimension-scale vector in each CTA's local TMEM.
-    // A 2x2 datapath selects DP0/1 for N[0,256) and DP2/3 for N[256,512).
-    // if (warpgroup_idx == 0) {
-    //     const uint32_t warp_dp_addr = tmem_cols::V_scale
-    //         + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
-    //     CUTE_UNROLL
-    //     for (int col = 0; col < 8; ++col) {
-    //         SM100_TMEM_STORE_32dp32b1x::copy(
-    //             warp_idx < 2 ? params.w1[col] : params.w2[col],
-    //             warp_dp_addr + col
-    //         );
-    //     }
-    //     cutlass::arch::fence_view_async_tmem_store();
-    // }
     ku::barrier_cluster_arrive_relaxed();
     ku::barrier_cluster_wait_acquire();
 
@@ -290,6 +276,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     if (warpgroup_idx == 0) {
         // Q fetching and O writing back warpgroup
         cutlass::arch::warpgroup_reg_alloc<176>();
+        const uint32_t warp_dp_addr = tmem_cols::V_scale
+            + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
+        CUTE_UNROLL
+        for (int col = 0; col < 8; ++col) {
+            SM100_TMEM_STORE_32dp32b1x::copy(
+                warp_idx < 2 ? params.w1[col] : params.w2[col],
+                warp_dp_addr + col
+            );
+        }
+        cutlass::arch::fence_view_async_tmem_store();
 
         bf16* sO_addrs[B_EPI/8];
         CUTE_UNROLL
@@ -930,7 +926,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         CpAsync4::copy(src[3], dst_hi_words[2], token_valid);
                         cute::cp_async_fence();
                         cute::cp_async_wait<0>();
-                        __syncwarp();
 
                         // The first copied byte is also the token multiplier
                         // applied to S before its E4M3 conversion.
@@ -1003,7 +998,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         __syncwarp();
 
                         smem.v_token_scale[k_buf_idx][row] =
-                            reinterpret_cast<const fp8_e8m0*>(dst_lo)[0];
+                            float(reinterpret_cast<const fp8_e8m0*>(dst_lo)[0]);
                         fence_view_async_shared();
                         __syncwarp();
                         if (elect_one_sync()) {
@@ -1105,7 +1100,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     // TMEM scale remains one, so this multiplication carries
                     // the token scale into the S operand itself.
                     const int token = s_col_base + i;
-                    float scaled_s = s_value * float(smem.v_token_scale[k_buf_idx][token]);
+                    float scaled_s = s_value * smem.v_token_scale[k_buf_idx][token];
                     s_abs_max = max(s_abs_max, scaled_s);
                     p[i] = scaled_s;
                 }
@@ -1120,8 +1115,18 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 constexpr float S_SCALE_EPS = 1.0e-20f;
                 float s_scale = 1.0f / max(float(s_scale_exp_e8m0), S_SCALE_EPS);
                 s_scale_exp_e8m0 = fp8_e8m0(1.0f / s_scale);
-                for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                    s[i] = fp8_e4m3(p[i] * s_scale);
+                const float2 scale2 = make_float2(s_scale, s_scale);
+
+                CUTE_UNROLL
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 2) {
+                    float2 x = *reinterpret_cast<const float2*>(p + i);
+                    x = ku::float2_mul(x, scale2);
+
+                    *reinterpret_cast<__nv_fp8x2_storage_t*>(s + i) = __nv_cvt_float2_to_fp8x2(
+                            x,
+                            __NV_SATFINITE,
+                            __NV_E4M3
+                        );;
                 }
                 li = fmaf(li, scale_for_old, cur_sum);
 
@@ -1141,12 +1146,13 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 );
                 cutlass::arch::fence_view_async_tmem_store();
                 CUTE_UNROLL
-                for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
-                    fp8_e4m3* sS_base = &sS_store(
-                        s_row, s_col_base + i * 8
+                CUTE_UNROLL
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD / 16; ++i) {
+                    fp8_e4m3* sS_base = &sS_store(s_row, s_col_base + i * 16);
+                    ku::st_shared(
+                        sS_base,
+                        *reinterpret_cast<__int128_t*>(s + i * 16)
                     );
-                    *reinterpret_cast<uint64_t*>(sS_base) =
-                        *reinterpret_cast<uint64_t*>(s + i*8);
                 }
 
                 // Rescale O

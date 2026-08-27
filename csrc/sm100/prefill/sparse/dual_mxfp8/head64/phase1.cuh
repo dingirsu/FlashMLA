@@ -117,8 +117,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         smem.bar_tOut_full.init(1);
         smem.bar_tOut_empty.init(256);
         smem.bar_P_empty.init(256);
-        smem.bar_SV_done.init(1);
-        smem.bar_S_O_full.init(256);
+        CUTE_UNROLL
+        for (int i = 0; i < 2; ++i) {
+            smem.bar_S_empty[i].init(1);
+            smem.bar_S_O_full[i].init(256);
+        }
         smem.bar_li_full.init(H_Q/2);
         smem.bar_li_empty.init(128);
         if constexpr (FWD_MODE != FwdMode::DecodeWithSplitKV) {
@@ -737,14 +740,14 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 // Issue O += S V
                 auto issue_O = [&](int k, int rs_offset) {
                     auto [k_buf_idx, k_bar_phase] = rs.offset_by(rs_offset).get<NUM_K_BUFS>();
-                    auto [_, bar_phase] = rs.offset_by(rs_offset).get<1>();
-                    smem.bar_S_O_full.wait(bar_phase);
+                    auto [s_buf_idx, s_bar_phase] = rs.offset_by(rs_offset).get<2>();
+                    smem.bar_S_O_full[s_buf_idx].wait(s_bar_phase);
                     if (k == args.start_block_idx) {
                         smem.bar_tOut_empty.wait(args.outer_loop_phase^1);
                     }
                     ku::tcgen05_after_thread_sync();
                     Tensor sS = make_tensor(
-                        make_smem_ptr(smem.S.data()),
+                        make_smem_ptr(smem.S[s_buf_idx].data()),
                         ku::make_umma_canonical_k_major_layout<H_Q/2, B_TOPK, 0, fp8_e4m3>()
                     );
                     Tensor sV = make_tensor(
@@ -753,15 +756,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     );
                     Tensor tS_scale = make_tensor<typename TiledMMA_O::FrgTypeSFA>(shape(SmemLayoutOScaleA{}));
                     Tensor tV_scale = make_tensor<typename TiledMMA_O::FrgTypeSFB>(shape(SmemLayoutOScaleB{}));
-                    tS_scale.data().get() = tmem_cols::S_scale;
+                    const uint32_t s_scale_col = tmem_cols::S_scale
+                        + s_buf_idx * tmem_cols::S_scale_stride;
+                    tS_scale.data().get() = s_scale_col;
                     tV_scale.data().get() = tmem_cols::V_scale;
                     ku::utcmma_blockscaled_ss_explicit_sfb(
                         tiled_mma_O, sS, sV,
-                        tmem_cols::S_scale, tmem_cols::V_scale,
+                        s_scale_col, tmem_cols::V_scale,
                         tmem_cols::V_scale_n_stride,
                         tO, k == args.start_block_idx
                     );
-                    ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_SV_done, 1|2);
+                    ku::umma_arrive_multicast_2x1SM_noelect(
+                        smem.bar_S_empty[s_buf_idx], 1|2
+                    );
                     ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_KV_empty[k_buf_idx], 1|2);
                 };
 
@@ -1030,12 +1037,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
         cutlass::arch::warpgroup_reg_alloc<176>();
 
         int local_warp_idx = warp_idx - 12;
-        Tensor sS_store = make_tensor(
-            make_smem_ptr(smem.S.data()),
-            ku::make_umma_canonical_k_major_layout<
-                H_Q/2, B_TOPK, 0, fp8_e4m3
-            >()
-        );
         int s_row = idx_in_warpgroup % (H_Q/2);
         int s_col_base = (local_warp_idx >= 2 ? B_TOPK/2 : 0);
 
@@ -1051,7 +1052,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             for (int k = args.start_block_idx; k < args.end_block_idx; ++k) {
                 auto [k_buf_idx, k_bar_phase] = rs.get<NUM_K_BUFS>();
                 auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDEX_BUFS>();
-                auto [_, bar_phase] = rs.get<1>();
+                auto [s_buf_idx, s_bar_phase] = rs.get<2>();
                 // NOTE We don't need to sync for Prefill mode, since we have two synchronizations inside the loop body (one for p_exchange_buf sync, another one for rowwise_max_buf sync). The latter one guarantees the emptyness of p_exchange_buf and the former one guarantees the emptyness of rowwise_max_buf
                 smem.bar_valid_coord_scales_full[indices_buf_idx].wait(indices_bar_phase);
 
@@ -1147,15 +1148,18 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
-                smem.bar_SV_done.wait(bar_phase^1);
+                smem.bar_S_empty[s_buf_idx].wait(s_bar_phase^1);
+                Tensor sS_store = make_tensor(
+                    make_smem_ptr(smem.S[s_buf_idx].data()),
+                    ku::make_umma_canonical_k_major_layout<
+                        H_Q/2, B_TOPK, 0, fp8_e4m3
+                    >()
+                );
                 smem.s_scale_exp[k_buf_idx][s_row][local_warp_idx >= 2 ? 1 : 0] =
                     s_scale_exp_e8m0.storage;
                 NamedBarrier::arrive_and_wait(128, barrier_ids::S_SCALE_SYNC);
-                // Publish the per-row S scale only after the previous O MMA
-                // has released this stage.  S_scale is a single TMEM buffer,
-                // so writing it earlier would race with issue_O(k-1).
                 store_s_scale_to_tmem(
-                    tmem_cols::S_scale,
+                    tmem_cols::S_scale + s_buf_idx * tmem_cols::S_scale_stride,
                     local_warp_idx,
                     smem.s_scale_exp[k_buf_idx][s_row][0],
                     smem.s_scale_exp[k_buf_idx][s_row][1]
@@ -1173,13 +1177,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
 
                 // Rescale O
                 if (k > args.start_block_idx && should_scale_o) {
+                    auto [prev_k_buf_idx, prev_k_bar_phase] =
+                        rs.offset_by(-1).get<NUM_K_BUFS>();
+                    // The previous SV completion releases its K/V stage. Use
+                    // that same event to keep the in-place O rescale ordered
+                    // after the asynchronous accumulator update.
+                    smem.bar_KV_empty[prev_k_buf_idx].wait(prev_k_bar_phase);
                     ku::tcgen05_after_thread_sync();
                     rescale_O<D_V, 32, tmem_cols::O>(scale_for_old);
                     ku::tcgen05_before_thread_sync();
                 }
 
                 fence_view_async_shared();
-                smem.bar_S_O_full.arrive(0u);
+                smem.bar_S_O_full[s_buf_idx].arrive(0u);
                 smem.bar_valid_coord_scales_empty[indices_buf_idx].arrive();
 
                 rs.update();

@@ -109,12 +109,14 @@ static_assert((H_Q/2)*D_Q*sizeof(bf16) >= NUM_EPI_SPLITKV_BUFS*(H_Q/2)*(B_EPI_SP
 struct tmem_cols {
     //   0 ~ 256: Output accumulator
     // 256 ~ 384: The two M-tiled P fragments (at 256 and 320)
-    // 448 ~ 480: Q/K/S/V scale factors
+    // 384 ~ 392: Double-buffered S scale factors
+    // 448 ~ 512: Q/K/V scale factors
     static constexpr int O = 0;
     static constexpr int P = 256;
+    static constexpr int S_scale = 384;
+    static constexpr int S_scale_stride = 4;
     static constexpr int Q_scale = 448;
     static constexpr int K_scale = 480;
-    static constexpr int S_scale = 496;
     static constexpr int V_scale = 500;
     static constexpr int V_scale_n_stride = 4;
 };
@@ -123,7 +125,7 @@ struct SharedMemoryPlan {
     // Q is reused by the BF16 output epilogue after the final MMA.
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
-    array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S;
+    array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S[2];
     CUTE_ALIGNAS(16) float v_token_scale[NUM_K_BUFS][B_TOPK];
     // One S scale per softmax row and per K=32 atom in the 64-token tile.
     // The two bytes are packed into one TMEM scale word before O MMA.
@@ -145,8 +147,8 @@ struct SharedMemoryPlan {
     transac_bar_t bar_K_scale_copy_ready[NUM_K_BUFS];
     transac_bar_t bar_v_scale_full[NUM_K_BUFS], bar_v_scale_empty[NUM_K_BUFS];
     transac_bar_t bar_P_empty;
-    transac_bar_t bar_QK_done[NUM_K_BUFS], bar_SV_done;
-    transac_bar_t bar_S_O_full;
+    transac_bar_t bar_QK_done[NUM_K_BUFS];
+    transac_bar_t bar_S_empty[2], bar_S_O_full[2];
     transac_bar_t bar_li_full, bar_li_empty;
 
     // The following barriers are prefill-only

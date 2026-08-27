@@ -126,10 +126,6 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             smem.bar_clc_empty.init(NUM_WORKER_THREADS);
         }
         fence_barrier_init();
-    } else if (warp_idx == 2) {
-        cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
-        __syncwarp();
-        cute::TMEM::Allocator2Sm().release_allocation_lock();
     } else if (warp_idx == 3 && elect_one_sync()) {
         CUTE_UNROLL
         for (int i = 0; i < NUM_K_BUFS; ++i) {
@@ -165,21 +161,26 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
     ku::barrier_cluster_arrive_relaxed();
     ku::barrier_cluster_wait_acquire();
 
+    if (warp_idx == 2) {
+        cute::TMEM::Allocator2Sm().allocate(512, smem.tmem_start_addr.data());
+        __syncwarp();
+        cute::TMEM::Allocator2Sm().release_allocation_lock();
+    } 
 
     // Store the complete V dimension-scale vector in each CTA's local TMEM.
     // A 2x2 datapath selects DP0/1 for N[0,256) and DP2/3 for N[256,512).
-    if (warpgroup_idx == 0) {
-        const uint32_t warp_dp_addr = tmem_cols::V_scale
-            + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
-        CUTE_UNROLL
-        for (int col = 0; col < 8; ++col) {
-            SM100_TMEM_STORE_32dp32b1x::copy(
-                warp_idx < 2 ? params.w1[col] : params.w2[col],
-                warp_dp_addr + col
-            );
-        }
-        cutlass::arch::fence_view_async_tmem_store();
-    }
+    // if (warpgroup_idx == 0) {
+    //     const uint32_t warp_dp_addr = tmem_cols::V_scale
+    //         + warp_idx * 32 * cute::TMEM::DP<uint32_t>::value;
+    //     CUTE_UNROLL
+    //     for (int col = 0; col < 8; ++col) {
+    //         SM100_TMEM_STORE_32dp32b1x::copy(
+    //             warp_idx < 2 ? params.w1[col] : params.w2[col],
+    //             warp_dp_addr + col
+    //         );
+    //     }
+    //     cutlass::arch::fence_view_async_tmem_store();
+    // }
     ku::barrier_cluster_arrive_relaxed();
     ku::barrier_cluster_wait_acquire();
 
@@ -1128,7 +1129,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 smem.bar_SV_done.wait(bar_phase^1);
                 smem.s_scale_exp[k_buf_idx][s_row][local_warp_idx >= 2 ? 1 : 0] =
                     s_scale_exp_e8m0.storage;
-                NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_WARP02_SYNC);
+                NamedBarrier::arrive_and_wait(128, barrier_ids::S_SCALE_SYNC);
                 // Publish the per-row S scale only after the previous O MMA
                 // has released this stage.  S_scale is a single TMEM buffer,
                 // so writing it earlier would race with issue_O(k-1).

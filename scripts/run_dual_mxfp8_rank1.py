@@ -469,12 +469,29 @@ def _benchmark_rank1(
     mxfp8_decode = _benchmark_cuda_us(launch_mxfp8_decode, warmup, iterations)
     bf16_decode = _benchmark_cuda_us(launch_bf16_decode, warmup, iterations)
 
-    def report(name: str, shape: str, mxfp8: Tuple[float, float, float], bf16: Tuple[float, float, float]):
+    # The standalone BF16 helper intentionally runs one unsplit partition,
+    # while the dual-MXFP8 API uses all available SM partitions for this
+    # workload. Keep the numbers visible, but do not present their ratio as a
+    # like-for-like decode speedup.
+    print(
+        "NOTE decode comparison is not apples-to-apples: "
+        "dual MXFP8 uses split-KV across num_sm_parts, "
+        "BF16 helper uses one unsplit partition"
+    )
+
+    def report(
+        name: str,
+        shape: str,
+        mxfp8: Tuple[float, float, float],
+        bf16: Tuple[float, float, float],
+        comparable: bool = True,
+    ):
+        speedup = f"{bf16[0] / mxfp8[0]:.3f}x" if comparable else "n/a"
         print(
             f"BENCH {name} {shape} "
             f"MXFP8 median={mxfp8[0]:.3f}us p20={mxfp8[1]:.3f}us p80={mxfp8[2]:.3f}us "
             f"BF16 median={bf16[0]:.3f}us p20={bf16[1]:.3f}us p80={bf16[2]:.3f}us "
-            f"speedup={bf16[0] / mxfp8[0]:.3f}x"
+            f"speedup={speedup}"
         )
 
     report(
@@ -488,6 +505,7 @@ def _benchmark_rank1(
         f"sq={decode_s_q} sk={s_kv} topk={topk}",
         mxfp8_decode,
         bf16_decode,
+        comparable=False,
     )
 
 

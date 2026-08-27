@@ -69,7 +69,8 @@ template<
     int TMEM_COL_START,
     int BARRIER_WARP02_SYNC_ID,
     int BARRIER_WARP13_SYNC_ID,
-    bool STORE_BACK_P
+    bool STORE_BACK_P,
+    int SECOND_M_TILE_OFFSET = 0
 >
 CUTE_DEVICE
 void retrieve_mask_and_reduce_p(
@@ -89,8 +90,8 @@ void retrieve_mask_and_reduce_p(
         ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START, p);
         ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START + NUM_ELEMS_PER_THREAD, p_peer);
     } else {
-        ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START, p_peer);
-        ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START + NUM_ELEMS_PER_THREAD, p);
+        ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START + SECOND_M_TILE_OFFSET, p_peer);
+        ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(TMEM_COL_START + SECOND_M_TILE_OFFSET + NUM_ELEMS_PER_THREAD, p);
     }
     cutlass::arch::fence_view_async_tmem_load();
     ku::tcgen05_before_thread_sync();

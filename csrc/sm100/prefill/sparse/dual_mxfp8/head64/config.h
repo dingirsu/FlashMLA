@@ -108,12 +108,10 @@ static_assert((H_Q/2)*D_Q*sizeof(bf16) >= NUM_EPI_SPLITKV_BUFS*(H_Q/2)*(B_EPI_SP
 // Tensor memory columns
 struct tmem_cols {
     //   0 ~ 256: Output accumulator
-    // 256 ~ 384: Q (512 E4M3 values in the duplicated TS layout)
-    // 384 ~ 448: P
+    // 256 ~ 384: The two M-tiled P fragments (at 256 and 320)
     // 448 ~ 480: Q/K/S/V scale factors
     static constexpr int O = 0;
-    static constexpr int Q = 256;
-    static constexpr int P = 384;
+    static constexpr int P = 256;
     static constexpr int Q_scale = 448;
     static constexpr int K_scale = 480;
     static constexpr int S_scale = 496;
@@ -138,7 +136,6 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) char is_k_valid[NUM_INDEX_BUFS][B_TOPK/8];
     CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) int64_t k_scale_offset[NUM_INDEX_BUFS][B_TOPK];
-    CUTE_ALIGNAS(16) fp8_e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN/2];
     
     transac_bar_t bar_sQ_full;
     transac_bar_t bar_Q_scale_ready;
@@ -163,8 +160,8 @@ struct SharedMemoryPlan {
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_2x1SM_TS_NOELECT<fp8_e4m3, fp8_e4m3, float, fp8_e8m0, H_Q, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
-)); // *2 for dual gemm
+    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, fp8_e8m0, H_Q, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
+)); // *2 for dual gemm; Q and K both stay in SMEM
 
 using TiledMMA_O = decltype(make_tiled_mma(
     SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, fp8_e8m0, H_Q, 256, UMMA::Major::K, UMMA::Major::MN>{},

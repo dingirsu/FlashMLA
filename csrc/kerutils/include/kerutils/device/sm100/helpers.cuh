@@ -85,6 +85,63 @@ void utcmma_blockscaled_ss(
     }
 }
 
+// Perform SS UTCMMA with explicit UE8M0 byte selectors. A keeps its existing
+// K=32 scale packing, while BScaleGroupSize controls how many consecutive
+// K=32 instructions reuse each B scale byte.
+template<
+    int BScaleGroupSize,
+    typename TiledMMA,
+    typename TensorA,
+    typename TensorB,
+    typename TensorSFA,
+    typename TensorSFB,
+    typename TensorFragC
+>
+CUTE_DEVICE
+void utcmma_blockscaled_ss_explicit_sf_ids(
+    TiledMMA &tiled_mma,
+    TensorA sA,
+    TensorB sB,
+    TensorSFA tSFA_frag,
+    TensorSFB tSFB_frag,
+    TensorFragC tC_frag,
+    bool clear_accum
+) {
+    using namespace cute;
+    static_assert(BScaleGroupSize >= 32 && BScaleGroupSize % 32 == 0);
+    constexpr int BScaleReuse = BScaleGroupSize / 32;
+    tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
+    ThrMMA thr_mma = tiled_mma.get_slice(_0{});
+    auto sA_frag = thr_mma.partition_fragment_A(sA);
+    auto sB_frag = thr_mma.partition_fragment_B(sB);
+    static_assert(size<2>(sA_frag) == size<2>(sB_frag));
+    static_assert(size<1>(sA_frag) == size<1>(tC_frag));
+    static_assert(size<1>(sB_frag) == size<2>(tC_frag));
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(sA_frag); ++k) {
+        uint32_t a_sf_id = uint32_t(k) & 3u;
+        uint32_t b_scale_idx = uint32_t(k) / BScaleReuse;
+        uint32_t b_sf_id = b_scale_idx & 3u;
+        int b_word_k = int(b_scale_idx & ~3u) * BScaleReuse;
+        auto tSFA = tSFA_frag(_, _, k);
+        auto tSFB = tSFB_frag(_, _, b_word_k);
+        auto tiled_mma_with_scale = tiled_mma.with(
+            tiled_mma.accumulate_,
+            raw_pointer_cast(tSFA.data()) & 0x3fffffffu,
+            raw_pointer_cast(tSFB.data()) & 0x3fffffffu,
+            a_sf_id,
+            b_sf_id
+        );
+        cute::gemm(
+            tiled_mma_with_scale,
+            sA_frag(_, _, k),
+            sB_frag(_, _, k),
+            tC_frag
+        );
+        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+    }
+}
+
 // Perform a 2x2-datapath SS UTCMMA with an explicitly padded SFB allocation.
 // Each N=128 atom gets its own four-column-aligned scale tile; consecutive
 // K=32 atoms select successive bytes in the same TMEM words.
@@ -112,9 +169,6 @@ void utcmma_blockscaled_ss_explicit_sfb(
     static_assert(size<2>(sA_frag) == size<2>(sB_frag));
     static_assert(size<1>(sA_frag) == size<1>(tC_frag));
     static_assert(size<1>(sB_frag) == size<2>(tC_frag));
-    static_assert(size<2>(sA_frag) == Int<2>{});
-    static_assert(size<1>(sB_frag) == Int<2>{});
-
     CUTE_UNROLL
     for (int k = 0; k < size<2>(sA_frag); ++k) {
         CUTE_UNROLL
@@ -126,8 +180,8 @@ void utcmma_blockscaled_ss_explicit_sfb(
                 accumulate,
                 tmem_sfa_addr,
                 tmem_sfb_addr + uint32_t(n) * tmem_sfb_n_stride,
-                uint32_t(k),
-                uint32_t(k)
+                uint32_t(k) & 3u,
+                uint32_t(k) & 3u
             );
             auto tC_atom = tC_frag(_, 0, n);
             auto sA_atom = sA_frag(_, 0, k);

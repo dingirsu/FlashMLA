@@ -130,6 +130,8 @@ def _make_rank1_storage(
     seed: int,
     w_exponents: torch.Tensor,
     two_anchors: bool,
+    force_data_one: bool = False,
+    force_scale_one: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return raw data bytes, replicated scale slots, dequantized KV, U, FP8."""
     generator = torch.Generator(device=device)
@@ -170,8 +172,14 @@ def _make_rank1_storage(
         (product_scale.view(torch.uint8), product_scale.view(torch.uint8)), dim=-1
     )
     data_bytes = fp8.view(torch.uint8)
+    if force_data_one:
+        data_bytes = torch.full_like(data_bytes, 0x38)  # E4M3 +1.0
+    if force_scale_one:
+        scale_slots = torch.full_like(scale_slots, 127)  # UE8M0 1.0
     u_scale = torch.exp2(u_exp.float())
-    dequant = fp8.float() * product_scale.float().repeat_interleave(KV_GROUP_SIZE, dim=-1)
+    raw_fp8 = data_bytes.view(torch.float8_e4m3fn).float()
+    raw_scale = scale_slots[..., :8].view(torch.float8_e8m0fnu).float()
+    dequant = raw_fp8 * raw_scale.repeat_interleave(KV_GROUP_SIZE, dim=-1)
     # The 528-byte interface envelope represents a page's average stride.  The
     # physical allocation is [all data rows][all 16-byte scale slots].
     expected_product = torch.cat(
@@ -181,8 +189,11 @@ def _make_rank1_storage(
         ),
         dim=1,
     )
-    torch.testing.assert_close(product_scale.float(), expected_product, atol=0, rtol=0)
-    return data_bytes, scale_slots, dequant, u_scale, fp8.float()
+    if not force_data_one and not force_scale_one:
+        torch.testing.assert_close(product_scale.float(), expected_product, atol=0, rtol=0)
+    if force_scale_one:
+        u_scale = torch.ones_like(u_scale)
+    return data_bytes, scale_slots, dequant, u_scale, raw_fp8
 
 
 def _pack_page_storage(
@@ -210,7 +221,21 @@ def _pack_prefill_storage(
     return flat.view(data_bytes.shape[0], 1, KV_RECORD_BYTES)
 
 
-def _make_prefill_q(s_q: int, device: torch.device, seed: int):
+def _decode_packed_q(packed: torch.Tensor) -> torch.Tensor:
+    data = packed[..., :D_HEAD].view(torch.float8_e4m3fn)
+    scales = packed[..., D_HEAD : D_HEAD + 8].view(torch.float8_e8m0fnu).float()
+    grouped = data.float().reshape(*data.shape[:-1], D_HEAD // 64, 2, 32)
+    grouped = grouped * scales[..., :, None, None]
+    return grouped.transpose(-3, -2).reshape(*packed.shape[:-1], D_HEAD).float()
+
+
+def _make_prefill_q(
+    s_q: int,
+    device: torch.device,
+    seed: int,
+    force_data_one: bool = False,
+    force_scale_one: bool = False,
+):
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     q = torch.randn((s_q, H_Q, D_HEAD), device=device, generator=generator) * 0.25
@@ -218,7 +243,27 @@ def _make_prefill_q(s_q: int, device: torch.device, seed: int):
     # dequantized result.
     from mxfp8_test_utils import pack_dual_q64
 
-    return pack_dual_q64(q)
+    packed, _ = pack_dual_q64(q)
+    q_block_values = os.environ.get("DUAL_MXFP8_Q_BLOCK_VALUES")
+    if q_block_values:
+        values = [float(value) for value in q_block_values.split(",")]
+        if len(values) != 4:
+            raise ValueError("DUAL_MXFP8_Q_BLOCK_VALUES requires four comma-separated values")
+        block_values = torch.tensor(
+            values, device=device, dtype=torch.float8_e4m3fn
+        ).view(torch.uint8)
+        packed[..., :D_HEAD] = block_values.repeat_interleave(128)
+    if force_data_one:
+        packed[..., :D_HEAD].fill_(0x38)  # E4M3 +1.0
+    if force_scale_one:
+        packed[..., D_HEAD:].fill_(127)  # UE8M0 1.0
+    q_dequant = _decode_packed_q(packed)
+    if os.environ.get("DUAL_MXFP8_REORDER_Q_BLOCKS") == "1":
+        q_blocks = packed[..., :D_HEAD].reshape(*packed.shape[:-1], 4, 128)
+        packed[..., :D_HEAD] = q_blocks[..., [0, 2, 1, 3], :].reshape(
+            *packed.shape[:-1], D_HEAD
+        )
+    return packed, q_dequant
 
 
 def _make_indices(rows: int, topk: int, s_kv: int, device: torch.device, seed: int):
@@ -767,17 +812,170 @@ def _cutlass_flow_reference(
 
 
 @torch.inference_mode()
+def _run_repeated_k_qk(
+    ext,
+    packed_q: torch.Tensor,
+    k_row: torch.Tensor,
+) -> torch.Tensor:
+    """Return reduced QK from LSE when all 64 selected K rows are identical."""
+    s_q, s_kv, topk = 2, 64, 64
+    if k_row.shape != (D_HEAD,) or k_row.dtype != torch.uint8:
+        raise ValueError("k_row must be one 512-byte E4M3 row")
+    data_bytes = k_row[None, :].expand(s_kv, -1).contiguous()
+    scale_slots = torch.full(
+        (s_kv, KV_SCALE_SLOT_BYTES), 127, device=k_row.device, dtype=torch.uint8
+    )
+    packed_kv = _pack_prefill_storage(data_bytes, scale_slots)
+    indices = torch.zeros(
+        (s_q // 2, 1, topk), device=k_row.device, dtype=torch.int32
+    )
+    zero_w = torch.zeros(8, dtype=torch.int32)
+    w1, w2, _ = _w_arguments(k_row.device, zero_w, True)
+    _, _, actual_lse = ext.dual_mxfp8_head64_sparse_prefill_fwd(
+        packed_q,
+        packed_kv,
+        indices,
+        SM_SCALE,
+        w1,
+        w2,
+        None,
+        None,
+    )
+    return (
+        actual_lse.float().reshape(s_q, H_Q) - math.log(topk)
+    ) / SM_SCALE
+
+
+def _qk_error(actual: torch.Tensor, expected: torch.Tensor) -> Tuple[float, float]:
+    error = (actual - expected).abs()
+    return error.max().item(), error.mean().item()
+
+
+@torch.inference_mode()
+def diagnose_qk_reduction(ext, device: torch.device) -> None:
+    """Separate QK atom mapping errors from reduced-P addressing errors."""
+    packed_q, q_dequant = _make_prefill_q(
+        2, device, 3101, force_scale_one=True
+    )
+    q_chunks = q_dequant.float().reshape(2, H_Q, D_HEAD // MMA_K, MMA_K)
+
+    # With K=1, every feature permutation gives the same dot product. Any
+    # discrepancy here is therefore in P row ownership/loading/reduction, not
+    # in the Q/K feature mapping used by the MMA.
+    k_one = torch.full((D_HEAD,), 0x38, device=device, dtype=torch.uint8)
+    reduction_p = _run_repeated_k_qk(ext, packed_q, k_one)
+    reduction_expected = q_chunks.sum(dim=(-2, -1))
+    torch.cuda.synchronize()
+    max_error, mean_error = _qk_error(reduction_p, reduction_expected)
+    print("QK diagnostic stage 1: K=1 isolates reduced-P row addressing")
+    print(f"identity: max_abs={max_error:.6g} mean_abs={mean_error:.6g}")
+    for row in range(2):
+        row_max, row_mean = _qk_error(reduction_p[row], reduction_expected[row])
+        print(f"query_row={row}: max_abs={row_max:.6g} mean_abs={row_mean:.6g}")
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(3102)
+    random_k = torch.randn(
+        (D_HEAD,), device=device, generator=generator
+    ).to(torch.float8_e4m3fn)
+    random_k_bytes = random_k.view(torch.uint8)
+    random_k_chunks = random_k.float().reshape(D_HEAD // MMA_K, MMA_K)
+
+    # Run each K=32 atom independently. The all-one probe identifies the Q=32
+    # chunk without depending on its internal element order. The random probe
+    # then checks whether the 32 elements inside that atom are also aligned.
+    atom_one_results = []
+    atom_random_results = []
+    for k_chunk in range(D_HEAD // MMA_K):
+        begin = k_chunk * MMA_K
+        end = begin + MMA_K
+        one_row = torch.zeros(D_HEAD, device=device, dtype=torch.uint8)
+        one_row[begin:end] = 0x38
+        random_row = torch.zeros_like(one_row)
+        random_row[begin:end] = random_k_bytes[begin:end]
+        atom_one_results.append(_run_repeated_k_qk(ext, packed_q, one_row))
+        atom_random_results.append(_run_repeated_k_qk(ext, packed_q, random_row))
+
+    atom_one = torch.stack(atom_one_results)
+    atom_random = torch.stack(atom_random_results)
+    torch.cuda.synchronize()
+    q_chunk_sums = q_chunks.sum(dim=-1)
+    print("QK diagnostic stage 2: one active K=32 atom per launch")
+    print("K32 -> best Q32 from K=1 | best Q32 from random K")
+    inferred_q_chunks = []
+    for k_chunk in range(D_HEAD // MMA_K):
+        one_errors = torch.stack([
+            (atom_one[k_chunk] - q_chunk_sums[..., q_chunk]).abs().mean()
+            for q_chunk in range(D_HEAD // MMA_K)
+        ])
+        random_expected = torch.stack([
+            (
+                q_chunks[..., q_chunk, :]
+                * random_k_chunks[k_chunk]
+            ).sum(dim=-1)
+            for q_chunk in range(D_HEAD // MMA_K)
+        ])
+        random_errors = (
+            atom_random[k_chunk][None, ...] - random_expected
+        ).abs().mean(dim=(-2, -1))
+        one_q = int(one_errors.argmin().item())
+        random_q = int(random_errors.argmin().item())
+        inferred_q_chunks.append(random_q)
+        one_max, one_mean = _qk_error(
+            atom_one[k_chunk], q_chunk_sums[..., one_q]
+        )
+        random_max, random_mean = _qk_error(
+            atom_random[k_chunk], random_expected[random_q]
+        )
+        print(
+            f"{k_chunk:2d} -> {one_q:2d} "
+            f"(max={one_max:.4g}, mean={one_mean:.4g}) | "
+            f"{random_q:2d} (max={random_max:.4g}, mean={random_mean:.4g})"
+        )
+
+    # Compare one full random-K launch with both the logical Python GEMM and
+    # the sum of the 16 independently measured kernel atoms. The latter keeps
+    # P reduction identical while removing cross-atom accumulation as a cause.
+    full_kernel_p = _run_repeated_k_qk(ext, packed_q, random_k_bytes)
+    decomposed_kernel_p = atom_random.sum(dim=0)
+    logical_python_p = (
+        q_chunks * random_k_chunks[None, None, ...]
+    ).sum(dim=(-2, -1))
+    mapped_python_p = torch.zeros_like(logical_python_p)
+    for k_chunk, q_chunk in enumerate(inferred_q_chunks):
+        mapped_python_p.add_((
+            q_chunks[..., q_chunk, :] * random_k_chunks[k_chunk]
+        ).sum(dim=-1))
+    torch.cuda.synchronize()
+    print("QK diagnostic stage 3: full GEMM")
+    for name, expected in (
+        ("logical Python", logical_python_p),
+        ("inferred chunk-map Python", mapped_python_p),
+        ("sum of isolated kernel atoms", decomposed_kernel_p),
+    ):
+        max_error, mean_error = _qk_error(full_kernel_p, expected)
+        print(f"kernel vs {name}: max_abs={max_error:.6g} mean_abs={mean_error:.6g}")
+
+
+@torch.inference_mode()
 def run_prefill(
     ext,
     device: torch.device,
     w_exponents: torch.Tensor,
     bf16_ext,
     two_anchors: bool,
+    force_q_data_one: bool,
+    force_q_scale_one: bool,
+    force_k_data_one: bool,
+    force_k_scale_one: bool,
 ) -> None:
     s_q, s_kv, topk = 2, 256, 128
-    packed_q, q_dequant = _make_prefill_q(s_q, device, 1001)
+    packed_q, q_dequant = _make_prefill_q(
+        s_q, device, 1001, force_q_data_one, force_q_scale_one
+    )
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        s_kv, device, 1002, w_exponents, two_anchors
+        s_kv, device, 1002, w_exponents, two_anchors,
+        force_k_data_one, force_k_scale_one,
     )
     packed_kv = _pack_prefill_storage(data_bytes, scale_slots)
     indices = _make_indices(s_q // 2, topk, s_kv, device, 1003).unsqueeze(1)
@@ -835,14 +1033,21 @@ def run_decode(
     w_exponents: torch.Tensor,
     bf16_decode_ext,
     two_anchors: bool,
+    force_q_data_one: bool,
+    force_q_scale_one: bool,
+    force_k_data_one: bool,
+    force_k_scale_one: bool,
 ) -> None:
     batch, s_q, page_size = 1, 1, 64
     num_pages = (topk + page_size - 1) // page_size
-    packed_q, q_dequant = _make_prefill_q(batch * s_q, device, 2001)
+    packed_q, q_dequant = _make_prefill_q(
+        batch * s_q, device, 2001, force_q_data_one, force_q_scale_one
+    )
     packed_q = packed_q.reshape(batch, s_q, H_Q, D_HEAD + 16)
     q_dequant = q_dequant.reshape(batch, s_q, H_Q, D_HEAD)
     data_bytes, scale_slots, kv_dequant, u_scale, kv_fp8 = _make_rank1_storage(
-        num_pages * page_size, device, 2002, w_exponents, two_anchors
+        num_pages * page_size, device, 2002, w_exponents, two_anchors,
+        force_k_data_one, force_k_scale_one,
     )
     packed_kv = _pack_page_storage(
         data_bytes, scale_slots, num_pages=num_pages, page_size=page_size
@@ -925,6 +1130,15 @@ def main() -> None:
         action="store_true",
         help="use W=1 for KV generation, kernel arguments, and both Torch references",
     )
+    parser.add_argument("--q-one", action="store_true", help="force Q E4M3 data to +1")
+    parser.add_argument("--q-scale-one", action="store_true", help="force Q UE8M0 scales to 1")
+    parser.add_argument("--k-one", action="store_true", help="force K/V E4M3 data to +1")
+    parser.add_argument("--k-scale-one", action="store_true", help="force K/V UE8M0 scales to 1")
+    parser.add_argument(
+        "--diagnose-qk",
+        action="store_true",
+        help="infer the kernel QK reduction from LSE using one repeated K token",
+    )
     anchor_group = parser.add_mutually_exclusive_group()
     anchor_group.add_argument(
         "--two-anchors",
@@ -944,6 +1158,9 @@ def main() -> None:
         raise RuntimeError("this test requires an NVIDIA SM100-family GPU")
     torch.cuda.set_device(args.device)
     ext = _load_extension()
+    if args.diagnose_qk:
+        diagnose_qk_reduction(ext, torch.device("cuda"))
+        return
     bf16_ext = _load_bf16_extension()
     bf16_decode_ext = _load_head64_decode_extension()
     base_w = (
@@ -964,9 +1181,13 @@ def main() -> None:
             args.iterations,
         )
         return
-    run_prefill(ext, torch.device("cuda"), w_exponents, bf16_ext, args.two_anchors)
+    run_prefill(
+        ext, torch.device("cuda"), w_exponents, bf16_ext, args.two_anchors,
+        args.q_one, args.q_scale_one, args.k_one, args.k_scale_one,
+    )
     run_decode(
-        ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext, args.two_anchors
+        ext, torch.device("cuda"), 256, w_exponents, bf16_decode_ext, args.two_anchors,
+        args.q_one, args.q_scale_one, args.k_one, args.k_scale_one,
     )
 
 

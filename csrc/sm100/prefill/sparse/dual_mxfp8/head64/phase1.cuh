@@ -525,27 +525,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     smem.bar_sQ_full.wait(args.outer_loop_phase);
                     smem.bar_tQ_empty.wait(args.outer_loop_phase^1);
 
-                    ku::tcgen05_after_thread_sync();
-                    UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-                        make_tensor(
-                            make_smem_ptr(smem.Q.data()),
-                            ku::make_umma_canonical_k_major_layout<(H_Q/2)*2, 128, 128, fp8_e4m3>()
-                        )
-                    );
-                    CUTE_UNROLL
-                    for (int tile_idx = 0; tile_idx < D_Q / 128; ++tile_idx) {
-                        CUTE_UNROLL
-                        for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
-                            UMMA::SmemDescriptor cur_sQ_desc = sQ_desc;
-                            cur_sQ_desc.start_address_ +=
-                                tile_idx * ((H_Q/2) * 128 * 2) / 16
-                                + subtile_idx;
-                            SM100_UTCCP_128dp128bit_2cta::copy(
-                                cur_sQ_desc,
-                                tmem_cols::Q + tile_idx * 32 + subtile_idx * 4
-                            );
-                        }
-                    }
+                    // Q remains in SMEM; the SS QK MMA consumes it directly.
                     ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_tQ_full, 1|2);
                 }
             }
@@ -675,14 +655,15 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             // UMMA thread
             TiledMMA tiled_mma_P = TiledMMA_P{};
             TiledMMA tiled_mma_O = TiledMMA_O{};
-            Tensor tP = partition_fragment_C(tiled_mma_P, Shape<Int<H_Q/2>, Int<B_TOPK*2>>{});
-            Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<H_Q/2>, Int<D_V>>{});
-            Tensor tQ = tiled_mma_P.get_slice(_0{}).make_fragment_A(
-                partition_shape_A(tiled_mma_P, Shape<Int<H_Q/2>, Int<D_Q/2>>{})
+            // Forge a CTA-local M=128 tile from an M=128 2-CTA atom. CuTe
+            // therefore tiles the atom twice in M while the instruction
+            // descriptor itself remains M=128.
+            Tensor tP = partition_fragment_C(
+                tiled_mma_P, Shape<Int<H_Q*2>, Int<B_TOPK*2>>{}
             );
+            Tensor tO = partition_fragment_C(tiled_mma_O, Shape<Int<H_Q/2>, Int<D_V>>{});
             tP.data().get() = tmem_cols::P;
             tO.data().get() = tmem_cols::O;
-            tQ.data().get() = tmem_cols::Q;
 
             run_outer_loop([&](const OuterloopArgs &args) {
                 smem.bar_tQ_full.wait(args.outer_loop_phase);
@@ -706,6 +687,36 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         smem.k_scale_mma[k_buf_idx].data(), tmem_cols::K_scale
                     );
                     ku::tcgen05_before_thread_sync();
+                    // Physical Q is 64x512. Its dual-64 input packing and the
+                    // 5D TMA copy permute the logical K=32 atoms in SMEM as
+                    // [0,8,1,9,4,12,5,13,2,10,3,11,6,14,7,15]. Present it as
+                    // a forged global 256x256 tensor while undoing that atom
+                    // permutation in the logical K mode. The CTA mode remains
+                    // replicated and the two M tiles select the two logical
+                    // 256-value halves.
+                    auto q_physical_layout =
+                        ku::make_umma_canonical_k_major_layout<
+                            H_Q/2, D_Q, 128, fp8_e4m3
+                        >();
+                    auto q_global_to_physical = Layout<
+                        Shape<
+                            Shape<Int<H_Q/2>, _2, _2>,
+                            Shape<_32, _2, _2, _2>
+                        >,
+                        Stride<
+                            Stride<_1, _0, Int<(H_Q/2)*32>>,
+                            Stride<
+                                Int<H_Q/2>,
+                                Int<(H_Q/2)*32*2>,
+                                Int<(H_Q/2)*32*8>,
+                                Int<(H_Q/2)*32*4>
+                            >
+                        >
+                    >{};
+                    Tensor sQ = make_tensor(
+                        make_smem_ptr(smem.Q.data()),
+                        composition(q_physical_layout, q_global_to_physical)
+                    );
                     Tensor sK = make_tensor(
                         make_smem_ptr(smem.K[k_buf_idx].data()),
                         ku::make_umma_canonical_k_major_layout<B_TOPK, D_K/2, 128, fp8_e4m3>()
@@ -714,8 +725,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     Tensor tK_scale = make_tensor<typename TiledMMA_P::FrgTypeSFB>(shape(SmemLayoutPScaleB{}));
                     tQ_scale.data().get() = tmem_cols::Q_scale;
                     tK_scale.data().get() = tmem_cols::K_scale;
-                    ku::utcmma_blockscaled_ts_explicit_sf_ids<K_QUANT_GROUP_SIZE>(
-                        tiled_mma_P, tQ, sK, tQ_scale, tK_scale, tP, true
+                    ku::utcmma_blockscaled_ss_explicit_sf_ids<K_QUANT_GROUP_SIZE>(
+                        tiled_mma_P, sQ, sK,
+                        tQ_scale, tK_scale, tP, true
                     );
                     ku::umma_arrive_multicast_2x1SM_noelect(
                         smem.bar_QK_done[k_buf_idx], 1|2
@@ -759,6 +771,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                         issue_P(k, 0);
                     }
                     if (k == args.end_block_idx-1) {
+                        // Q is an SS operand now. Wait for the asynchronous
+                        // QK instruction before allowing SMEM Q reuse.
+                        ku::tcgen05_before_thread_sync();
                         ku::umma_arrive_2x1SM_noelect(smem.bar_tQ_empty);
                     }
 
@@ -1049,7 +1064,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     tmem_cols::P,
                     barrier_ids::WG2_WARP02_SYNC,
                     barrier_ids::WG2_WARP13_SYNC,
-                    false
+                    false,
+                    64
                 >(
                     smem.is_k_valid[indices_buf_idx],
                     local_warp_idx,

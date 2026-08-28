@@ -10,7 +10,6 @@
 #include "defines.h"
 #include "params.h"
 
-
 namespace sm100::dual_mxfp8::head64 {
 
 using namespace cute;
@@ -40,7 +39,7 @@ struct TmaParamsForDecode {
     CUtensorMap tensor_map_o;
     CUtensorMap tensor_map_o_accum;
     CUtensorMap tensor_map_kv;
-    CUtensorMap tensor_map_extra_kv;   // Only available if extra_kv is enabled
+    CUtensorMap tensor_map_extra_kv;
 };
 
 using TmaParams = std::conditional_t<
@@ -54,45 +53,30 @@ static_assert(D_QK == 512);
 static constexpr int D_Q = D_QK;
 static constexpr int D_K = D_QK;
 static constexpr int D_V = 512;
-static constexpr float MAX_INIT_VAL = -1e30;    // We use this number as the initial value for mi (max logits) to avoid -inf - (-inf) = nan
+
+// Avoid -inf - (-inf) when the first tile contains no valid logits.
+static constexpr float MAX_INIT_VAL = -1e30;
 
 // The 2-SM MMA still has 128 logical rows, but each CTA contributes all 64
 // heads from a different query token in the adjacent-token pair.
 static constexpr int TOKEN_H_Q = 64;
 static constexpr int H_Q = 2*TOKEN_H_Q;
-static constexpr int B_TOPK = 64; // For 2 CTAs
+static constexpr int B_TOPK = 64;
 static constexpr int NUM_THREADS = 128*4;
-// Prefill run_outer_loop participants per CTA:
-// WG0=128, KV producer elected lanes=4, validity lanes=8, K-scale
-    // copy warps=64, and softmax WG=128. Only CTA0's elected warp8 lane
-    // issues cta_group::2 UTCCP/MMA operations. Warp10 folds the CLC query
-    // into its K-scale loop.
-    static constexpr int NUM_WORKER_THREADS = IS_PREFILL
+static constexpr int NUM_WORKER_THREADS = IS_PREFILL
     ? (128 + 4 + (B_TOPK/8) + 64 + 128)*2 + 1
     : (128 + 128 + 1 + 32 + 2 + 128)*2;
 
-// For non-decode mode, we have 4 (half-)KV buffers
-// For decode mode, we have 3 (half-)KV buffers with two raw KV buffers
 static constexpr int NUM_K_BUFS = IS_DECODE ? 3 : 4;
-static constexpr int NUM_INDEX_BUFS = IS_DECODE ? 4 : 4;
+static constexpr int NUM_INDEX_BUFS = 4;
 
 static constexpr int TMA_K_STRIDE_FOR_DECODING = D_QK;
-static constexpr int NUM_SCALES_EACH_TOKEN = 8; // 7 scales + 1 padding
-static constexpr int MXFP8_SCALE_VEC_SIZE = 32;
 static constexpr int Q_QUANT_GROUP_SIZE = 64;
 static constexpr int Q_SCALE_BYTES = D_Q / Q_QUANT_GROUP_SIZE;
 static constexpr int Q_SCALE_SLOT_BYTES = 16;
 static constexpr int K_QUANT_GROUP_SIZE = 64;
 static constexpr int K_SCALE_BYTES = D_K / K_QUANT_GROUP_SIZE;
 static constexpr int K_SCALE_SLOT_BYTES = 16;
-static constexpr int K_SCALE_GATHER_ROWS = 4;
-static constexpr int K_SCALE_GATHER_BYTES =
-    K_SCALE_GATHER_ROWS * K_SCALE_SLOT_BYTES;
-// Gather4 writes four complete 16B slots into a 64B raw payload. Keep each
-// gather destination on a separate 128B row so the destination is aligned for
-// both the TMA path and the warp10/warp11 repack loads.
-static constexpr int K_SCALE_GATHER_SMEM_STRIDE = 128;
-static constexpr int SCALE_GROUPS_PER_TMEM_BLOCK = 4;
 static constexpr int Q_BYTES_PER_HEAD = D_Q + Q_SCALE_SLOT_BYTES;
 static constexpr int KV_BYTES_PER_TOKEN = D_K + K_SCALE_SLOT_BYTES;
 static_assert(Q_SCALE_BYTES == 8);
@@ -100,10 +84,13 @@ static_assert(Q_SCALE_SLOT_BYTES == 16);
 static_assert(K_SCALE_BYTES == 8);
 static_assert(K_SCALE_SLOT_BYTES == 2 * K_SCALE_BYTES);
 
-static constexpr int B_EPI = 64;                // Epilogue block size for normal case (i.e. prefill or non-splitkv decoding)
-static constexpr int B_EPI_SPLITKV = 32;        // Epilogue block size for splitkv decoding
-static constexpr int NUM_EPI_SPLITKV_BUFS = 4;  // The number of epilogue buffers for splitkv decoding
-static_assert((H_Q/2)*D_Q*sizeof(bf16) >= NUM_EPI_SPLITKV_BUFS*(H_Q/2)*(B_EPI_SPLITKV*2)*sizeof(float));
+static constexpr int B_EPI = 64;
+static constexpr int B_EPI_SPLITKV = 32;
+static constexpr int NUM_EPI_SPLITKV_BUFS = 4;
+static_assert(
+    (H_Q/2)*D_Q*sizeof(bf16)
+        >= NUM_EPI_SPLITKV_BUFS*(H_Q/2)*(B_EPI_SPLITKV*2)*sizeof(float)
+);
 
 // Tensor memory columns
 struct tmem_cols {
@@ -122,7 +109,6 @@ struct tmem_cols {
 };
 
 struct SharedMemoryPlan {
-    // Q is reused by the BF16 output epilogue after the final MMA.
     array_aligned<fp8_e4m3, (H_Q/2)*D_Q*sizeof(bf16)> Q;
     array_aligned<fp8_e4m3, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<fp8_e4m3, (H_Q/2)*B_TOPK> S[2];
@@ -138,7 +124,7 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) char is_k_valid[NUM_INDEX_BUFS][B_TOPK/8];
     CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) int64_t k_scale_offset[NUM_INDEX_BUFS][B_TOPK];
-    
+
     transac_bar_t bar_sQ_full;
     transac_bar_t bar_Q_scale_ready;
     transac_bar_t bar_tQ_empty, bar_tQ_full;
@@ -151,44 +137,75 @@ struct SharedMemoryPlan {
     transac_bar_t bar_S_empty[2], bar_S_O_full[2];
     transac_bar_t bar_li_full, bar_li_empty;
 
-    // The following barriers are prefill-only
     transac_bar_t bar_clc_full, bar_clc_empty;
-
-    // The following barriers are decode-only
-    transac_bar_t bar_valid_coord_scales_full[NUM_INDEX_BUFS], bar_valid_coord_scales_empty[NUM_INDEX_BUFS];
+    transac_bar_t bar_valid_coord_scales_full[NUM_INDEX_BUFS];
+    transac_bar_t bar_valid_coord_scales_empty[NUM_INDEX_BUFS];
 
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, fp8_e8m0, H_Q, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
-)); // *2 for dual gemm; Q and K both stay in SMEM
+    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<
+        fp8_e4m3, fp8_e4m3, float, fp8_e8m0,
+        H_Q, B_TOPK*2, UMMA::Major::K, UMMA::Major::K
+    >{}
+));
 
 using TiledMMA_O = decltype(make_tiled_mma(
-    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, fp8_e8m0, H_Q, 256, UMMA::Major::K, UMMA::Major::MN>{},
+    SM100_MMA_MXF8F6F4_2x1SM_SS_NOELECT<
+        fp8_e4m3, fp8_e4m3, float, fp8_e8m0,
+        H_Q, 256, UMMA::Major::K, UMMA::Major::MN
+    >{},
     Layout<Shape<_1, _1, _1>>{},
-    Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}  // We use this permutation layout to let CTA0 takes V[:, 0:256] and CTA1 takes V[:, 256:512]
+    // CTA0 consumes V[:, 0:256], while CTA1 consumes V[:, 256:512].
+    Tile<
+        Int<128>,
+        Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>,
+        _16
+    >{}
 ));
 
-// CUTLASS's generic 2-CTA scale layout assumes a 128-row scale tile per CTA.
-// This kernel uses the legal M=128 2-SM MMA shape, i.e. 64 rows per CTA, so
-// use the MMA's 128-row physical scale atom and let UTCCP broadcast it across
-// the two CTAs.  All current factors are one, so the duplicate logical rows
-// need no distinct SMEM storage.
-using SmemLayoutPScaleA = decltype(cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFA(
-    TiledMMA_P{}, Shape<Int<H_Q*2>, Int<B_TOPK*2>, Int<D_Q>>{}
+// Undo the K=32 atom permutation introduced by the dual-64 TMA packing:
+// [0,8,1,9,4,12,5,13,2,10,3,11,6,14,7,15].
+using SmemLayoutQPhysical = decltype(
+    ku::make_umma_canonical_k_major_layout<H_Q/2, D_Q, 128, fp8_e4m3>()
+);
+using QGlobalToPhysical = Layout<
+    Shape<Shape<Int<H_Q/2>, _2, _2>, Shape<_32, _2, _2, _2>>,
+    Stride<
+        Stride<_1, _0, Int<(H_Q/2)*32>>,
+        Stride<
+            Int<H_Q/2>,
+            Int<(H_Q/2)*32*2>,
+            Int<(H_Q/2)*32*8>,
+            Int<(H_Q/2)*32*4>
+        >
+    >
+>;
+using SmemLayoutQ = decltype(composition(
+    SmemLayoutQPhysical{}, QGlobalToPhysical{}
 ));
-using SmemLayoutPScaleB = decltype(cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFB(
-    TiledMMA_P{}, Shape<Int<H_Q*2>, Int<B_TOPK*2>, Int<D_K>>{}
-));
-using SmemLayoutOScaleA = decltype(cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFA(
-    TiledMMA_O{}, Shape<Int<H_Q*2>, Int<256>, _128>{}
-));
-using SmemLayoutOScaleB = decltype(cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFB(
-    TiledMMA_O{}, Shape<Int<H_Q*2>, Int<256>, _128>{}
-));
+using SmemLayoutK = decltype(
+    ku::make_umma_canonical_k_major_layout<B_TOPK, D_K/2, 128, fp8_e4m3>()
+);
+using SmemLayoutS = decltype(
+    ku::make_umma_canonical_k_major_layout<H_Q/2, B_TOPK, 0, fp8_e4m3>()
+);
+using SmemLayoutV = decltype(
+    ku::make_umma_canonical_mn_major_layout<D_V/2, B_TOPK, 128, fp8_e4m3>()
+);
 
+using SmemLayoutPScaleA = decltype(
+    cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFA(
+        TiledMMA_P{}, Shape<Int<H_Q*2>, Int<B_TOPK*2>, Int<D_Q>>{}
+    )
+);
+using SmemLayoutPScaleB = decltype(
+    cutlass::detail::Sm1xxBlockScaledConfig<32>::deduce_smem_layoutSFB(
+        TiledMMA_P{}, Shape<Int<H_Q*2>, Int<B_TOPK*2>, Int<D_K>>{}
+    )
+);
 
 struct barrier_ids {
     static constexpr int WG0_SYNC = 0;

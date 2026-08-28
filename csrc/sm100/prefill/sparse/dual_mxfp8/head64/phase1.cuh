@@ -1027,8 +1027,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     p
                 );
 
-                float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
-                cur_pi_max *= params.sm_scale_div_log2;
+                float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p)
+                    * params.sm_scale_div_log2;
 
                 smem.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(64, barrier_ids::WG2_WARP02_SYNC + (local_warp_idx&1));
@@ -1047,25 +1047,68 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 mi = new_max;
 
                 fp8_e4m3 s[NUM_ELEMS_PER_THREAD];
-                float cur_sum = 0.0f;
                 smem.bar_v_scale_full[k_buf_idx].wait(k_bar_phase);
-                float s_abs_max = 0.0f;
+                const float2 logit_scale2 = make_float2(
+                    params.sm_scale_div_log2,
+                    params.sm_scale_div_log2
+                );
+                const float2 neg_max2 = make_float2(-new_max, -new_max);
+                float2 cur_sum2[4] = {
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f)
+                };
+                float2 s_abs_max2[4] = {
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f),
+                    make_float2(0.0f, 0.0f)
+                };
                 CUTE_UNROLL
-                for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i) {
-                    float s_value = exp2f(fmaf(p[i], params.sm_scale_div_log2, -new_max));
-                    cur_sum += s_value;
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 2) {
+                    const int acc = (i / 2) & 3;
+                    float2 logits = ku::float2_fma(
+                        *reinterpret_cast<const float2*>(p + i),
+                        logit_scale2,
+                        neg_max2
+                    );
+                    float2 s_value = make_float2(
+                        exp2f(logits.x), exp2f(logits.y)
+                    );
+                    cur_sum2[acc] = ku::float2_add(cur_sum2[acc], s_value);
                     const int token = s_col_base + i;
-                    float scaled_s = s_value * smem.v_token_scale[k_buf_idx][token];
-                    s_abs_max = max(s_abs_max, scaled_s);
-                    p[i] = scaled_s;
+                    float2 scaled_s = ku::float2_mul(
+                        s_value,
+                        *reinterpret_cast<const float2*>(
+                            &smem.v_token_scale[k_buf_idx][token]
+                        )
+                    );
+                    s_abs_max2[acc].x = max(s_abs_max2[acc].x, scaled_s.x);
+                    s_abs_max2[acc].y = max(s_abs_max2[acc].y, scaled_s.y);
+                    *reinterpret_cast<float2*>(p + i) = scaled_s;
                 }
                 smem.bar_v_scale_empty[k_buf_idx].arrive();
+                cur_sum2[0] = ku::float2_add(cur_sum2[0], cur_sum2[1]);
+                cur_sum2[2] = ku::float2_add(cur_sum2[2], cur_sum2[3]);
+                cur_sum2[0] = ku::float2_add(cur_sum2[0], cur_sum2[2]);
+                CUTE_UNROLL
+                for (int i = 1; i < 4; ++i) {
+                    s_abs_max2[0].x = max(s_abs_max2[0].x, s_abs_max2[i].x);
+                    s_abs_max2[0].y = max(s_abs_max2[0].y, s_abs_max2[i].y);
+                }
+                float cur_sum = cur_sum2[0].x + cur_sum2[0].y;
+                float s_abs_max = max(s_abs_max2[0].x, s_abs_max2[0].y);
                 float raw_s_scale = s_abs_max > 0.0f
                     ? s_abs_max / 448.0f : 1.0f;
                 fp8_e8m0 s_scale_exp_e8m0 = fp8_e8m0(raw_s_scale);
-                constexpr float s_scale_eps = 1.0e-20f;
-                float s_scale = 1.0f / max(float(s_scale_exp_e8m0), s_scale_eps);
-                s_scale_exp_e8m0 = fp8_e8m0(1.0f / s_scale);
+                constexpr uint8_t min_s_scale_exp = 61;
+                s_scale_exp_e8m0.storage = max(
+                    s_scale_exp_e8m0.storage, min_s_scale_exp
+                );
+                float s_scale = __uint_as_float(
+                    uint32_t(254u - s_scale_exp_e8m0.storage) << 23
+                );
                 const float2 scale2 = make_float2(s_scale, s_scale);
 
                 CUTE_UNROLL
